@@ -591,9 +591,9 @@ def collect_raid_state():
     return metrics.values()
 
 
-def handle_raid_state(target_id, state_int):
+def handle_raid_state(target_id, state_int, origin_state):
     if state_int != 0:
-        send_raid_state_alarm_to_mn(target_id, state_int)
+        send_raid_state_alarm_to_mn(target_id, origin_state)
         return
     remove_raid_status_abnormal(target_id)
 
@@ -625,7 +625,7 @@ def collect_arcconf_raid_state(metrics, infos):
                 state = l.strip().split(":")[-1].strip()
                 state_int = convert_raid_state_to_int(state)
                 metrics['raid_state'].add_metric([target_id], state_int)
-                handle_raid_state(target_id, state_int)
+                handle_raid_state(target_id, state_int, state)
 
         for infos in device_arr[1:]:
             drive_state = serial_number = slot_number = enclosure_device_id = "unknown"
@@ -676,7 +676,7 @@ def collect_sas_raid_state(metrics, infos):
                     continue
                 state_int = convert_raid_state_to_int(state)
                 metrics['raid_state'].add_metric([target_id], state_int)
-                handle_raid_state(target_id, state_int)
+                handle_raid_state(target_id, state_int, state)
         
         disk_info = bash_o("sas3ircu %s display | grep -E 'Enclosure #|Slot #|State|Serial No|Drive Type'" % line.strip())
         enclosure_device_id = slot_number = state = serial_number = "unknown"
@@ -721,7 +721,7 @@ def collect_mega_raid_state(metrics, infos):
             disk_group = data[attr][0]["DG/VD"].split("/")[0]
             converted_vd_state = convert_raid_state_to_int(vd_state)
             metrics['raid_state'].add_metric([disk_group], converted_vd_state)
-            handle_raid_state(disk_group, converted_vd_state)
+            handle_raid_state(disk_group, converted_vd_state, vd_state)
 
     # collect disk state
     o = bash_o("/opt/MegaRAID/storcli/storcli64 /call/eall/sall show all J").strip()
