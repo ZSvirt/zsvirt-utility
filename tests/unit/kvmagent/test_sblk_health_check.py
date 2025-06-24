@@ -11,6 +11,8 @@ import subprocess
 import time
 from unittest.mock import mock_open, patch
 
+import pytest
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
 VG = 'vg-1'
@@ -228,6 +230,27 @@ def test_aged_io_error_kills_without_accumulating():
 
     victims = _run(checker, Record(result=-5, space_dead=0))
     assert VG in victims
+
+
+@pytest.mark.parametrize('io_timeout,age,failed', [
+    (5, 34, False), (5, 35, False), (5, 36, True),
+    (20, 139, False), (20, 140, False), (20, 141, True),
+])
+@pytest.mark.parametrize('result', [-5, -202])
+def test_io_failure_fences_before_shared_lease_expiry(io_timeout, age, failed, result):
+    checker, _clock = _load_health_check(1000)
+    record = Record(result=result, success=1000 - age, io_timeout=io_timeout)
+    sanlock_result = checker._do_sanlock_heartbeat_check(VG, record, [LOCKSPACE])
+    checker._do_health_check_vg_by_sanlock = lambda _vgs: {VG: sanlock_result}
+
+    def unexpected_fallback(_vgs):
+        raise AssertionError('known sanlock I/O result must not use a healthy fallback')
+
+    checker._do_health_check_vg_by_zsblkagent = unexpected_fallback
+    combined = checker._do_health_check(5, 3)[VG]
+
+    assert combined.no_way is False
+    assert combined.failed is failed
 
 
 def test_space_dead_kills_before_renewal_threshold():

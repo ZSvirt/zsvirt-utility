@@ -551,7 +551,7 @@ class SblkHealthChecker(AbstractStorageFencer):
     # lockspace is adding                                                    | reset, stop
     # renewal_last_result == 1                                               | reset, stop
     # space_dead is set                                                      | kill, stop
-    # result is -5 or -202, and uptime - last_success exceeds 8 * io_timeout | kill, stop
+    # result is -5 or -202, and uptime - last_success exceeds 7 * io_timeout | kill, stop
     # result is -5 or -202, but the age has not reached the threshold        | reset, stop
     # any other result code                                                  | hand to zsblk-agent
     # result is -5 or -202, but uptime cannot be read                        | hand to zsblk-agent
@@ -596,7 +596,8 @@ class SblkHealthChecker(AbstractStorageFencer):
         if r.get_renewal_last_result() == 1:
             return 'reset', None
 
-        renewal_failure_seconds = sanlock.calc_id_renewal_fail_seconds(r.get_io_timeout())
+        # Leave one I/O timeout before the shared lease expiry for local fencing.
+        renewal_failure_seconds = sanlock.calc_id_renewal_fail_seconds(r.get_io_timeout()) - r.get_io_timeout()
         if r.is_space_dead():
             now = sanlock.read_monotonic_uptime()
             failure = "sanlock lockspace for vg %s is dead, space_dead=%s, uptime=%s, last success is %s, renewal failure threshold is %s second" % \
