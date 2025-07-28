@@ -796,9 +796,9 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         self.clear_stalled_qmp_socket()
         lvm.check_missing_pv(cmd.vgUuid)
         lvm.refresh_mismatched_lvs(cmd.vgUuid)
-        self.connected(cmd.vgUuid)
         lvm.update_lockspace_io_timeout_if_need(cmd.vgUuid, cmd.ioTimeout)
 
+        self.connected(cmd.vgUuid)
         rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
         rsp.hostId = lvm.get_running_host_id(cmd.vgUuid)
         rsp.vgLvmUuid = lvm.get_vg_lvm_uuid(cmd.vgUuid)
