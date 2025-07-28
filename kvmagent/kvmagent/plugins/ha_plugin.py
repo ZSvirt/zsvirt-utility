@@ -2377,7 +2377,7 @@ class HaPlugin(kvmagent.KvmAgent):
                 logger.warn("last fencer fire: %s, now: %s, passed: %s seconds, within %s seconds, skip fire",
                             self.fencer_fire_timestamp[vg], time.time(),
                             time.time() - self.fencer_fire_timestamp.get(vg),
-                            300 * (fire + 1 if fire < 10 else 10))
+                            30 * (fire + 1 if fire < 10 else 10))
                 return False
 
             self.fencer_fire_timestamp[vg] = time.time()
