@@ -126,10 +126,10 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
             iscsi_server.ip,"3260"
         )
         self.assertEqual(True, rsp.success, rsp.error)
-        dev = bash.bash_o('basename "$(readlink -f /dev/disk/by-id/scsi-* | head -n 1)"').strip()
+        dev = bash.bash_o('basename "$(readlink -f /dev/disk/by-id/scsi-3* | head -n 1)"').strip()
         self.assertEqual(True, dev.startswith("sd"), dev)
         self.disk1_dev = dev
-        wwid = bash.bash_o('ls /dev/disk/by-id/scsi-* | head -n 1').strip().split("scsi-")[1]
+        wwid = bash.bash_o('ls /dev/disk/by-id/scsi-3* | head -n 1').strip().split("scsi-")[1]
         self.disk1_wwid = wwid
 
         # restart lvmlockd and sanlock for updating sanlock io timeout
