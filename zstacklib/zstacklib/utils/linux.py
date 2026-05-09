@@ -19,11 +19,13 @@ import re
 import resource
 import shutil
 import socket
+import stat
 import struct
 import tempfile
 import threading
 import time
 import traceback
+import uuid
 from inspect import stack
 
 import netaddr
@@ -47,6 +49,8 @@ except NameError:
     long = int
 
 logger = log.get_logger(__name__)
+
+QCOW2_BACKING_ARG_COMPACT_THRESHOLD = 900
 
 RPM_BASED_OS = ['redhat', 'centos', 'alibaba', 'kylin10', 'rocky']
 DEB_BASED_OS = ['uos', 'kylin4.0.2', 'debian', 'ubuntu', 'uniontech']
@@ -308,6 +312,19 @@ def rm_file_force(fpath):
         os.remove(fpath)
     except:
         pass
+
+def move_file_no_overwrite(src, dst):
+    if src == dst:
+        return
+    if not os.path.exists(src):
+        raise Exception("source file %s does not exist" % src)
+    if os.path.exists(dst):
+        raise Exception("target file %s already exists" % dst)
+
+    dst_dir = os.path.dirname(dst)
+    if dst_dir and not os.path.exists(dst_dir):
+        os.makedirs(dst_dir)
+    os.rename(src, dst)
 
 black_dpath_list = ["", "/", "*", "/root", "/var", "/bin", "/lib", "/sys"]
 
@@ -1303,6 +1320,18 @@ def get_img_file_fmt(src):
     return fmt
 
 
+def _is_block_device(path):
+    """True if `path` exists and points to a block device. False on missing path
+    (caller is expected to fail loudly elsewhere) or on a regular file. Used to
+    decide whether tmp+rename is feasible (regular files) versus writing in
+    place (block devices, e.g. SharedBlock LVs).
+    """
+    try:
+        return stat.S_ISBLK(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
 def get_img_fmt(src):
     if os.path.exists(src):
         with open(src, 'rb') as f:
@@ -1331,13 +1360,6 @@ def qcow2_clone(src, dst, size=""):
     shell.check_run('/usr/bin/qemu-img create -F %s -b %s -f qcow2 %s %s' % (fmt, src, dst, size))
     os.chmod(dst, 0o660)
 
-def qcow2_clone_with_cmd(src, dst, cmd=None):
-    size = cmd.virtualSize if cmd.virtualSize else ""
-    if cmd is None or cmd.kvmHostAddons is None or cmd.kvmHostAddons.qcow2Options is None:
-        qcow2_clone(src, dst, size)
-    else:
-        qcow2_clone_with_option(src, dst, cmd.kvmHostAddons.qcow2Options, size)
-
 def qcow2_clone_with_option(src, dst, opt="", size=""):
     # NOTE(weiw): qcow2 doesn't support specify backing file and preallocation at same time
     pattern = re.compile("\-o\ preallocation\=\w+ ")
@@ -1347,15 +1369,76 @@ def qcow2_clone_with_option(src, dst, opt="", size=""):
     shell.check_run('/usr/bin/qemu-img create -F %s %s -b %s -f qcow2 %s %s' % (fmt, opt, src, dst, size))
     os.chmod(dst, 0o660)
 
+def qcow2_clone_encrypted(src, dst, secret_material_file, size="", opt=""):
+    """
+    Clone a qcow2 overlay backed by `src`, with LUKS encryption applied only to the
+    overlay layer. `src` is left untouched: qemu reads unallocated clusters from `src`
+    using `src`'s own format, while writes to the new overlay are encrypted with the
+    LUKS master key sealed by the passphrase read from `secret_material_file`.
+
+    `secret_material_file` is a one-shot channel (typically a FIFO produced by
+    key-agent) and is rm'd after the qemu-img invocation.
+
+    For file-based dst we go through a tmp+rename so a half-written file never
+    appears at the target path. For block-device dst (SharedBlock LV) tmp+rename
+    is impossible: we write directly to `dst` and rely on the caller to gc the
+    LV if the qemu-img invocation fails.
+    """
+    if not secret_material_file:
+        raise Exception("qcow2_clone_encrypted requires a non-empty secret material file path")
+    if not os.path.exists(src):
+        raise Exception("backing file %s does not exist" % src)
+
+    fmt = get_img_fmt(src)
+    # qcow2 doesn't allow backing_file together with preallocation
+    opt = re.sub(r"-o\s+preallocation=\w+\s*", " ", opt or "")
+    if not size:
+        size = qcow2_virtualsize(src)
+    dst_is_block = _is_block_device(dst)
+    target_path = dst if dst_is_block else ("%s.creating.%s" % (dst, uuid.uuid4().hex))
+    try:
+        cmd = ("/usr/bin/qemu-img create -u "
+               "--object secret,id=luks_sec,format=raw,file=%s "
+               "-F %s -b %s -f qcow2 %s "
+               "-o encrypt.format=luks,encrypt.key-secret=luks_sec "
+               "%s %s") % (
+            secret_material_file, fmt, src, opt, target_path, size)
+        shell.check_run(cmd)
+        if not dst_is_block:
+            shell.check_run("mv %s %s" % (target_path, dst))
+            os.chmod(dst, 0o660)
+    finally:
+        rm_file_force(secret_material_file)
+        # tmp_path cleanup only meaningful for the file-based dst path
+        if not dst_is_block and os.path.exists(target_path):
+            rm_file_force(target_path)
+
+def qcow2_clone_with_cmd(src, dst, cmd=None):
+    secret_material_file = getattr(cmd, 'encryptLuksSecretMaterialFilePath', None) if cmd else None
+
+    size = cmd.virtualSize if cmd.virtualSize else ""
+    if cmd is None or cmd.kvmHostAddons is None or cmd.kvmHostAddons.qcow2Options is None:
+        if secret_material_file:
+            qcow2_clone_encrypted(src, dst, secret_material_file, size=size)
+        else:
+            qcow2_clone(src, dst, size)
+    else:
+        if secret_material_file:
+            qcow2_clone_encrypted(src, dst, secret_material_file, size=size,
+                                  opt=cmd.kvmHostAddons.qcow2Options)
+        else:
+            qcow2_clone_with_option(src, dst, cmd.kvmHostAddons.qcow2Options, size)
+
+def qcow2_clone_with_secret(src, dst, secret_material_file, size="", kvm_host_addons=None):
+    if kvm_host_addons is None or kvm_host_addons.qcow2Options is None:
+        qcow2_clone_encrypted(src, dst, secret_material_file, size=size)
+    else:
+        qcow2_clone_encrypted(src, dst, secret_material_file, size=size,
+                              opt=kvm_host_addons.qcow2Options)
+
 def raw_clone(src, dst):
     shell.check_run('/usr/bin/qemu-img create -b %s -f raw %s' % (src, dst))
     os.chmod(dst, 0o660)
-
-
-def qcow2_create(dst, size, chmod=True):
-    shell.check_run('/usr/bin/qemu-img create -f qcow2 %s %s' % (dst, size))
-    if (chmod):
-        os.chmod(dst, 0o660)
 
 def qemu_img_resize(target, size, fmt='qcow2', force=False, skip_if_sufficient=False):
     if skip_if_sufficient:
@@ -1368,11 +1451,28 @@ def qemu_img_resize(target, size, fmt='qcow2', force=False, skip_if_sufficient=F
     force_option = '--shrink' if force else ''
     shell.check_run('/usr/bin/qemu-img resize %s %s %s %s' % (fmt_option, force_option, target, size))
 
-def qcow2_create_with_cmd(dst, size, cmd=None, discard_on_metadata=True):
-    if cmd is None or cmd.kvmHostAddons is None or cmd.kvmHostAddons.qcow2Options is None:
-        qcow2_create(dst, size)
-    else:
-        qcow2_create_with_option(dst, size, cmd.kvmHostAddons.qcow2Options, discard_on_metadata)
+def qemu_img_resize_with_secret(target, size, secret_material_file, force=False, skip_if_sufficient=False):
+    if not secret_material_file:
+        raise Exception("qemu_img_resize_with_secret requires a non-empty secret material file path")
+    try:
+        if skip_if_sufficient:
+            virtual_size = qcow2_get_virtual_size(target)
+            if virtual_size >= size:
+                logger.debug('skip resize the encrypted image[%s] as the virtual size[%s] '
+                             'is already larger than the required size[%s]' % (target, virtual_size, size))
+                return
+
+        force_option = '--shrink' if force else ''
+        with _qcow2_image_opts_with_secret_context(target) as target_arg:
+            shell.check_run('%s --object secret,id=luks_sec,format=raw,file=%s %s %s %s' %
+                            (qemu_img.subcmd('resize'), secret_material_file, force_option, target_arg, size))
+    finally:
+        rm_file_force(secret_material_file)
+
+def qcow2_create(dst, size, chmod=True):
+    shell.check_run('/usr/bin/qemu-img create -f qcow2 %s %s' % (dst, size))
+    if (chmod):
+        os.chmod(dst, 0o660)
 
 def qcow2_create_with_option(dst, size, opt="", discard_on_metadata=True):
     shell.check_run('/usr/bin/qemu-img create -f qcow2 %s %s %s' % (opt, dst, size))
@@ -1380,12 +1480,567 @@ def qcow2_create_with_option(dst, size, opt="", discard_on_metadata=True):
         qcow2_discard(dst)
     os.chmod(dst, 0o660)
 
+def qcow2_create_encrypted(dst, size, secret_material_file, opt=""):
+    """
+    Create a standalone LUKS-encrypted qcow2 (no backing). One-shot via `qemu-img create`
+    so the file lands in its final encrypted form; `secret_material_file` is rm'd after.
+
+    File-based dst: tmp+rename to keep the install path atomic.
+    Block-device dst (SharedBlock LV): write directly to `dst` (rename across
+    block devices is meaningless).
+    """
+    if not secret_material_file:
+        raise Exception("qcow2_create_encrypted requires a non-empty secret material file path")
+
+    dst_is_block = _is_block_device(dst)
+    target_path = dst if dst_is_block else ("%s.creating.%s" % (dst, uuid.uuid4().hex))
+    try:
+        cmd = ("/usr/bin/qemu-img create "
+               "--object secret,id=luks_sec,format=raw,file=%s "
+               "-f qcow2 %s "
+               "-o encrypt.format=luks,encrypt.key-secret=luks_sec "
+               "%s %s") % (
+            secret_material_file, opt or "", target_path, size)
+        shell.check_run(cmd)
+        if not dst_is_block:
+            shell.check_run("mv %s %s" % (target_path, dst))
+            os.chmod(dst, 0o660)
+    finally:
+        rm_file_force(secret_material_file)
+        if not dst_is_block and os.path.exists(target_path):
+            rm_file_force(target_path)
+
+def encrypt_plain_volume_in_place(src, secret_material_file, opt=""):
+    """
+    In-place LUKS encryption of the plain volume file at `src`. Dispatches by the
+    source's detected format so each source format lands in its idiomatic encrypted
+    form (no surprise format flips for the user):
+
+      raw   -> `-O luks`         (standalone LUKS container; guest sees raw payload,
+                                  file size ~= original raw + a few MB of LUKS header)
+      qcow2 -> `-O qcow2 -o encrypt.format=luks`   (LUKS embedded in qcow2 header)
+      vmdk  -> never reaches here on real ZStack flows: the imagestore BS rewrites
+               vmdk to qcow2 at addImage time, so the downloaded bits are already
+               qcow2. We still treat any non-raw source as the qcow2 branch as a
+               defensive default.
+
+    Runs the conversion into a tmp file and atomically renames it over `src`. The
+    original plain bits are removed on successful rename. `secret_material_file`
+    is rm'd at the end (single-use).
+
+    Used by the data-volume-from-template encryption path on file-based primary
+    storages: the agent first downloads the plain template into the volume's
+    install path, then invokes this helper to turn it into a self-contained
+    encrypted volume (no backing file). The output keeps the same install path
+    so downstream consumers see no diff; libvirt-side <driver type=...> is
+    resolved at start_vm time by linux.get_img_fmt on the actual file magic.
+    """
+    if not secret_material_file:
+        raise Exception("encrypt_plain_volume_in_place requires a non-empty secret material file path")
+    if not os.path.exists(src):
+        raise Exception("source file %s does not exist" % src)
+
+    fmt = get_img_fmt(src)
+    if fmt == 'raw':
+        # standalone LUKS: -O luks emits a self-contained luks container
+        # (LUKS header + encrypted raw payload). Guest virtual size matches
+        # the original raw; only the few-MB header is overhead.
+        out_format = 'luks'
+        out_opts = "-o key-secret=luks_sec"
+    else:
+        # qcow2-and-friends: keep LUKS-in-qcow2 layout so backing chains, sparse
+        # allocation and qcow2 snapshot semantics survive.
+        out_format = 'qcow2'
+        out_opts = "-o encrypt.format=luks,encrypt.key-secret=luks_sec"
+
+    if _is_block_device(src):
+        raise Exception(
+            "encrypt_plain_volume_in_place does not support block-device source[%s]; "
+            "callers backed by LVM (e.g. SharedBlock) must use "
+            "encrypt_plain_volume_block_to_block which lets the caller manage the "
+            "destination LV lifecycle (lvcreate + lvextend for LUKS header overhead, "
+            "dd back, lvremove)." % src)
+
+    tmp_path = "%s.encrypting.%s" % (src, uuid.uuid4().hex)
+    try:
+        cmd = ("/usr/bin/qemu-img convert "
+               "--object secret,id=luks_sec,format=raw,file=%s "
+               "-f %s -O %s "
+               "%s "
+               "%s %s %s") % (
+            secret_material_file, fmt, out_format, out_opts, opt or "", src, tmp_path)
+        shell.check_run(cmd)
+        shell.check_run("mv -f %s %s" % (tmp_path, src))
+        os.chmod(src, 0o660)
+    finally:
+        rm_file_force(secret_material_file)
+        if os.path.exists(tmp_path):
+            rm_file_force(tmp_path)
+
+
+def encrypt_plain_volume_block_to_block(src_block, dst_block, secret_material_file, opt=""):
+    """
+    Convert plain bits at `src_block` (a block device) into LUKS-encrypted bits
+    at `dst_block` (another block device), one-shot via `qemu-img convert`.
+    Source format is autodetected; output format follows the same rule as
+    `encrypt_plain_volume_in_place`: `raw` -> `-O luks`, anything else -> `-O qcow2`
+    with `encrypt.format=luks`. NOT in-place: the caller owns dst_block's
+    lifecycle (typically lvcreate it, run this helper, then lvrename to swap).
+
+    Block-device callers (SharedBlock LV) own the destination LV lifecycle:
+      1. `lvcreate` a destination LV in the same VG, sized = source size +
+         LUKS header overhead (~16MB safe margin). qemu-img will fail with
+         "Cannot grow device files" if the destination cannot hold the
+         encrypted payload + header.
+      2. Invoke this helper.
+      3. (Optional) `dd if=dst of=src` then `lvremove dst` if the caller wants
+         the encrypted bits to end up under `src`'s LV name -- this helper
+         does not perform that copy; it just runs the qemu-img convert.
+
+    `secret_material_file` is rm'd after the qemu-img invocation, win or lose.
+    """
+    if not secret_material_file:
+        raise Exception("encrypt_plain_volume_block_to_block requires a non-empty secret material file path")
+    if not _is_block_device(src_block):
+        raise Exception("src[%s] is not a block device" % src_block)
+    if not _is_block_device(dst_block):
+        raise Exception("dst[%s] is not a block device" % dst_block)
+
+    fmt = get_img_fmt(src_block)
+    if fmt == 'raw':
+        out_format = 'luks'
+        out_opts = "-o key-secret=luks_sec"
+    else:
+        out_format = 'qcow2'
+        out_opts = "-o encrypt.format=luks,encrypt.key-secret=luks_sec"
+
+    try:
+        cmd = ("/usr/bin/qemu-img convert "
+               "--object secret,id=luks_sec,format=raw,file=%s "
+               "-f %s -O %s "
+               "%s "
+               "%s %s %s") % (
+            secret_material_file, fmt, out_format, out_opts, opt or "", src_block, dst_block)
+        shell.check_run(cmd)
+    finally:
+        rm_file_force(secret_material_file)
+
+def qcow2_create_with_cmd(dst, size, cmd=None, discard_on_metadata=True):
+    secret_material_file = getattr(cmd, 'encryptLuksSecretMaterialFilePath', None) if cmd else None
+
+    if cmd is None or cmd.kvmHostAddons is None or cmd.kvmHostAddons.qcow2Options is None:
+        if secret_material_file:
+            qcow2_create_encrypted(dst, size, secret_material_file)
+        else:
+            qcow2_create(dst, size)
+    else:
+        if secret_material_file:
+            qcow2_create_encrypted(dst, size, secret_material_file,
+                                   opt=cmd.kvmHostAddons.qcow2Options)
+        else:
+            qcow2_create_with_option(dst, size, cmd.kvmHostAddons.qcow2Options, discard_on_metadata)
+
+def is_luks_encrypted_image(src):
+    try:
+        info = simplejson.loads(shell.call('%s --output=json %s' % (qemu_img.subcmd('info'), src)))
+    except Exception:
+        return False
+
+    if info.get('encrypted') is True:
+        return True
+    fmt_data = info.get('format-specific', {}).get('data', {})
+    encrypt = fmt_data.get('encrypt')
+    if isinstance(encrypt, dict):
+        return bool(encrypt.get('format') or encrypt.get('key-secret'))
+    return False
+
+def create_encrypted_template_with_secret(src, dst, secret_material_file,
+                                          dst_format='qcow2', compress=False,
+                                          shell=shell, progress_output=None, opts=None):
+    if not secret_material_file:
+        raise Exception("create_encrypted_template_with_secret requires a non-empty secret material file path")
+    redirect, ext_opts = "", []
+    if progress_output:
+        redirect = " > " + progress_output
+        ext_opts.append("-p")
+    if compress:
+        ext_opts.append("-c")
+    if opts:
+        ext_opts.append(opts)
+
+    dst_is_block = _is_block_device(dst)
+    target_path = dst if dst_is_block else ("%s.creating.%s" % (dst, uuid.uuid4().hex))
+    try:
+        out_format = dst_format
+        if dst_format == 'raw':
+            out_format = 'luks'
+            out_opts = "-o key-secret=luks_sec"
+        else:
+            out_opts = "-o encrypt.format=luks,encrypt.key-secret=luks_sec"
+
+        with _qcow2_image_opts_with_secret_context(src) as src_arg:
+            cmdline = ("%s --object secret,id=luks_sec,format=raw,file=%s "
+                       "%s -O %s %s %s %s %s") % (
+                qemu_img.subcmd('convert'), secret_material_file,
+                " ".join(ext_opts), out_format, out_opts, src_arg, target_path, redirect)
+            shell.call(cmdline)
+        if not dst_is_block:
+            shell.call("mv -f %s %s" % (target_path, dst))
+            os.chmod(dst, 0o660)
+    finally:
+        rm_file_force(secret_material_file)
+        if not dst_is_block and os.path.exists(target_path):
+            rm_file_force(target_path)
+
+def _qcow2_image_opts_with_secret(path, secret_id='luks_sec', include_backing=True, path_aliases=None):
+    image_opts = []
+    current = path
+    prefix = ""
+    path_aliases = path_aliases or {}
+    while current:
+        image_opts.append("%sdriver=%s" % (prefix, get_img_fmt(current)))
+        image_opts.append("%sfile.filename=%s" % (prefix, path_aliases.get(current, current)))
+        if is_luks_encrypted_image(current):
+            image_opts.append("%sencrypt.key-secret=%s" % (prefix, secret_id))
+        if not include_backing:
+            break
+        current = qcow2_get_backing_file(current)
+        prefix += "backing."
+    return "--image-opts %s" % shellquote(",".join(image_opts))
+
+@contextlib.contextmanager
+def _qcow2_path_aliases_context(path, include_backing=True):
+    tmpdir = tempfile.mkdtemp(prefix='zstack-qcow2-backing-', dir='/tmp')
+    try:
+        path_aliases = {}
+        current = path
+        index = 0
+        while current:
+            alias = os.path.join(tmpdir, "b%d" % index)
+            os.symlink(current, alias)
+            path_aliases[current] = alias
+            if not include_backing:
+                break
+            current = qcow2_get_backing_file(current)
+            index += 1
+
+        yield path_aliases
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+@contextlib.contextmanager
+def _qcow2_image_opts_with_secret_context(path, secret_id='luks_sec', include_backing=True):
+    image_opts = _qcow2_image_opts_with_secret(path, secret_id, include_backing)
+    if len(image_opts) <= QCOW2_BACKING_ARG_COMPACT_THRESHOLD:
+        yield image_opts
+        return
+
+    with _qcow2_path_aliases_context(path, include_backing) as path_aliases:
+        yield _qcow2_image_opts_with_secret(path, secret_id, include_backing, path_aliases)
+
+def _qcow2_chain_has_luks_encrypted_image(path):
+    current = path
+    while current:
+        if is_luks_encrypted_image(current):
+            return True
+        current = qcow2_get_backing_file(current)
+    return False
+
+def _qcow2_image_opts_json_with_secret(path, secret_id='luks_sec', include_backing=True):
+    return _qcow2_image_opts_json_with_secret_aliases(path, secret_id, include_backing, {})
+
+def _qcow2_image_opts_json_with_secret_aliases(path, secret_id, include_backing, path_aliases):
+    opts = {
+        "driver": get_img_fmt(path),
+        "file": {
+            "driver": "host_device" if _is_block_device(path) else "file",
+            "filename": path_aliases.get(path, path),
+        },
+    }
+
+    if is_luks_encrypted_image(path):
+        opts["encrypt"] = {
+            "key-secret": secret_id,
+        }
+
+    if include_backing:
+        backing_file = qcow2_get_backing_file(path)
+        if backing_file:
+            opts["backing"] = _qcow2_image_opts_json_with_secret_aliases(backing_file, secret_id, include_backing, path_aliases)
+
+    return opts
+
+def _qcow2_backing_arg_with_secret(path, secret_id='luks_sec', include_backing=True):
+    if not path or not _qcow2_chain_has_luks_encrypted_image(path):
+        return path
+
+    opts = _qcow2_image_opts_json_with_secret(path, secret_id, include_backing)
+    return "json:%s" % json.dumps(opts, separators=(',', ':'))
+
+@contextlib.contextmanager
+def _qcow2_backing_arg_with_secret_context(path, secret_id='luks_sec', include_backing=True):
+    backing_arg = _qcow2_backing_arg_with_secret(path, secret_id, include_backing)
+    if not backing_arg.startswith("json:") or len(backing_arg) <= QCOW2_BACKING_ARG_COMPACT_THRESHOLD:
+        yield backing_arg
+        return
+
+    with _qcow2_path_aliases_context(path, include_backing) as path_aliases:
+        opts = _qcow2_image_opts_json_with_secret_aliases(path, secret_id, include_backing, path_aliases)
+        yield "json:%s" % json.dumps(opts, separators=(',', ':'))
+
+def read_luks_secret_material_file(secret_material_file):
+    if not secret_material_file:
+        return None
+
+    try:
+        with open(secret_material_file, 'rb') as fd:
+            return fd.read()
+    finally:
+        rm_file_force(secret_material_file)
+
+def _write_all(fd, data):
+    written = 0
+    while written < len(data):
+        written += os.write(fd, data[written:])
+
+@contextlib.contextmanager
+def existing_luks_secret_file(secret_material_file):
+    yield secret_material_file
+
+@contextlib.contextmanager
+def temporary_luks_secret_file(secret_material):
+    if secret_material is None:
+        yield None
+        return
+
+    fd, path = tempfile.mkstemp(prefix='zstack-luks-sec-', dir='/tmp')
+    try:
+        os.fchmod(fd, 0o600)
+        _write_all(fd, secret_material)
+        os.close(fd)
+        fd = None
+        yield path
+    finally:
+        if fd is not None:
+            os.close(fd)
+        rm_file_force(path)
+
+@contextlib.contextmanager
+def temporary_luks_secret_fifo(secret_material):
+    if secret_material is None:
+        yield None
+        return
+
+    path = os.path.join('/tmp', 'zstack-luks-fifo-%s' % uuid.uuid4().hex)
+    os.mkfifo(path, 0o600)
+    stop = [False]
+    errors = []
+
+    def write_secret():
+        fd = None
+        try:
+            while not stop[0]:
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                    break
+                except OSError as e:
+                    if e.errno == errno.ENXIO:
+                        time.sleep(0.05)
+                        continue
+                    raise
+            if fd is None:
+                return
+            _write_all(fd, secret_material)
+        except Exception as e:
+            errors.append(e)
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    writer = threading.Thread(target=write_secret)
+    writer.daemon = True
+    writer.start()
+    try:
+        yield path
+    finally:
+        stop[0] = True
+        writer.join(10)
+        rm_file_force(path)
+        if errors:
+            logger.warn('failed to write temporary LUKS secret FIFO %s: %s' % (path, errors[0]))
+
+def qcow2_commit_with_secret(top, base, secret_material_file):
+    if not secret_material_file:
+        raise Exception("qcow2_commit_with_secret requires a non-empty secret material file path")
+    try:
+        with _qcow2_image_opts_with_secret_context(top) as top_arg:
+            base_option = '' if qcow2_get_backing_file(top) == base else '-b %s' % shellquote(base)
+            shell.call('%s --object secret,id=luks_sec,format=raw,file=%s %s %s' %
+                       (qemu_img.subcmd('commit'), secret_material_file, base_option, top_arg))
+    finally:
+        rm_file_force(secret_material_file)
+
+def qcow2_rebase_with_secret(backing_file, target, secret_file_provider):
+    if not secret_file_provider or not callable(secret_file_provider):
+        raise Exception("qcow2_rebase_with_secret requires a non-empty LUKS secret file provider")
+
+    top_virtual_size = int(qcow2_get_virtual_size(target))
+    backing_chain = qcow2_get_backing_chain(target)
+    for idx, bf in enumerate(backing_chain):
+        if idx == len(backing_chain)-1 and get_img_fmt(bf) != 'qcow2':
+            break
+        bf_virtual_size = int(qcow2_get_virtual_size(bf))
+        if bf_virtual_size < top_virtual_size:
+            if is_luks_encrypted_image(bf):
+                with secret_file_provider() as resize_secret:
+                    with _qcow2_image_opts_with_secret_context(bf) as target_arg:
+                        shell.check_run('%s --object secret,id=luks_sec,format=raw,file=%s %s %s' %
+                                        (qemu_img.subcmd('resize'), resize_secret, target_arg, top_virtual_size))
+            else:
+                qemu_img_resize(bf, top_virtual_size)
+        if bf == backing_file:
+            break
+
+    if backing_file:
+        fmt = get_img_fmt(backing_file)
+        backing_arg = _qcow2_backing_arg_with_secret(backing_file)
+        backing_needs_reset = backing_arg != backing_file
+
+        def do_rebase(effective_backing_arg):
+            backing_option = '-F %s -b %s' % (fmt, shellquote(effective_backing_arg))
+            with _qcow2_image_opts_with_secret_context(target) as target_arg:
+                with secret_file_provider() as rebase_secret:
+                    shell.call('%s --object secret,id=luks_sec,format=raw,file=%s %s %s' %
+                               (qemu_img.subcmd('rebase'), rebase_secret, backing_option, target_arg))
+
+        if backing_needs_reset:
+            with _qcow2_backing_arg_with_secret_context(backing_file) as effective_backing_arg:
+                do_rebase(effective_backing_arg)
+        else:
+            do_rebase(backing_arg)
+    else:
+        backing_needs_reset = False
+        with _qcow2_image_opts_with_secret_context(target) as target_arg:
+            with secret_file_provider() as rebase_secret:
+                shell.call('%s --object secret,id=luks_sec,format=raw,file=%s -b "" %s' %
+                           (qemu_img.subcmd('rebase'), rebase_secret, target_arg))
+
+    if backing_file and backing_needs_reset:
+        with _qcow2_image_opts_with_secret_context(target, include_backing=False) as target_arg:
+            with secret_file_provider() as reset_secret:
+                shell.call('%s --object secret,id=luks_sec,format=raw,file=%s -F %s -u -b "%s" %s' %
+                           (qemu_img.subcmd('rebase'), reset_secret, fmt, backing_file, target_arg))
+
+def qcow2_rebase_no_check_with_secret(backing_file, target, secret_material_file, backing_fmt=None):
+    if not secret_material_file:
+        raise Exception("qcow2_rebase_no_check_with_secret requires a non-empty secret material file path")
+    try:
+        fmt = backing_fmt if backing_fmt else get_img_fmt(backing_file)
+        with _qcow2_image_opts_with_secret_context(target, include_backing=False) as target_arg:
+            shell.call('%s --object secret,id=luks_sec,format=raw,file=%s -F %s -u -b "%s" %s' %
+                       (qemu_img.subcmd('rebase'), secret_material_file, fmt, backing_file, target_arg))
+    finally:
+        rm_file_force(secret_material_file)
+
+def convert_qcow2_volume_encryption(src, dst, target_encrypted, secret_file_provider=None,
+                                    target_backing_file=None):
+    if not os.path.exists(src):
+        raise Exception("source image %s does not exist" % src)
+    if target_encrypted and not secret_file_provider:
+        raise Exception("target encrypted conversion requires a non-empty LUKS secret file provider")
+    if _qcow2_chain_has_luks_encrypted_image(src) and not secret_file_provider:
+        raise Exception("source image chain %s contains encrypted image but secret file provider is not provided" % src)
+
+    dst_dir = os.path.dirname(dst)
+    if dst_dir and not os.path.exists(dst_dir):
+        os.makedirs(dst_dir)
+
+    dst_is_block = _is_block_device(dst)
+    target_path = dst if dst_is_block else ("%s.creating.%s" % (dst, uuid.uuid4().hex))
+    backing_arg = target_backing_file
+    backing_fmt = None
+    backing_needs_reset = False
+    try:
+        if target_backing_file:
+            if not os.path.exists(target_backing_file):
+                raise Exception("target backing image %s does not exist" % target_backing_file)
+            backing_fmt = get_img_fmt(target_backing_file)
+            if _qcow2_chain_has_luks_encrypted_image(target_backing_file):
+                if not secret_file_provider:
+                    raise Exception("target backing image chain %s contains encrypted image but secret file provider is not provided" %
+                                    target_backing_file)
+                backing_arg = _qcow2_backing_arg_with_secret(target_backing_file)
+                backing_needs_reset = backing_arg != target_backing_file
+
+        out_opts = []
+        if target_encrypted:
+            out_opts.extend(["encrypt.format=luks", "encrypt.key-secret=luks_sec"])
+        out_opt = "-o %s" % ",".join(out_opts) if out_opts else ""
+
+        @contextlib.contextmanager
+        def src_arg_context():
+            if _qcow2_chain_has_luks_encrypted_image(src):
+                with _qcow2_image_opts_with_secret_context(src) as src_arg:
+                    yield src_arg
+            else:
+                yield "-f %s %s" % (get_img_fmt(src), shellquote(src))
+
+        def run_convert(effective_backing_arg):
+            backing_opt = ""
+            if target_backing_file:
+                backing_opt = "-F %s -B %s" % (backing_fmt, shellquote(effective_backing_arg))
+
+            if secret_file_provider:
+                with secret_file_provider() as secret_file:
+                    secret_opt = "--object secret,id=luks_sec,format=raw,file=%s" % shellquote(secret_file)
+                    shell.check_run("%s %s %s -O qcow2 %s %s %s" % (
+                        qemu_img.subcmd('convert'), secret_opt, src_arg, out_opt, backing_opt, shellquote(target_path)))
+            else:
+                shell.check_run("%s %s -O qcow2 %s %s %s" % (
+                    qemu_img.subcmd('convert'), src_arg, out_opt, backing_opt, shellquote(target_path)))
+
+        with src_arg_context() as src_arg:
+            if backing_needs_reset:
+                with _qcow2_backing_arg_with_secret_context(target_backing_file) as effective_backing_arg:
+                    run_convert(effective_backing_arg)
+            else:
+                run_convert(backing_arg)
+
+        if backing_needs_reset:
+            if target_encrypted:
+                with secret_file_provider() as reset_secret_file:
+                    reset_secret_opt = "--object secret,id=luks_sec,format=raw,file=%s" % shellquote(reset_secret_file)
+                    with _qcow2_image_opts_with_secret_context(target_path, include_backing=False) as target_arg:
+                        shell.check_run("%s %s -F %s -u -b %s %s" % (
+                            qemu_img.subcmd('rebase'), reset_secret_opt, backing_fmt,
+                            shellquote(target_backing_file), target_arg))
+            else:
+                reset_secret_opt = ""
+                target_arg = shellquote(target_path)
+                shell.check_run("%s %s -F %s -u -b %s %s" % (
+                    qemu_img.subcmd('rebase'), reset_secret_opt, backing_fmt,
+                    shellquote(target_backing_file), target_arg))
+
+        if not dst_is_block:
+            shell.check_run("mv -f %s %s" % (shellquote(target_path), shellquote(dst)))
+            os.chmod(dst, 0o660)
+        return os.path.getsize(dst)
+    finally:
+        if not dst_is_block and os.path.exists(target_path):
+            rm_file_force(target_path)
+
 def qcow2_create_with_backing_file(backing_file, dst, size=""):
     fmt = get_img_fmt(backing_file)
     shell.call('/usr/bin/qemu-img create -F %s -f qcow2 -b %s %s %s' % (fmt, backing_file, dst, size))
     os.chmod(dst, 0o660)
 
 def qcow2_create_with_backing_file_and_cmd(backing_file, dst, cmd=None, size=""):
+    secret_material_file = getattr(cmd, 'encryptLuksSecretMaterialFilePath', None) if cmd else None
+    if secret_material_file:
+        opt = ""
+        if cmd is not None and cmd.kvmHostAddons is not None and cmd.kvmHostAddons.qcow2Options is not None:
+            opt = cmd.kvmHostAddons.qcow2Options
+        return qcow2_clone_encrypted(backing_file, dst, secret_material_file, size=size, opt=opt)
     if cmd is None or cmd.kvmHostAddons is None or cmd.kvmHostAddons.qcow2Options is None:
         qcow2_create_with_backing_file(backing_file, dst, size)
     else:
@@ -1482,13 +2137,47 @@ def qcow2_virtualsize(file_path):
     out = cmd.stdout.strip(' \t\r\n')
     return long(out)
 
-def qcow2_get_backing_file(path):
+def qcow2_get_backing_file(path, normalize=True):
+    def json_image_opts_from_arg(arg):
+        if not arg or not arg.startswith('json:'):
+            return None
+        try:
+            return json.loads(arg[len('json:'):])
+        except Exception:
+            return None
+
+    def json_image_opts_file(opts):
+        if not isinstance(opts, dict):
+            return None
+        file_opts = opts.get('file')
+        if isinstance(file_opts, dict):
+            return file_opts.get('filename')
+        return None
+
+    def json_image_opts_backing_file(opts):
+        if not isinstance(opts, dict):
+            return None
+        return json_image_opts_file(opts.get('backing'))
+
+    def normalize_backing_arg(backing):
+        opts = json_image_opts_from_arg(backing)
+        if opts:
+            filename = json_image_opts_file(opts)
+            if filename:
+                return filename
+        return backing
+
+    json_opts = json_image_opts_from_arg(path)
+    if json_opts:
+        return json_image_opts_backing_file(json_opts) or ""
+
     if not os.path.exists(path) and ":" in path:
         # find through protocol
         out = shell.call("%s %s" %(qemu_img.subcmd('info'), path))
         for line in out.splitlines():
             if "backing file:" in line:
-                return line.replace("backing file:", "", 1).strip()
+                backing = line.replace("backing file:", "", 1).strip()
+                return normalize_backing_arg(backing) if normalize else backing
         return ""
 
     with open(path, 'r') as resp:
@@ -1505,7 +2194,8 @@ def qcow2_get_backing_file(path):
 
         backing_file_size = struct.unpack('>L', backing_file_info[8:])[0]
         resp.seek(backing_file_offset)
-        return resp.read(backing_file_size)
+        backing = resp.read(backing_file_size)
+        return normalize_backing_arg(backing) if normalize else backing
 
 def qcow2_get_virtual_size(path):
     # type: (str) -> int

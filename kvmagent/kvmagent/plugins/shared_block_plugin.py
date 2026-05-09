@@ -5,6 +5,7 @@ import random
 import traceback
 
 from kvmagent import kvmagent
+from kvmagent.plugins import volume_secret
 from kvmagent.plugins.imagestore import ImageStoreClient
 from zstacklib.utils import jsonobject
 from zstacklib.utils import shell
@@ -31,6 +32,7 @@ DEFAULT_VG_METADATA_SIZE = "2g"
 DEFAULT_SANLOCK_LV_SIZE = "1024"
 QMP_SOCKET_PATH = "/var/lib/libvirt/qemu/zstack"
 MAX_ACTUAL_SIZE_FACTOR = 3
+LUKS_HEADER_OVERHEAD = 8 * 1024 * 1024
 
 
 class AgentRsp(object):
@@ -135,6 +137,12 @@ class ConvertVolumeFormatRsp(AgentRsp):
     def __init__(self):
         super(ConvertVolumeFormatRsp, self).__init__()
         self.size = None
+
+
+class ConvertVolumeEncryptionRsp(AgentRsp):
+    def __init__(self):
+        super(ConvertVolumeEncryptionRsp, self).__init__()
+        self.actualSizes = {}
 
 
 class RetryException(Exception):
@@ -429,6 +437,8 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
     CLEANUP_VM_METADATA_PATH = "/sharedblock/vm/metadata/cleanup"
     CLEANUP_ALL_VM_METADATA_PATH = "/sharedblock/vm/metadata/cleanupall"
     PREFIX_REBASE_BACKING_FILES_PATH = "/sharedblock/snapshot/prefixrebasebackingfiles"
+    ENCRYPT_VOLUME_BITS_PATH = "/sharedblock/volume/encryptinplace"
+    CONVERT_VOLUME_ENCRYPTION_PATH = "/sharedblock/volume/convertencryption"
 
     _metadata_handler = SblkMetadataHandler(lvm, bash)
 
@@ -492,6 +502,8 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.CLEANUP_ALL_VM_METADATA_PATH, self.cleanup_all_vm_metadata)
         http_server.register_async_uri(self.GET_VM_INSTANCE_METADATA_PATH, self.get_vm_instance_metadata)
         http_server.register_async_uri(self.PREFIX_REBASE_BACKING_FILES_PATH, self.prefix_rebase_backing_files)
+        http_server.register_async_uri(self.ENCRYPT_VOLUME_BITS_PATH, self.encrypt_volume_bits)
+        http_server.register_async_uri(self.CONVERT_VOLUME_ENCRYPTION_PATH, self.convert_volume_encryption)
 
         self.imagestore_client = ImageStoreClient()
 
@@ -911,16 +923,26 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
     def resize_volume(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         install_abs_path = translate_absolute_path_from_install_path(cmd.installPath)
+        secret_material_file = getattr(cmd, 'encryptLuksSecretMaterialFilePath', None)
+        encrypted = bool(getattr(cmd, 'encrypted', False) or secret_material_file)
+        lv_size = int(cmd.size) + LUKS_HEADER_OVERHEAD if encrypted else cmd.size
 
         with lvm.RecursiveOperateLv(install_abs_path, shared=False):
             if cmd.force:
-                lvm.resize_lv(install_abs_path, cmd.size, True)
+                lvm.resize_lv(install_abs_path, lv_size, True)
             else:
-                lvm.extend_lv_from_cmd(install_abs_path, cmd.size, cmd)
+                lvm.extend_lv_from_cmd(install_abs_path, lv_size, cmd)
             fmt = linux.get_img_fmt(install_abs_path)
             if not cmd.live and fmt == 'qcow2':
-                linux.qemu_img_resize(install_abs_path, cmd.size, 'qcow2', cmd.force, skip_if_sufficient=True)
-            ret = linux.qcow2_virtualsize(install_abs_path)
+                if secret_material_file:
+                    linux.qemu_img_resize_with_secret(install_abs_path, cmd.size, secret_material_file,
+                                                      cmd.force, skip_if_sufficient=True)
+                elif encrypted:
+                    raise Exception("encrypted shared block volume resize requires LUKS secret material file")
+                else:
+                    linux.qemu_img_resize(install_abs_path, cmd.size, 'qcow2', cmd.force, skip_if_sufficient=True)
+            ret = cmd.size if cmd.live and encrypted else (
+                linux.qcow2_get_virtual_size(install_abs_path) if encrypted else linux.qcow2_virtualsize(install_abs_path))
 
         rsp = ResizeVolumeRsp()
         rsp.size = ret
@@ -947,6 +969,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         template_abs_path_cache = translate_absolute_path_from_install_path(cmd.templatePathInCache)
         install_abs_path = translate_absolute_path_from_install_path(cmd.installPath)
         qcow2_options = self.calc_qcow2_option(self, cmd.kvmHostAddons, True, cmd.provisioning)
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
 
         with lvm.RecursiveOperateLv(template_abs_path_cache, shared=True, skip_deactivate_tags=[IMAGE_TAG]):
             if cmd.virtualSize:
@@ -955,8 +978,15 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
                 virtual_size = linux.qcow2_virtualsize(template_abs_path_cache)
             lvm.create_lv_from_cmd(install_abs_path, virtual_size, cmd,
                                    "%s::%s::%s" % (VOLUME_TAG, cmd.hostUuid, time.time()), lvmlock=False)
-            size = cmd.virtualSize if cmd.virtualSize else ""
-            linux.qcow2_clone_with_option(template_abs_path_cache, install_abs_path, qcow2_options, size)
+            size = cmd.virtualSize if cmd.virtualSize else virtual_size
+            if encrypted_dek:
+                with volume_secret.luks_secret_channel(encrypted_dek) as secret_material_file:
+                    lvm.extend_lv(install_abs_path, int(virtual_size) + LUKS_HEADER_OVERHEAD,
+                                  skip_if_sufficient=True)
+                    linux.qcow2_clone_encrypted(template_abs_path_cache, install_abs_path,
+                                                secret_material_file, size=size, opt=qcow2_options)
+            else:
+                linux.qcow2_clone_with_option(template_abs_path_cache, install_abs_path, qcow2_options, size)
 
         virtual_size = linux.qcow2_get_virtual_size(install_abs_path)
         lvm.deactive_lv(install_abs_path)
@@ -1019,6 +1049,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         rsp = CreateTemplateFromVolumeRsp()
         volume_abs_path = translate_absolute_path_from_install_path(cmd.volumePath)
         install_abs_path = translate_absolute_path_from_install_path(cmd.installPath)
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
 
         if cmd.sharedVolume:
             lvm.do_active_lv(volume_abs_path, lvm.LvmlockdLockType.SHARE, True)
@@ -1026,12 +1057,19 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         with lvm.RecursiveOperateLv(volume_abs_path, shared=cmd.sharedVolume, skip_deactivate_tags=[IMAGE_TAG]):
             if not lvm.lv_exists(install_abs_path):
                 total_size = self.get_total_required_size(volume_abs_path)
+                if encrypted_dek:
+                    total_size += LUKS_HEADER_OVERHEAD
                 lvm.update_pv_allocate_strategy(cmd)
                 lvm.create_lv_from_absolute_path(install_abs_path, total_size,
                                                  "%s::%s::%s" % (VOLUME_TAG, cmd.hostUuid, time.time()))
             with lvm.OperateLv(install_abs_path, shared=False, delete_when_exception=True):
                 t_shell = traceable_shell.get_shell(cmd)
-                linux.create_template(volume_abs_path, install_abs_path, shell=t_shell)
+                if encrypted_dek:
+                    with volume_secret.luks_secret_channel(encrypted_dek) as secret_file:
+                        linux.create_encrypted_template_with_secret(
+                            volume_abs_path, install_abs_path, secret_file, shell=t_shell)
+                else:
+                    linux.create_template(volume_abs_path, install_abs_path, shell=t_shell)
                 logger.debug('successfully created template[%s] from volume[%s]' % (cmd.installPath, cmd.volumePath))
 
                 if cmd.compareQcow2:
@@ -1060,15 +1098,23 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         rsp = CreateTemplateFromVolumeRsp()
         volume_abs_path = translate_absolute_path_from_install_path(cmd.volumePath)
         install_abs_path = translate_absolute_path_from_install_path(cmd.installPath)
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
 
         with lvm.RecursiveOperateLv(volume_abs_path, shared=True, skip_deactivate_tags=[IMAGE_TAG]):
             if not lvm.lv_exists(install_abs_path):
                 total_size = self.get_total_required_size(volume_abs_path)
+                if encrypted_dek:
+                    total_size += LUKS_HEADER_OVERHEAD
                 lvm.update_pv_allocate_strategy(cmd)
                 lvm.create_lv_from_absolute_path(install_abs_path, total_size, IMAGE_TAG)
             with lvm.OperateLv(install_abs_path, shared=False, delete_when_exception=True):
                 t_shell = traceable_shell.get_shell(cmd)
-                linux.create_template(volume_abs_path, install_abs_path, shell=t_shell)
+                if encrypted_dek:
+                    with volume_secret.luks_secret_channel(encrypted_dek) as secret_file:
+                        linux.create_encrypted_template_with_secret(
+                            volume_abs_path, install_abs_path, secret_file, shell=t_shell)
+                else:
+                    linux.create_template(volume_abs_path, install_abs_path, shell=t_shell)
                 logger.debug('successfully created template cache [%s] from volume[%s]' % (cmd.installPath, cmd.volumePath))
 
                 if cmd.compareQcow2:
@@ -1198,6 +1244,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         rsp = RevertVolumeFromSnapshotRsp()
         snapshot_abs_path = translate_absolute_path_from_install_path(cmd.snapshotInstallPath)
         qcow2_options = self.calc_qcow2_option(self, cmd.kvmHostAddons, True, cmd.provisioning)
+        secret_material_file = getattr(cmd, 'encryptLuksSecretMaterialFilePath', None)
         new_volume_path = cmd.installPath
         if new_volume_path is None or new_volume_path == "":
             new_volume_path = "/dev/%s/%s" % (cmd.vgUuid, uuidhelper.uuid())
@@ -1206,12 +1253,17 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
 
         with lvm.RecursiveOperateLv(snapshot_abs_path, shared=True):
             size = linux.qcow2_virtualsize(snapshot_abs_path)
+            lv_size = int(size) + LUKS_HEADER_OVERHEAD if secret_material_file else size
             pe_ranges = lvm.get_lv_affinity_sorted_pvs(snapshot_abs_path, cmd)
-            lvm.create_lv_from_cmd(new_volume_path, size, cmd,
+            lvm.create_lv_from_cmd(new_volume_path, lv_size, cmd,
                                              "%s::%s::%s" % (VOLUME_TAG, cmd.hostUuid, time.time()), pe_ranges=pe_ranges)
             with lvm.OperateLv(new_volume_path, shared=False, delete_when_exception=True):
-                linux.qcow2_clone_with_option(snapshot_abs_path, new_volume_path, qcow2_options)
-                size = linux.qcow2_virtualsize(new_volume_path)
+                if secret_material_file:
+                    linux.qcow2_clone_encrypted(snapshot_abs_path, new_volume_path,
+                                                secret_material_file, size=size, opt=qcow2_options)
+                else:
+                    linux.qcow2_clone_with_option(snapshot_abs_path, new_volume_path, qcow2_options)
+                    size = linux.qcow2_virtualsize(new_volume_path)
 
         rsp.newVolumeInstallPath = new_volume_path
         rsp.size = size
@@ -1223,11 +1275,14 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         rsp = MergeSnapshotRsp()
         snapshot_abs_path = translate_absolute_path_from_install_path(cmd.snapshotInstallPath)
         workspace_abs_path = translate_absolute_path_from_install_path(cmd.workspaceInstallPath)
+        secret_material_file = getattr(cmd, 'encryptLuksSecretMaterialFilePath', None)
 
         lvm.update_pv_allocate_strategy(cmd)
         with lvm.RecursiveOperateLv(snapshot_abs_path, shared=True):
             virtual_size = linux.qcow2_virtualsize(snapshot_abs_path)
             lv_size = max(self.get_total_required_size(snapshot_abs_path), int(lvm.get_lv_size(snapshot_abs_path)))
+            if secret_material_file:
+                lv_size += LUKS_HEADER_OVERHEAD
             if not lvm.lv_exists(workspace_abs_path):
                 pe_ranges = lvm.get_lv_affinity_sorted_pvs(snapshot_abs_path, cmd)
                 lvm.create_lv_from_absolute_path(workspace_abs_path, lv_size,
@@ -1236,7 +1291,11 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
                                                  exact_size=True)
             with lvm.OperateLv(workspace_abs_path, shared=False, delete_when_exception=True):
                 t_shell = traceable_shell.get_shell(cmd)
-                linux.create_template(snapshot_abs_path, workspace_abs_path, shell=t_shell)
+                if secret_material_file:
+                    linux.create_encrypted_template_with_secret(
+                        snapshot_abs_path, workspace_abs_path, secret_material_file, shell=t_shell)
+                else:
+                    linux.create_template(snapshot_abs_path, workspace_abs_path, shell=t_shell)
                 rsp.size = virtual_size
                 rsp.actualSize = int(lvm.get_lv_size(workspace_abs_path))
 
@@ -1277,36 +1336,50 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         rsp = OfflineMergeSnapshotRsp()
         src_abs_path = translate_absolute_path_from_install_path(cmd.srcPath) if not cmd.fullRebase else ""
         dst_abs_path = translate_absolute_path_from_install_path(cmd.destPath)
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
 
-        with lvm.RecursiveOperateLv(dst_abs_path, shared=False, skip_deactivate_tags=[IMAGE_TAG]):
-            if linux.qcow2_get_backing_file(dst_abs_path) == src_abs_path:
+        try:
+            with lvm.RecursiveOperateLv(dst_abs_path, shared=False, skip_deactivate_tags=[IMAGE_TAG]):
+                raw_backing = linux.qcow2_get_backing_file(dst_abs_path, normalize=False)
+                backing_needs_reset = encrypted_dek and raw_backing and raw_backing.startswith('json:')
+                if linux.qcow2_get_backing_file(dst_abs_path) == src_abs_path and not backing_needs_reset:
+                    rsp.actualSize = lvm.get_lv_size(dst_abs_path)
+                    rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
+                    return jsonobject.dumps(rsp)
+
+                total_required_size = self.get_total_required_size(dst_abs_path)
+                current_size = int(lvm.get_lv_size(dst_abs_path))
+                if not cmd.fullRebase:
+                    if current_size < total_required_size:
+                        lvm.extend_lv_from_cmd(dst_abs_path, total_required_size, cmd, extend_thin_by_specified_size=True)
+
+                    with lvm.RecursiveOperateLv(src_abs_path, shared=True):
+                        if encrypted_dek:
+                            linux.qcow2_rebase_with_secret(src_abs_path, dst_abs_path,
+                                                           lambda: volume_secret.luks_secret_channel(encrypted_dek))
+                        else:
+                            linux.qcow2_rebase(src_abs_path, dst_abs_path)
+                else:
+                    tmp_abs_path = os.path.join(os.path.dirname(dst_abs_path), 'tmp_%s' % uuidhelper.uuid())
+                    logger.debug("creating temp lv %s" % tmp_abs_path)
+                    lv_size = max(total_required_size, current_size)
+                    if encrypted_dek:
+                        lv_size += LUKS_HEADER_OVERHEAD
+                    pe_ranges = lvm.get_lv_affinity_sorted_pvs(dst_abs_path, cmd)
+                    lvm.create_lv_from_absolute_path(tmp_abs_path, lv_size,
+                                                     "%s::%s::%s" % (VOLUME_TAG, cmd.hostUuid, time.time()),
+                                                     pe_ranges=pe_ranges,
+                                                     exact_size=True)
+                    with lvm.OperateLv(tmp_abs_path, shared=False, delete_when_exception=True):
+                        if encrypted_dek:
+                            linux.create_encrypted_template_with_secret(dst_abs_path, tmp_abs_path, volume_secret.make_luks_secret_file(encrypted_dek))
+                        else:
+                            qcow2.create_template_with_task_daemon(dst_abs_path, tmp_abs_path, task_spec=cmd)
+                        lvm.lv_rename(tmp_abs_path, dst_abs_path, overwrite=True)
+                lvm.delete_lv_meta(dst_abs_path)
                 rsp.actualSize = lvm.get_lv_size(dst_abs_path)
-                rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
-                return jsonobject.dumps(rsp)
-
-            total_required_size = self.get_total_required_size(dst_abs_path)
-            current_size = int(lvm.get_lv_size(dst_abs_path))
-            if not cmd.fullRebase:
-                if current_size < total_required_size:
-                    lvm.extend_lv_from_cmd(dst_abs_path, total_required_size, cmd, extend_thin_by_specified_size=True)
-
-                with lvm.RecursiveOperateLv(src_abs_path, shared=True):
-                    linux.qcow2_rebase(src_abs_path, dst_abs_path)
-            else:
-                tmp_abs_path = os.path.join(os.path.dirname(dst_abs_path), 'tmp_%s' % uuidhelper.uuid())
-                logger.debug("creating temp lv %s" % tmp_abs_path)
-                lv_size = max(total_required_size, current_size)
-                pe_ranges = lvm.get_lv_affinity_sorted_pvs(dst_abs_path, cmd)
-                lvm.create_lv_from_absolute_path(tmp_abs_path, lv_size,
-                                                 "%s::%s::%s" % (VOLUME_TAG, cmd.hostUuid, time.time()),
-                                                 pe_ranges=pe_ranges,
-                                                 exact_size=True)
-                with lvm.OperateLv(tmp_abs_path, shared=False, delete_when_exception=True):
-                    qcow2.create_template_with_task_daemon(dst_abs_path, tmp_abs_path, task_spec=cmd)
-                    lvm.lv_rename(tmp_abs_path, dst_abs_path, overwrite=True)
-            lvm.delete_lv_meta(dst_abs_path)
-            rsp.actualSize = lvm.get_lv_size(dst_abs_path)
-        rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
+        finally:
+            rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
@@ -1315,16 +1388,22 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         rsp = OfflineCommitSnapshotRsp()
         top = translate_absolute_path_from_install_path(cmd.top)
         base = translate_absolute_path_from_install_path(cmd.base)
-
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
         with lvm.RecursiveOperateLv(top, shared=True):
-            if linux.qcow2_get_backing_file(cmd.top) != linux.qcow2_get_backing_file(cmd.base):
-                linux.qcow2_commit(cmd.top, cmd.base)
+            if linux.qcow2_get_backing_file(top) != linux.qcow2_get_backing_file(base):
+                if encrypted_dek:
+                    linux.qcow2_commit_with_secret(top, base, volume_secret.make_luks_secret_file(encrypted_dek))
+                else:
+                    linux.qcow2_commit(top, base)
 
             if cmd.topChildrenInstallPathInDb:
                 for childrenInstallPath in cmd.topChildrenInstallPathInDb:
                     with lvm.RecursiveOperateLv(childrenInstallPath, shared=True):
                         if linux.qcow2_get_backing_file(childrenInstallPath) != base:
-                            linux.qcow2_rebase_no_check(base, childrenInstallPath)
+                            if encrypted_dek:
+                                linux.qcow2_rebase_no_check_with_secret(base, childrenInstallPath, volume_secret.make_luks_secret_file(encrypted_dek))
+                            else:
+                                linux.qcow2_rebase_no_check(base, childrenInstallPath)
 
             lvm.delete_lv_meta(base)
 
@@ -1339,6 +1418,13 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         rsp = CreateEmptyVolumeRsp()
 
         install_abs_path = translate_absolute_path_from_install_path(cmd.installPath)
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
+
+        def make_secret():
+            if encrypted_dek:
+                return volume_secret.make_luks_secret_file(encrypted_dek)
+
+        is_encrypted = bool(encrypted_dek)
 
         if cmd.backingFile:
             qcow2_options = self.calc_qcow2_option(self, cmd.kvmHostAddons, True, cmd.provisioning)
@@ -1350,7 +1436,13 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
                     lvm.create_lv_from_cmd(install_abs_path, virtual_size, cmd,
                                                      "%s::%s::%s" % (VOLUME_TAG, cmd.hostUuid, time.time()))
                 with lvm.OperateLv(install_abs_path, shared=False, delete_when_exception=True):
-                    linux.qcow2_create_with_backing_file_and_option(backing_abs_path, install_abs_path, qcow2_options)
+                    if is_encrypted:
+                        lvm.extend_lv(install_abs_path, int(virtual_size) + LUKS_HEADER_OVERHEAD,
+                                      skip_if_sufficient=True)
+                        linux.qcow2_clone_encrypted(backing_abs_path, install_abs_path,
+                                                    make_secret(), size=virtual_size, opt=qcow2_options)
+                    else:
+                        linux.qcow2_create_with_backing_file_and_option(backing_abs_path, install_abs_path, qcow2_options)
                     rsp.size = linux.qcow2_virtualsize(install_abs_path)
         elif not lvm.lv_exists(install_abs_path):
             lvm.create_lv_from_cmd(install_abs_path, cmd.size, cmd,
@@ -1358,8 +1450,17 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
             if cmd.volumeFormat != 'raw':
                 qcow2_options = self.calc_qcow2_option(self, cmd.kvmHostAddons, False, cmd.provisioning)
                 with lvm.OperateLv(install_abs_path, shared=False, delete_when_exception=True):
-                    linux.qcow2_create_with_option(install_abs_path, cmd.size, qcow2_options, discard_on_metadata=False)
-                    if cmd.zeroFilled:
+                    if is_encrypted:
+                        lvm.extend_lv(install_abs_path, int(cmd.size) + LUKS_HEADER_OVERHEAD,
+                                      skip_if_sufficient=True)
+                        linux.qcow2_create_encrypted(install_abs_path, cmd.size,
+                                                     make_secret(), opt=qcow2_options)
+                    else:
+                        linux.qcow2_create_with_option(install_abs_path, cmd.size, qcow2_options, discard_on_metadata=False)
+                    if cmd.zeroFilled and not is_encrypted:
+                        # Skip zero-fill on LUKS volumes: qcow2 LUKS clusters are
+                        # always cipher-noise so a deliberate-zero pre-pass adds
+                        # nothing and just wastes IO.
                         linux.qcow2_fill(0, 1048576, install_abs_path)
                     rsp.size = linux.qcow2_virtualsize(install_abs_path)
 
@@ -1380,6 +1481,175 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
             lvm.add_lv_tag(install_abs_path, "%s::%s::%s" % (VOLUME_TAG, cmd.hostUuid, time.time()))
 
         lvm.delete_lv_meta(install_abs_path)
+
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    @lock.file_lock(LOCK_FILE)
+    def encrypt_volume_bits(self, req):
+        """
+        In-place LUKS encryption of a plain volume on a SharedBlock LV.
+
+        Strategy (block-device path; cannot mv-overwrite like LocalStorage):
+          1. lvcreate a sibling tmp LV in the same VG, sized = src + LUKS header
+             overhead so qemu-img convert has room for the LUKS header.
+          2. qemu-img convert  -f <auto>  -O luks  (or -O qcow2 + encrypt.format=luks)
+             src  ->  tmp_lv.  Source format dispatches per
+             linux.encrypt_plain_volume_block_to_block:
+                 raw   -> -O luks         (standalone LUKS, guest sees raw)
+                 qcow2 -> -O qcow2 +encrypt.format=luks (LUKS-in-qcow2)
+          3. Replace src with tmp_lv via lvrename (atomic, O(1), no data copy):
+                 lvrename src     -> <src>.old.<ts>
+                lvrename tmp_lv  -> src           tmp now lives at the install path
+                 lvremove <src>.old.<ts>
+             lvm.lv_rename(..., overwrite=True) implements exactly this dance.
+          4. On any failure, lvremove the tmp LV best-effort.
+        """
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        rsp = AgentRsp()
+        tmp_lv_path = None
+        try:
+            install_abs_path = translate_absolute_path_from_install_path(cmd.installPath)
+            encrypted_dek = getattr(cmd, 'encryptedDek', None)
+            sec_file = volume_secret.make_luks_secret_file(encrypted_dek)
+
+            with lvm.OperateLv(install_abs_path, shared=False):
+                # qemu-img convert -O luks needs dst >= src virtual size + LUKS
+                # header (~2MB). On a raw LV, virtual size = block device size.
+                # We make dst strictly larger by LUKS_HEADER_OVERHEAD;
+                # `create_lv_from_cmd` internally re-pads via calcLvReservedSize
+                # so dst ends up larger than src by the LUKS and LVM margins.
+                # We deliberately do NOT touch src -- growing src would only
+                # enlarge what qemu-img has to write into LUKS payload.
+                src_size = int(lvm.get_lv_size(install_abs_path))
+                dst_request_size = src_size + LUKS_HEADER_OVERHEAD
+
+                vg_uuid = cmd.vgUuid
+                tmp_lv_name = "%s-encrypting-%s" % (
+                    os.path.basename(install_abs_path), uuidhelper.uuid()[:8])
+                tmp_lv_path = "/dev/%s/%s" % (vg_uuid, tmp_lv_name)
+                lvm.create_lv_from_cmd(tmp_lv_path, dst_request_size, cmd,
+                                       "%s::%s::%s" % (VOLUME_TAG, cmd.hostUuid, time.time()))
+
+                with lvm.OperateLv(tmp_lv_path, shared=False, delete_when_exception=True):
+                    # Run the LUKS convert: tmp_lv now holds [LUKS header | encrypted payload].
+                    linux.encrypt_plain_volume_block_to_block(install_abs_path, tmp_lv_path, sec_file)
+
+                # Atomic swap: tmp_lv takes over the install path, original src
+                # LV is renamed aside and then removed. lvm.lv_rename(overwrite=True)
+                # does the 3-step dance internally; if the second rename fails it
+                # rolls back. After success, tmp_lv_path no longer exists -- the
+                # encrypted bits live at install_abs_path under the original name.
+                lvm.lv_rename(tmp_lv_path, install_abs_path, overwrite=True)
+                tmp_lv_path = None     # ownership transferred; nothing to clean
+
+            logger.debug('successfully LUKS-encrypted volume bits at %s' % install_abs_path)
+        except Exception as e:
+            logger.warn(linux.get_exception_stacktrace())
+            rsp.success = False
+            rsp.error = 'failed to LUKS-encrypt volume bits at %s: %s' % (cmd.installPath, str(e))
+        finally:
+            # Reap leftover tmp LV when the convert / rename never completed.
+            # On the happy path tmp_lv_path was set to None right after lv_rename,
+            # so this is a no-op then.
+            if tmp_lv_path is not None and lvm.lv_exists(tmp_lv_path):
+                try:
+                    lvm.delete_lv(tmp_lv_path, raise_exception=False)
+                except Exception as cleanup_ex:
+                    logger.warn("failed to lvremove tmp encrypt LV %s: %s" %
+                                (tmp_lv_path, cleanup_ex))
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    @lock.file_lock(LOCK_FILE)
+    def convert_volume_encryption(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        rsp = ConvertVolumeEncryptionRsp()
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
+        converted_items = []
+        converted_target_paths = {}
+        renamed_sources = []
+        finalized_targets = []
+
+        def rebase_secret_file(reason):
+            return volume_secret.luks_secret_channel(encrypted_dek)
+
+        try:
+            if cmd.targetEncrypted and not encrypted_dek:
+                raise Exception("target encrypted conversion requires encryptedDek")
+
+            lvm.update_pv_allocate_strategy(cmd)
+            for index, item in enumerate(cmd.items):
+                source_abs_path = translate_absolute_path_from_install_path(item.sourceInstallPath)
+                target_abs_path = translate_absolute_path_from_install_path(item.targetInstallPath)
+                temp_abs_path = "%s_converted_%s" % (target_abs_path, uuidhelper.uuid())
+
+                target_backing_abs_path = None
+                if getattr(item, 'targetBackingInstallPath', None):
+                    target_backing_abs_path = translate_absolute_path_from_install_path(item.targetBackingInstallPath)
+                effective_backing_abs_path = converted_target_paths.get(target_backing_abs_path, target_backing_abs_path)
+
+                if lvm.lv_exists(temp_abs_path):
+                    lvm.delete_lv(temp_abs_path)
+
+                secret_file_provider = (lambda: volume_secret.luks_secret_channel(encrypted_dek)) if encrypted_dek else None
+                with lvm.RecursiveOperateLv(source_abs_path, shared=True):
+                    lv_size = int(lvm.get_lv_size(source_abs_path))
+                    if cmd.targetEncrypted:
+                        lv_size += LUKS_HEADER_OVERHEAD
+                    lvm.create_lv_from_absolute_path(temp_abs_path, lv_size, exact_size=True)
+
+                    if effective_backing_abs_path:
+                        with lvm.RecursiveOperateLv(effective_backing_abs_path, shared=True):
+                            with lvm.OperateLv(temp_abs_path, shared=False, delete_when_exception=True):
+                                actual_size = linux.convert_qcow2_volume_encryption(
+                                    source_abs_path, temp_abs_path, cmd.targetEncrypted,
+                                    secret_file_provider, effective_backing_abs_path)
+                    else:
+                        with lvm.OperateLv(temp_abs_path, shared=False, delete_when_exception=True):
+                            actual_size = linux.convert_qcow2_volume_encryption(
+                                source_abs_path, temp_abs_path, cmd.targetEncrypted,
+                                secret_file_provider, effective_backing_abs_path)
+
+                rsp.actualSizes[item.resourceUuid] = long(lvm.get_lv_size(temp_abs_path) or actual_size)
+                converted_items.append((item, source_abs_path, temp_abs_path, target_abs_path,
+                                        effective_backing_abs_path, target_backing_abs_path))
+                converted_target_paths[target_abs_path] = temp_abs_path
+
+            for item, source_abs_path, _, _, _, _ in converted_items:
+                source_trash_path = getattr(item, 'sourceTrashInstallPath', None)
+                if source_trash_path:
+                    source_trash_abs_path = translate_absolute_path_from_install_path(source_trash_path)
+                    r, o, e = lvm.lv_rename(source_abs_path, source_trash_abs_path, False)
+                    if r != 0:
+                        raise Exception("rename lv %s to trash %s failed: stdout: %s, stderr: %s" %
+                                        (source_abs_path, source_trash_abs_path, o, e))
+                    renamed_sources.append((source_trash_abs_path, source_abs_path))
+
+            for _, _, temp_abs_path, target_abs_path, effective_backing_abs_path, target_backing_abs_path in converted_items:
+                if target_backing_abs_path and effective_backing_abs_path != target_backing_abs_path:
+                    with lvm.RecursiveOperateLv(target_backing_abs_path, shared=True):
+                        with lvm.OperateLv(temp_abs_path, shared=False):
+                            if cmd.targetEncrypted:
+                                with rebase_secret_file("final encrypted backing rebase") as reset_secret_file:
+                                    linux.qcow2_rebase_no_check_with_secret(target_backing_abs_path, temp_abs_path, reset_secret_file)
+                            else:
+                                linux.qcow2_rebase_no_check(target_backing_abs_path, temp_abs_path)
+                lvm.lv_rename(temp_abs_path, target_abs_path, False)
+                finalized_targets.append(target_abs_path)
+
+            rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
+        except Exception as e:
+            logger.warn(linux.get_exception_stacktrace())
+            for target_abs_path in finalized_targets:
+                lvm.delete_lv(target_abs_path, False)
+            for _, _, temp_abs_path, _, _, _ in converted_items:
+                lvm.delete_lv(temp_abs_path, False)
+            for source_trash_abs_path, source_abs_path in reversed(renamed_sources):
+                if lvm.lv_exists(source_trash_abs_path) and not lvm.lv_exists(source_abs_path):
+                    lvm.lv_rename(source_trash_abs_path, source_abs_path, False)
+            rsp.success = False
+            rsp.error = 'failed to convert volume[%s] encryption: %s' % (cmd.volumeUuid, str(e))
 
         return jsonobject.dumps(rsp)
 
