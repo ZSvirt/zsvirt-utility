@@ -4187,6 +4187,7 @@ class Vm(object):
             # set the hostname, otherwise the migration will fail
             shell.call('hostname %s.zstack.org' % hostname)
 
+        migrate_tls = cmd.hasattr('migrateTls') and cmd.migrateTls
         destUrl = "qemu+tcp://{0}/system".format(cmd.destHostManagementIp)
         tcpUri = "tcp://{0}".format(cmd.destHostIp)
         bandwidth = cmd.bandwidth if cmd.bandwidth > 0 else 0
@@ -4208,6 +4209,31 @@ class Vm(object):
         flag = (libvirt.VIR_MIGRATE_LIVE |
                 libvirt.VIR_MIGRATE_PEER2PEER |
                 libvirt.VIR_MIGRATE_UNDEFINE_SOURCE)
+
+        if migrate_tls:
+            if not hasattr(libvirt, 'VIR_MIGRATE_TLS'):
+                raise kvmagent.KvmError('libvirt python binding does not support TLS migration')
+            flag |= libvirt.VIR_MIGRATE_TLS
+            for p in ('/etc/pki/qemu/ca-cert.pem',
+                      '/etc/pki/qemu/server-cert.pem',
+                      '/etc/pki/qemu/server-key.pem',
+                      '/etc/pki/qemu/client-cert.pem',
+                      '/etc/pki/qemu/client-key.pem'):
+                if not os.path.exists(p):
+                    raise kvmagent.KvmError('migration TLS certificate file[%s] is missing' % p)
+            qemu_conf = '/etc/libvirt/qemu.conf'
+            if not os.path.exists(qemu_conf):
+                raise kvmagent.KvmError('migration TLS requeired libvirt qemu config[%s] is missing' % qemu_conf)
+            with open(qemu_conf, 'r') as fd:
+                qemu_conf_content = fd.read()
+            if re.search(r'(?m)^\s*migrate_tls_x509_verify\s*=\s*1\s*$', qemu_conf_content) is None:
+                raise kvmagent.KvmError('migration TLS required migrate_tls_x509_verify is not configured')
+            if re.search(r'(?m)^\s*migrate_tls_x509_cert_dir\s*=\s*"/etc/pki/qemu"\s*$', qemu_conf_content) is None:
+                raise kvmagent.KvmError('migration TLS requiredmigrate_tls_x509_cert_dir is not configured')
+            logger.debug('migration TLS enabled for vm[uuid:%s], mutualTls:%s, expectedDestCertFingerprint:%s' % (
+                cmd.vmUuid,
+                cmd.mutualTls if cmd.hasattr('mutualTls') else None,
+                cmd.expectedDestCertFingerprint if cmd.hasattr('expectedDestCertFingerprint') else None))
 
         if cmd.downTime:
             self.domain.migrateSetMaxDowntime(cmd.downTime)

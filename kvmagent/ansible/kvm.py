@@ -529,6 +529,12 @@ def copy_kvm_files():
         _dst = os.path.join(workplace, file)
         copy_to_remote(_src, _dst, None, host_post_info)
 
+    # Ensure cert dir exists before qemu.conf references it and libvirtd restarts.
+    command = 'test -d /etc/pki/qemu || mkdir -p /etc/pki/qemu'
+    host_post_info.post_label = "ansible.shell.mkdir"
+    host_post_info.post_label_param = "/etc/pki/qemu"
+    run_remote_command(command, host_post_info)
+
     # copy qemu configration file
     qemu_conf_src = os.path.join(file_root, "qemu.conf")
     qemu_conf_dst = "/etc/libvirt/qemu.conf"
