@@ -10,6 +10,8 @@ logger = log.get_logger(__name__)
 
 KEY_AGENT_UNIX_SOCKET = 'unix:///var/run/key-agent/key-agent.sock'
 KEY_AGENT_SOCKET_PATH = '/var/run/key-agent/key-agent.sock'
+VOLUME_BACKUP_ENCRYPTION_ADDON = 'VolumeBackupEncryption'
+VOLUME_BACKUP_ENCRYPTION_SPECS = 'specs'
 
 try:
     import grpc
@@ -35,6 +37,68 @@ def _decode_encrypted_dek(encrypted_dek_b64):
     if encoded.rstrip('=') != normalized.rstrip('='):
         raise Exception('encryptedDek must be canonical base64')
     return encrypted_dek
+
+
+def _get_value(obj, key, default=None):
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        return obj[key]
+    except Exception:
+        return getattr(obj, key, default)
+
+
+def _volume_backup_spec_to_json(spec):
+    if not spec or not _get_value(spec, 'encrypted', False):
+        return None
+
+    return {
+        'encrypted': True,
+        'encryptedDek': _get_value(spec, 'encryptedDek'),
+        'keyProviderUuid': _get_value(spec, 'keyProviderUuid'),
+        'keyVersion': _get_value(spec, 'keyVersion'),
+        'cipher': _get_value(spec, 'cipher'),
+    }
+
+
+def _volume_backup_specs(addons):
+    addon = _get_value(addons, VOLUME_BACKUP_ENCRYPTION_ADDON)
+    return _get_value(addon, VOLUME_BACKUP_ENCRYPTION_SPECS, []) or []
+
+
+def make_backup_args_option(cmdstr, args, addons, device_ids, write_json_temp_file, key_agent_provider):
+    specs = _volume_backup_specs(addons)
+    specs_by_device_id = {
+        _get_value(spec, 'deviceId'): spec for spec in specs
+    }
+
+    if not any(_volume_backup_spec_to_json(spec) for spec in specs_by_device_id.values()):
+        return cmdstr, None
+
+    backups = []
+    for idx, arg in enumerate(args):
+        item = {
+            'bitmap': arg[0],
+            'mode': arg[1],
+            'drive': arg[2],
+            'speed': arg[3],
+        }
+
+        device_id = device_ids[idx] if idx < len(device_ids) else None
+        spec_json = _volume_backup_spec_to_json(specs_by_device_id.get(device_id))
+        if spec_json:
+            item['encryption'] = spec_json
+        backups.append(item)
+
+    args_file = write_json_temp_file({'backups': backups})
+    args_option = '-args-json-file %s -secret-channel-provider %s' % (
+        args_file, key_agent_provider)
+    backup_cmdstr = re.sub(r' -args [^ ]+$', ' %s' % args_option, cmdstr)
+    if backup_cmdstr == cmdstr:
+        raise Exception('failed to replace zstcli backup args option')
+    return backup_cmdstr, args_file
 
 
 def prepare_luks_secret_material_channel(encrypted_dek_b64):

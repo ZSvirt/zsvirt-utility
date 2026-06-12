@@ -781,7 +781,7 @@ class VolumeBackupInfo(object):
 
 
 class TakeVolumesBackupsCommand(kvmagent.AgentCommand):
-    @log.sensitive_fields("password")
+    @log.sensitive_fields("password", "addons.VolumeBackupEncryption.specs.encryptedDek")
     def __init__(self):
         super(TakeVolumesBackupsCommand, self).__init__()
         self.hostname = None
@@ -9487,7 +9487,6 @@ host side snapshot files chian:
     def do_take_volumes_backup(self, cmd, target_disks, bitmaps, dstdir):
         isc = ImageStoreClient()
         backupArgs = {}
-        final_backup_args = []
         speed = cmd.volumeWriteBandwidth if cmd.volumeWriteBandwidth else 0
         backing_files = {}
 
@@ -9515,10 +9514,13 @@ host side snapshot files chian:
 
             args = get_backup_args()
             backupArgs[deviceId] = args
-            final_backup_args.append(args)
+
+        final_backup_args = [backupArgs[deviceId] for deviceId in device_ids]
 
         logger.info('{api: %s} taking backup for vm: %s' % (cmd.threadContext["api"], cmd.vmUuid))
-        res = isc.backup_volumes(cmd.vmUuid, final_backup_args, dstdir, cmd.pointInTime, Report.from_spec(cmd, "VmBackup"), get_task_stage(cmd))
+        res = isc.backup_volumes(cmd.vmUuid, final_backup_args, dstdir, cmd.pointInTime,
+                                 Report.from_spec(cmd, "VmBackup"), get_task_stage(cmd),
+                                 getattr(cmd, 'addons', None), device_ids)
         logger.info('{api: %s} completed backup for vm: %s' % (cmd.threadContext["api"], cmd.vmUuid))
 
         backres = jsonobject.loads(res)
