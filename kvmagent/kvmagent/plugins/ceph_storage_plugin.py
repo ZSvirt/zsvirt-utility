@@ -1,7 +1,13 @@
 import os
 import uuid as uuidlib
+from contextlib import contextmanager
+try:
+    from shlex import quote as shell_quote
+except ImportError:
+    from pipes import quote as shell_quote
 
 from kvmagent import kvmagent
+from kvmagent.plugins.imagestore import ImageStoreClient
 from kvmagent.plugins import volume_secret
 from zstacklib.utils import http
 from zstacklib.utils import jsonobject
@@ -40,8 +46,23 @@ class CephStoragePlugin(kvmagent.KvmAgent):
     LUKS_ENCRYPT_IN_PLACE_PATH = "/ceph/primarystorage/kvmhost/encryptinplace"
     LUKS_RESIZE_PATH = "/ceph/primarystorage/kvmhost/luksresize"
     LUKS_CONVERT_PATH = "/ceph/primarystorage/kvmhost/luksconvert"
+    IMAGESTORE_ENCRYPTED_DOWNLOAD_PATH = "/ceph/primarystorage/kvmhost/imagestore/encrypteddownload"
 
     CEPH_CLIENT_CONF_ROOT = "/var/lib/zstack/ceph"
+
+    @staticmethod
+    def _env_prefix(env):
+        if not env:
+            return ""
+        return " ".join(["%s=%s" % (k, shell_quote(str(v))) for k, v in env.items()]) + " "
+
+    @contextmanager
+    def _json_temp_file(self, content):
+        path = self.imagestore_client._write_json_temp_file(content)
+        try:
+            yield path
+        finally:
+            linux.rm_file_force(path)
 
     def start(self):
         http_server = kvmagent.get_http_server()
@@ -51,6 +72,8 @@ class CephStoragePlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.LUKS_ENCRYPT_IN_PLACE_PATH, self.luks_encrypt_in_place)
         http_server.register_async_uri(self.LUKS_RESIZE_PATH, self.luks_resize)
         http_server.register_async_uri(self.LUKS_CONVERT_PATH, self.luks_convert)
+        http_server.register_async_uri(self.IMAGESTORE_ENCRYPTED_DOWNLOAD_PATH, self.download_encrypted_imagestore)
+        self.imagestore_client = ImageStoreClient()
 
     @kvmagent.replyerror
     def check_host_storage_connection(self, req):
@@ -238,6 +261,78 @@ class CephStoragePlugin(kvmagent.KvmAgent):
 
         rsp.actualSize = self._rbd_actual_size(dst_path, conf)
         return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    def download_encrypted_imagestore(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        rsp = CephLuksRsp()
+        conf = self._validate_luks_cmd(cmd, rsp, encrypted_dek=True)
+        if conf is None:
+            return jsonobject.dumps(rsp)
+        if not getattr(cmd, "hostname", None):
+            rsp.success = False
+            rsp.error = "hostname is required for encrypted ImageStore download"
+            return jsonobject.dumps(rsp)
+        if not getattr(cmd, "backupStorageInstallPath", None):
+            rsp.success = False
+            rsp.error = "backupStorageInstallPath is required for encrypted ImageStore download"
+            return jsonobject.dumps(rsp)
+        if not getattr(cmd, "primaryStorageInstallPath", None):
+            rsp.success = False
+            rsp.error = "primaryStorageInstallPath is required for encrypted ImageStore download"
+            return jsonobject.dumps(rsp)
+
+        self.imagestore_client._check_zstore_cli()
+        name, imageid = self.imagestore_client._parse_image_reference(cmd.backupStorageInstallPath)
+        target_encryption = {
+            "encrypted": True,
+            "encryptedDek": getattr(cmd, "encryptedDek", None),
+            "keyProviderUuid": getattr(cmd, "keyProviderUuid", None),
+            "keyVersion": getattr(cmd, "keyVersion", None),
+            "cipher": getattr(cmd, "cipher", None),
+        }
+        source_encryption = None
+        if getattr(cmd, "sourceEncrypted", False):
+            source_encryption = {
+                "encrypted": True,
+                "encryptedDek": getattr(cmd, "encryptedDek", None),
+                "keyProviderUuid": getattr(cmd, "keyProviderUuid", None),
+                "keyVersion": getattr(cmd, "keyVersion", None),
+                "cipher": getattr(cmd, "cipher", None),
+            }
+
+        with self._json_temp_file(target_encryption) as target_encryption_file:
+            if source_encryption:
+                with self._json_temp_file(source_encryption) as source_encryption_file:
+                    self._pull_encrypted_imagestore(
+                        cmd, conf, name, imageid, target_encryption_file, source_encryption_file)
+            else:
+                self._pull_encrypted_imagestore(cmd, conf, name, imageid, target_encryption_file, None)
+        rsp.actualSize = self._rbd_actual_size(cmd.primaryStorageInstallPath.replace("ceph://", ""), conf)
+        return jsonobject.dumps(rsp)
+
+    def _pull_encrypted_imagestore(self, cmd, conf, name, imageid, target_encryption_file, source_encryption_file):
+        pull_extra_param = " -target-encryption-json-file %s -secret-channel-provider %s" % (
+            shell_quote(str(target_encryption_file)), shell_quote(str(self.imagestore_client.KEY_AGENT_PROVIDER)))
+        if source_encryption_file:
+            pull_extra_param += " -encryption-json-file %s" % shell_quote(str(source_encryption_file))
+        concurrency = getattr(cmd, "concurrency", 1)
+        if concurrency and concurrency > 1:
+            pull_extra_param += " -concurrency=%d" % concurrency
+        env = {
+            "CEPH_CONF": conf,
+            "CEPH_ARGS": "--conf %s" % conf,
+        }
+        cmdstr = "%s%s -url %s:%s pull %s -installpath %s %s:%s" % (
+            self._env_prefix(env),
+            self.imagestore_client.ZSTORE_CLI_PATH,
+            shell_quote(str(cmd.hostname)),
+            self.imagestore_client.ZSTORE_DEF_PORT,
+            pull_extra_param,
+            shell_quote(str(cmd.primaryStorageInstallPath)),
+            shell_quote(str(name)),
+            shell_quote(str(imageid)))
+        shell.call(cmdstr)
 
     @kvmagent.replyerror
     def luks_create_empty(self, req):

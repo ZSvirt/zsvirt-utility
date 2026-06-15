@@ -373,6 +373,7 @@ Parse command parameters error:
                     all_params[params[0]] = eval(params[1])
                 elif apiname in ['APICreateVmInstanceMsg',
                                  'APICreateVmInstanceFromTemplatedVmInstanceMsg',
+                                 'APICreateVmFromVmBackupMsg',
                                  'APICloneVmInstanceMsg'] and params[0] == 'diskAOs':
                     all_params[params[0]] = eval(params[1])
                 elif apiname == 'APIPrimaryStorageMigrateVmMsg' and params[0] == 'volumeMigrationAOs':
