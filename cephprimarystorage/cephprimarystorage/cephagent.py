@@ -803,6 +803,29 @@ class CephAgent(plugin.TaskManager):
             return cmd_string + " --image-shared"
         return cmd_string
 
+    @staticmethod
+    def _purge_image_snapshots(image_path, ignore_error=False):
+        def run(cmd):
+            return shell.run(cmd) if ignore_error else shell.call(cmd)
+
+        q_image = linux.shellquote(image_path)
+        try:
+            out = shell.call('rbd --format json snap ls %s' % q_image)
+            snapshots = simplejson.loads(out) if out else []
+        except Exception:
+            if ignore_error:
+                return
+            raise
+
+        for snap in snapshots:
+            name = snap.get('name')
+            protected = snap.get('protected', False)
+            protected = protected is True or str(protected).lower() in ('true', 'yes', '1')
+            if name and protected:
+                run('rbd snap unprotect %s@%s' % (q_image, linux.shellquote(name)))
+
+        run('rbd snap purge %s' % q_image)
+
     @replyerror
     def cp(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
@@ -838,10 +861,11 @@ class CephAgent(plugin.TaskManager):
         if os.path.exists(PFILE):
             os.remove(PFILE)
 
-        shell.run('rbd snap purge %s' % dst_path)
         if err:
+            self._purge_image_snapshots(dst_path, ignore_error=True)
             shell.run('rbd rm %s' % dst_path)
             raise err
+        self._purge_image_snapshots(dst_path)
 
         rsp = CpRsp()
         rsp.size = self._get_file_size(dst_path)
