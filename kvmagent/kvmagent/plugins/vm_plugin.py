@@ -9525,7 +9525,8 @@ host side snapshot files chian:
             if nodebak.mode == 'incremental':
                 parent = self.getLastBackup(deviceId, cmd.backupInfos)
             elif (nodebak.mode == 'top' or backupArgs[deviceId][1] == 'top') and deviceId in backing_files:
-                imf = isc.upload_image(cmd.hostname, backing_files[deviceId], cmd.uploadConcurrency)
+                encryption_spec = volume_secret.get_volume_backup_encryption_spec(getattr(cmd, 'addons', None), deviceId)
+                imf = isc.upload_image(cmd.hostname, backing_files[deviceId], cmd.uploadConcurrency, encryption_spec)
                 parent = isc._build_install_path(imf.name, imf.id)
 
             info = VolumeBackupInfo(deviceId,

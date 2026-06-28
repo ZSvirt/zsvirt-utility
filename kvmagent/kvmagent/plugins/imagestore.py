@@ -50,8 +50,8 @@ class ImageStoreClient(object):
     def _build_install_path(self, name, imgid):
         return "{0}{1}/{2}".format(self.ZSTORE_PROTOSTR, name, imgid)
 
-    def upload_image(self, hostname, fpath, concurrency=None):
-        imf = self.commit_image(fpath)
+    def upload_image(self, hostname, fpath, concurrency=None, encryption_spec=None):
+        imf = self.commit_image(fpath, encryption_spec)
 
         extra_param = ""
         if concurrency and concurrency > 1:
@@ -64,11 +64,20 @@ class ImageStoreClient(object):
 
         return imf
 
-    def commit_image(self, fpath):
-        cmdstr = '%s -json add -file %s' % (self.ZSTORE_CLI_PATH, fpath)
+    def commit_image(self, fpath, encryption_spec=None):
+        args_file = None
+        encryption_option = ''
+        if encryption_spec:
+            args_file = self._write_json_temp_file(encryption_spec)
+            encryption_option = ' -encryption-json-file %s -secret-channel-provider %s' % (
+                args_file, self.KEY_AGENT_PROVIDER)
+
+        cmdstr = '%s -json add -file %s%s' % (self.ZSTORE_CLI_PATH, fpath, encryption_option)
         logger.debug('adding %s to local image store' % fpath)
         output = shell.call(cmdstr.encode(encoding="utf-8"))
         logger.debug('%s added to local image store' % fpath)
+        if args_file:
+            linux.rm_file_force(args_file)
 
         return jsonobject.loads(output.splitlines()[-1])
 

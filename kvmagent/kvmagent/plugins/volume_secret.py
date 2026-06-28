@@ -68,6 +68,13 @@ def _volume_backup_specs(addons):
     return _get_value(addon, VOLUME_BACKUP_ENCRYPTION_SPECS, []) or []
 
 
+def get_volume_backup_encryption_spec(addons, device_id):
+    for spec in _volume_backup_specs(addons):
+        if _get_value(spec, 'deviceId') == device_id:
+            return _volume_backup_spec_to_json(spec)
+    return None
+
+
 def make_backup_args_option(cmdstr, args, addons, device_ids, write_json_temp_file, key_agent_provider):
     specs = _volume_backup_specs(addons)
     specs_by_device_id = {
