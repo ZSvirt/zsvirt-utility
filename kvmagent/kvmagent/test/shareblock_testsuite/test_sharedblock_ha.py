@@ -29,6 +29,11 @@ __ENV_SETUP__ = {
 hostUuid = "8b12f74e6a834c5fa90304b8ea54b1dd"
 hostId = 24
 vgUuid = "36b02490bb944233b0b01990a450ba83"
+SELF_FENCER_STATE_CHANGED_PATH = "/kvm/reportselffencerstatechanged"
+STORAGE_STATUS_REPORT_PATH = "/kvm/reportstoragestatus"
+LOCKSPACE_SETTLE_TIMEOUT = 15
+LOCKSPACE_SETTLE_INTERVAL = 0.5
+LOCKSPACE_SETTLE_STABLE_CHECKS = 2
 
 
 ## describe: case will manage by ztest
@@ -66,7 +71,10 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
 
     def mock_management_work(self):
         def mock_func(uri, body=None, headers={}, fail_soon=False, print_curl=False):
-            if "/kvm/reportselffencerstatechanged" in headers.values():
+            if STORAGE_STATUS_REPORT_PATH in headers.values():
+                return ""
+
+            if SELF_FENCER_STATE_CHANGED_PATH in headers.values():
                 if self.management_network_ok:
                     return ""
                 else:
@@ -84,12 +92,33 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
 
 
     def connnect_storage(self):
+        self.wait_sharedblock_lock_settled()
         bash.bash_errorout("echo 'running' > /sys/class/block/%s/device/state" % self.disk1_dev)
         rsp = self.connect([self.disk1_wwid], self.disk1_wwid, vgUuid, hostUuid, hostId, forceWipe=True, ioTimeout=self.sanlock_io_timeout)
         self.assertEqual(True, rsp.success, rsp.error)
 
     def disconnect_storage(self):
         bash.bash_errorout("echo 'offline' > /sys/class/block/%s/device/state" % self.disk1_dev)
+
+    def wait_sharedblock_lock_settled(self):
+        stable_checks = 0
+        deadline = time.time() + LOCKSPACE_SETTLE_TIMEOUT
+        pending_lock_cmd = (
+            "ps -ef | grep -E 'lvmlockctl .*(--drop|--gl-disable).*%s|dmsetup remove .*%s-lvmlock' | grep -v grep"
+            % (vgUuid, vgUuid)
+        )
+        while time.time() < deadline:
+            _, lockspace = bash.bash_ro("sanlock client gets | grep -E 'lvm_%s.* (ADD|REM)'" % vgUuid)
+            _, lock_cmd = bash.bash_ro(pending_lock_cmd)
+            if lockspace.strip() == "" and lock_cmd.strip() == "":
+                stable_checks += 1
+                if stable_checks >= LOCKSPACE_SETTLE_STABLE_CHECKS:
+                    return
+            else:
+                stable_checks = 0
+            time.sleep(LOCKSPACE_SETTLE_INTERVAL)
+
+        self.fail("sharedblock lockspace %s is still changing" % vgUuid)
 
     def run_fencer_case(self, sanlock_con, zsblk_con, expect_result):
         print("test case: sanlock %s , zsblk %s, expect %s\n" % (sanlock_con, zsblk_con, expect_result))
@@ -110,6 +139,8 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
             check_timeout -= 5
         self.assertEqual(expect_result, self.fencer_result_dict[self.fencer_triggered], "the result did not meet expectations, expect %s actual %s, sanlock %s, zsblk %s"
                          % (expect_result, self.fencer_result_dict[self.fencer_triggered], sanlock_con, zsblk_con))
+        if self.fencer_triggered:
+            self.wait_sharedblock_lock_settled()
 
 
     @pytest_utils.ztest_decorater
