@@ -120,6 +120,26 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
 
         self.fail("sharedblock lockspace %s is still changing" % vgUuid)
 
+    def reset_sharedblock_fencer_state(self):
+        self.fencer_triggered = 0
+        self.zsblk_agent_heart_result = "success"
+        self.management_network_ok = True
+
+        plugin = ha_utils.HA_PLUGIN
+        plugin.fencer_fire_timestamp.pop(vgUuid, None)
+        plugin.storage_status.pop(vgUuid, None)
+
+        checker = plugin.sblk_health_checker
+        checker.fired_vgs.pop(vgUuid, None)
+        checker.reset_fencer_fire_cnt(vgUuid)
+        checker.reset_vg_failure_cnt(vgUuid)
+
+    def prepare_fencer_case(self):
+        self.connnect_storage()
+        self.zsblk_agent_heart_result = "success"
+        time.sleep(self.sanlock_io_timeout + 1)
+        self.reset_sharedblock_fencer_state()
+
     def run_fencer_case(self, sanlock_con, zsblk_con, expect_result):
         print("test case: sanlock %s , zsblk %s, expect %s\n" % (sanlock_con, zsblk_con, expect_result))
         self.fencer_triggered = 0
@@ -178,8 +198,8 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
         rsp = ha_utils.setup_sharedblock_self_fencer(vgUuid, hostUuid, "None", addons, vgUuid, self.interval, 3, self.sanlock_io_timeout, "Force", ["hostStorageState"])
         self.assertEqual(True, rsp.success, rsp.error)
 
+        self.prepare_fencer_case()
         self.management_network_ok = False
-        self.connnect_storage()
         self.zsblk_agent_heart_result = "success"
         self.run_fencer_case("no_way", "no_way", "trigger")
 
@@ -191,8 +211,6 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
 
         for sanlk_con in [1, 0, -1]:
             for zsblk_con in [1, 0, -1]:
-                self.connnect_storage()
-                self.zsblk_agent_heart_result = "success"
-                time.sleep(self.sanlock_io_timeout + 1) # wait vg recovered
+                self.prepare_fencer_case()
                 self.run_fencer_case(self.condition_dict[sanlk_con], self.condition_dict[zsblk_con],
                                      self.fencer_result_dict[expect_result[sanlk_con][zsblk_con]])
