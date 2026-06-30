@@ -3407,6 +3407,7 @@ class Vm(object):
             disk = etree.Element('disk', {'type': 'network', 'device': 'disk'})
             e(disk, 'driver', None, {'name': 'qemu', 'type': 'raw', 'cache': 'none', 'discard': 'unmap'})
             e(disk, 'source', None, {'protocol': 'cbd', 'name': make_cbd_conf(volume.installPath)})
+            _add_luks_encryption(disk, volume, allow_legacy_secret=False)
             if volume.useVirtioSCSI or volume.useSCSI:
                 e(disk, 'target', None, {'dev': 'sd%s' % dev_letter, 'bus': 'scsi'})
                 e(disk, 'wwn', volume.wwn)
@@ -3839,6 +3840,52 @@ class Vm(object):
         if r != 0:
             raise kvmagent.KvmError(
                 'unable to resize volume[id:{1}] of vm[uuid:{0}] because {2}'.format(device_id, self.uuid, e))
+        self._resize_luks_cbd_block_node(volume, target_disk, size)
+
+    def _resize_luks_cbd_block_node(self, volume, target_disk, size):
+        if volume.deviceType != 'cbd' or not getattr(target_disk, 'encryption', None):
+            return
+
+        alias_name = target_disk.alias.name_
+        for block in get_vm_blocks(self.uuid):
+            qdev = block.get('qdev')
+            inserted = block.get('inserted')
+            if not qdev or alias_name not in qdev or not inserted:
+                continue
+            node_name = inserted.get('node-name')
+            if not node_name:
+                break
+            payload_offset = self._get_luks_payload_offset(inserted)
+            if payload_offset and node_name.endswith('-format'):
+                storage_size = self._get_cbd_storage_size(target_disk)
+                if storage_size <= payload_offset:
+                    raise kvmagent.KvmError(
+                        'invalid CBD LUKS storage size[%s] for volume[id:%s] of vm[uuid:%s]' %
+                        (storage_size, volume.deviceId, self.uuid))
+                storage_node_name = '%s-storage' % node_name[:-len('-format')]
+                qmp.execute_qmp_command(self.uuid, "block_resize", node_name=storage_node_name, size=storage_size)
+            qmp.execute_qmp_command(self.uuid, "block_resize", node_name=node_name, size=size)
+            logger.debug("resize LUKS CBD block node[%s] for volume[%s] of vm[%s]" %
+                         (node_name, volume.volumeUuid, self.uuid))
+            return
+
+        raise kvmagent.KvmError('unable to find LUKS CBD block node for volume[id:{0}] of vm[uuid:{1}]'.format(
+            volume.deviceId, self.uuid))
+
+    @staticmethod
+    def _get_luks_payload_offset(block):
+        try:
+            return int(block.get('image', {}).get('format-specific', {}).get('data', {}).get('payload-offset', 0))
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _get_cbd_storage_size(target_disk):
+        cbd_path = target_disk.source.name_
+        if not cbd_path.startswith(PROTOCOL_CBD_PREFIX):
+            cbd_path = PROTOCOL_CBD_PREFIX + cbd_path
+        out = bash.bash_errorout("qemu-img info --output json -f cbd %s" % linux.shellquote(cbd_path))
+        return int(simplejson.loads(out).get('virtual-size', 0))
 
     def take_live_volumes_delta_snapshots(self, vs_structs):
         """
@@ -6216,6 +6263,7 @@ class Vm(object):
                 disk = etree.Element('disk', {'type': 'network', 'device': 'disk'})
                 e(disk, 'driver', None, {'name': 'qemu', 'type': 'raw', 'cache': 'none', 'discard': 'unmap'})
                 e(disk, 'source', None, {'protocol': 'cbd', 'name': make_cbd_conf(_v.installPath)})
+                _add_luks_encryption(disk, _v, allow_legacy_secret=False)
                 if _v.useVirtioSCSI or _v.useSCSI:
                     e(disk, 'target', None, {'dev': 'sd%s' % _dev_letter, 'bus': 'scsi'})
                     e(disk, 'wwn', _v.wwn)
@@ -8852,6 +8900,7 @@ class VmPlugin(kvmagent.KvmAgent):
             disk = etree.Element('disk', {'type': 'network', 'device': 'disk'})
             e(disk, 'driver', None, {'name': 'qemu', 'type': 'raw', 'cache': 'none', 'discard': 'unmap'})
             e(disk, 'source', None, {'protocol': 'cbd', 'name': make_cbd_conf(_v.installPath)})
+            _add_luks_encryption(disk, _v, allow_legacy_secret=False)
             e(disk, 'target', None, {'dev': 'vd%s' % _v.dev_letter, 'bus': 'virtio'})
             if _v.physicalBlockSize:
                 e(disk, 'blockio', None, {'physical_block_size': str(_v.physicalBlockSize)})
@@ -8905,7 +8954,8 @@ class VmPlugin(kvmagent.KvmAgent):
         if block_backing_store is not None:
             ele.append(block_backing_store)
 
-        _add_luks_encryption(ele, volume)
+        if volume.deviceType not in ['ceph', 'cbd']:
+            _add_luks_encryption(ele, volume)
 
         logger.info("updated disk XML: " + etree.tostring(ele))
         return ele
