@@ -1037,6 +1037,15 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         return total_size
 
     @staticmethod
+    def get_convert_volume_encryption_lv_size(source_abs_path, target_encrypted, target_backing_abs_path):
+        lv_size = int(lvm.get_lv_size(source_abs_path))
+        if not target_backing_abs_path:
+            lv_size = max(lv_size, SharedBlockPlugin.get_total_required_size(source_abs_path))
+        if target_encrypted:
+            lv_size += LUKS_HEADER_OVERHEAD
+        return lv_size
+
+    @staticmethod
     @bash.in_bash
     def compare_qcow2(src, dst):
         logger.debug("comparing qcow2 between %s and %s" % (src, dst))
@@ -1594,9 +1603,8 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
 
                 secret_file_provider = (lambda: volume_secret.luks_secret_channel(encrypted_dek)) if encrypted_dek else None
                 with lvm.RecursiveOperateLv(source_abs_path, shared=True):
-                    lv_size = int(lvm.get_lv_size(source_abs_path))
-                    if cmd.targetEncrypted:
-                        lv_size += LUKS_HEADER_OVERHEAD
+                    lv_size = self.get_convert_volume_encryption_lv_size(
+                        source_abs_path, cmd.targetEncrypted, effective_backing_abs_path)
                     lvm.create_lv_from_absolute_path(temp_abs_path, lv_size, exact_size=True)
 
                     if effective_backing_abs_path:
