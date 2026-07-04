@@ -5,6 +5,7 @@ __author__ = 'frank'
 
 import pprint
 import traceback
+import uuid as uuidlib
 import cephprimarystorage
 import urlparse
 import rados
@@ -328,6 +329,8 @@ class CephAgent(plugin.TaskManager):
     ADD_POOL_PATH = "/ceph/primarystorage/addpool"
     CHECK_POOL_PATH = "/ceph/primarystorage/checkpool"
     RESIZE_VOLUME_PATH = "/ceph/primarystorage/volume/resize"
+    LUKS_REPLACE_VOLUME_PATH = "/ceph/primarystorage/volume/luksreplace"
+    LUKS_SWAP_IN_PLACE_PATH = "/ceph/primarystorage/volume/luksswapinplace"
     MIGRATE_VOLUME_SEGMENT_PATH = "/ceph/primarystorage/volume/migratesegment"
     GET_VOLUME_SNAPINFOS_PATH = "/ceph/primarystorage/volume/getsnapinfos"
     UPLOAD_IMAGESTORE_PATH = "/ceph/primarystorage/imagestore/backupstorage/commit"
@@ -402,6 +405,8 @@ class CephAgent(plugin.TaskManager):
         self.http_server.register_async_uri(self.DELETE_IMAGE_CACHE, self.delete_image_cache)
         self.http_server.register_async_uri(self.CHECK_BITS_PATH, self.check_bits)
         self.http_server.register_async_uri(self.RESIZE_VOLUME_PATH, self.resize_volume)
+        self.http_server.register_async_uri(self.LUKS_REPLACE_VOLUME_PATH, self.replace_luks_volume)
+        self.http_server.register_async_uri(self.LUKS_SWAP_IN_PLACE_PATH, self.swap_luks_volume_in_place)
         self.http_server.register_sync_uri(self.ECHO_PATH, self.echo)
         self.http_server.register_async_uri(self.MIGRATE_VOLUME_SEGMENT_PATH, self.migrate_volume_segment, cmd=CephToCephMigrateVolumeSegmentCmd())
         self.http_server.register_async_uri(self.GET_VOLUME_SNAPINFOS_PATH, self.get_volume_snapinfos)
@@ -1136,6 +1141,118 @@ class CephAgent(plugin.TaskManager):
 
     def _parse_install_path(self, path):
         return self._normalize_install_path(path).split('/')
+
+    def _rbd_image_exists(self, path):
+        return shell.run('rbd info %s > /dev/null' % path) == 0
+
+    @replyerror
+    def swap_luks_volume_in_place(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        src_path = self._normalize_install_path(cmd.installPath)
+        tmp_path = self._normalize_install_path(cmd.temporaryInstallPath)
+        old_path = '%s-plain-%s' % (src_path, uuidlib.uuid4().hex[:8])
+
+        if '@' in src_path or '@' in tmp_path:
+            raise Exception('RBD LUKS in-place swap only supports active image paths: source[%s], temporary[%s]' %
+                            (src_path, tmp_path))
+        if not self._rbd_image_exists(src_path):
+            raise Exception('RBD source image does not exist: %s' % src_path)
+        if not self._rbd_image_exists(tmp_path):
+            raise Exception('RBD temporary image does not exist: %s' % tmp_path)
+        if self._rbd_image_exists(old_path):
+            raise Exception('RBD old image already exists: %s' % old_path)
+
+        moved_original = False
+        try:
+            shell.call('rbd mv %s %s' % (src_path, old_path))
+            moved_original = True
+            try:
+                shell.call('rbd mv %s %s' % (tmp_path, src_path))
+                moved_original = False
+            except Exception:
+                shell.call('rbd mv %s %s' % (old_path, src_path))
+                moved_original = False
+                raise
+
+            if shell.run('rbd rm %s' % old_path) != 0:
+                logger.warn('failed to remove old RBD image after LUKS in-place swap: %s' % old_path)
+        finally:
+            if self._rbd_image_exists(tmp_path):
+                if shell.run('rbd rm %s' % tmp_path) != 0:
+                    logger.warn('failed to remove temporary RBD image after LUKS in-place swap: %s' % tmp_path)
+            if moved_original and self._rbd_image_exists(old_path):
+                if shell.run('rbd mv %s %s' % (old_path, src_path)) != 0:
+                    logger.warn('failed to restore original RBD image after LUKS in-place swap: source[%s], temporary[%s], old[%s]' %
+                                (src_path, tmp_path, old_path))
+
+        return jsonobject.dumps(AgentResponse())
+
+    @replyerror
+    def replace_luks_volume(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        src_path = self._normalize_install_path(cmd.installPath)
+        tmp_path = self._normalize_install_path(cmd.temporaryInstallPath)
+        target_path = self._normalize_install_path(getattr(cmd, 'targetInstallPath', None) or cmd.installPath)
+        trash_path = getattr(cmd, 'sourceTrashInstallPath', None)
+        delete_source_trash = getattr(cmd, 'deleteSourceTrash', False)
+        if trash_path:
+            trash_path = self._normalize_install_path(trash_path)
+        else:
+            trash_path = '%s-trash-%s' % (src_path, uuidlib.uuid4().hex[:8])
+            delete_source_trash = True
+
+        if '@' in src_path or '@' in tmp_path or '@' in target_path or '@' in trash_path:
+            raise Exception('RBD LUKS replacement only supports active image paths: source[%s], temporary[%s], target[%s], trash[%s]' %
+                            (src_path, tmp_path, target_path, trash_path))
+
+        if self._rbd_image_exists(trash_path):
+            raise Exception('RBD trash image already exists: %s' % trash_path)
+        if target_path != src_path and self._rbd_image_exists(target_path):
+            raise Exception('RBD target image already exists: %s' % target_path)
+        if not self._rbd_image_exists(src_path):
+            raise Exception('RBD source image does not exist: %s' % src_path)
+        if not self._rbd_image_exists(tmp_path):
+            raise Exception('RBD temporary image does not exist: %s' % tmp_path)
+
+        moved_original = False
+        replaced = False
+        try:
+            shell.call('rbd mv %s %s' % (src_path, trash_path))
+            moved_original = True
+            try:
+                shell.call('rbd mv %s %s' % (tmp_path, target_path))
+                moved_original = False
+                replaced = True
+            except Exception:
+                shell.call('rbd mv %s %s' % (trash_path, src_path))
+                moved_original = False
+                if self._rbd_image_exists(tmp_path):
+                    if shell.run('rbd rm %s' % tmp_path) != 0:
+                        logger.warn('failed to remove temporary RBD image after failed LUKS replacement rollback: %s' % tmp_path)
+                raise
+
+            if delete_source_trash:
+                if shell.run('rbd rm %s' % trash_path) != 0:
+                    logger.warn('failed to remove source trash after LUKS replacement: %s' % trash_path)
+        finally:
+            if replaced and self._rbd_image_exists(tmp_path):
+                if shell.run('rbd rm %s' % tmp_path) != 0:
+                    logger.warn('failed to remove temporary RBD image after LUKS replacement: %s' % tmp_path)
+            if moved_original and self._rbd_image_exists(trash_path):
+                if shell.run('rbd mv %s %s' % (trash_path, src_path)) != 0:
+                    logger.warn('failed to restore source RBD image after LUKS replacement: source[%s], temporary[%s], trash[%s]' %
+                                (src_path, tmp_path, trash_path))
+
+        rsp = GetVolumeSizeRsp()
+        try:
+            rsp.size = self._get_file_size(target_path)
+        except Exception as e:
+            logger.warn('failed to get RBD size after LUKS replacement committed: %s, %s' % (target_path, e))
+        try:
+            rsp.actualSize = self._get_file_actual_size(target_path)
+        except Exception as e:
+            logger.warn('failed to get RBD actual size after LUKS replacement committed: %s, %s' % (target_path, e))
+        return jsonobject.dumps(rsp)
 
     @replyerror
     def create(self, req):

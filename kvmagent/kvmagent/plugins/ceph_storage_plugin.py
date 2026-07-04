@@ -1,5 +1,4 @@
 import os
-import uuid as uuidlib
 from contextlib import contextmanager
 try:
     from shlex import quote as shell_quote
@@ -37,6 +36,7 @@ class CephLuksRsp(kvmagent.AgentResponse):
     def __init__(self):
         super(CephLuksRsp, self).__init__()
         self.actualSize = None
+        self.installPath = None
 
 
 class CephStoragePlugin(kvmagent.KvmAgent):
@@ -161,26 +161,7 @@ class CephStoragePlugin(kvmagent.KvmAgent):
             return "file format: luks" in out
         except Exception as e:
             logger.warn("failed to probe RBD source format for %s: %s" % (install_path, e))
-            return False
-
-    @staticmethod
-    def _rbd_actual_size(install_path, conf_path):
-        try:
-            du_output = shell.call("rbd --conf %s du %s --format json" % (conf_path, install_path))
-            du_result = jsonobject.loads(du_output)
-            images = getattr(du_result, "images", None)
-            if not images:
-                return None
-            # rbd du json returns a list; first row is the image itself when no
-            # snapshots are queried. Pick the first numeric used_size_ we see.
-            for image_usage in images:
-                used = getattr(image_usage, "used_size_", None)
-                if used is not None:
-                    return long(used)
-            return None
-        except Exception as e:
-            logger.warn("failed to read rbd du for %s: %s" % (install_path, e))
-            return None
+            raise
 
     def _validate_luks_cmd(self, cmd, rsp, encrypted_dek=False):
         if not getattr(cmd, "psUuid", None):
@@ -259,7 +240,6 @@ class CephStoragePlugin(kvmagent.KvmAgent):
         finally:
             pass
 
-        rsp.actualSize = self._rbd_actual_size(dst_path, conf)
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
@@ -308,7 +288,6 @@ class CephStoragePlugin(kvmagent.KvmAgent):
                         cmd, conf, name, imageid, target_encryption_file, source_encryption_file)
             else:
                 self._pull_encrypted_imagestore(cmd, conf, name, imageid, target_encryption_file, None)
-        rsp.actualSize = self._rbd_actual_size(cmd.primaryStorageInstallPath.replace("ceph://", ""), conf)
         return jsonobject.dumps(rsp)
 
     def _pull_encrypted_imagestore(self, cmd, conf, name, imageid, target_encryption_file, source_encryption_file):
@@ -353,7 +332,6 @@ class CephStoragePlugin(kvmagent.KvmAgent):
                 )
         finally:
             pass
-        rsp.actualSize = self._rbd_actual_size(install_path, conf)
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
@@ -365,93 +343,60 @@ class CephStoragePlugin(kvmagent.KvmAgent):
             return jsonobject.dumps(rsp)
 
         src_path = cmd.installPath.replace("ceph://", "")
-        target_path = getattr(cmd, "targetInstallPath", None) or cmd.installPath
-        target_path = target_path.replace("ceph://", "")
-        trash_path = getattr(cmd, "sourceTrashInstallPath", None)
-        if trash_path:
-            trash_path = trash_path.replace("ceph://", "")
-        else:
-            trash_path = "%s-trash-%s" % (src_path, uuidlib.uuid4().hex[:8])
-
-        if "@" in src_path or "@" in target_path or "@" in trash_path:
+        target_path = getattr(cmd, "targetInstallPath", None)
+        if not target_path:
             rsp.success = False
-            rsp.error = "RBD LUKS conversion only supports active image paths, got source[%s], target[%s], trash[%s]" % (
-                src_path, target_path, trash_path,
+            rsp.error = "targetInstallPath is required for RBD LUKS conversion"
+            return jsonobject.dumps(rsp)
+        target_path = target_path.replace("ceph://", "")
+
+        if "@" in src_path or "@" in target_path:
+            rsp.success = False
+            rsp.error = "RBD LUKS conversion only supports active image paths, got source[%s], target[%s]" % (
+                src_path, target_path,
             )
             return jsonobject.dumps(rsp)
 
-        tmp_path = "%s-converting-%s" % (target_path, uuidlib.uuid4().hex[:8])
-        rbd_prefix = "rbd --conf %s" % conf
-        moved_original = False
-        converted = False
-
-        try:
-            if shell.run("%s info %s" % (rbd_prefix, trash_path)) == 0:
+        source_is_luks = self._is_luks_rbd(src_path, conf)
+        if source_is_luks:
+            src_arg = "--image-opts driver=luks,key-secret=luks_sec,%s" % self._rbd_image_opts(src_path, conf)
+        else:
+            if not cmd.targetEncrypted:
                 rsp.success = False
-                rsp.error = "RBD trash image already exists: %s" % trash_path
+                rsp.error = "RBD image is not LUKS formatted: %s" % cmd.installPath
                 return jsonobject.dumps(rsp)
-            if target_path != src_path and shell.run("%s info %s" % (rbd_prefix, target_path)) == 0:
-                rsp.success = False
-                rsp.error = "RBD target image already exists: %s" % target_path
-                return jsonobject.dumps(rsp)
+            src_arg = "-f raw %s" % self._rbd_uri(src_path, conf)
 
-            source_is_luks = self._is_luks_rbd(src_path, conf)
-            if source_is_luks:
-                src_arg = "--image-opts driver=luks,key-secret=luks_sec,%s" % self._rbd_image_opts(src_path, conf)
+        with volume_secret.luks_secret_channel(cmd.encryptedDek) as sec:
+            if cmd.targetEncrypted:
+                target_format = "-O luks -o key-secret=luks_sec"
             else:
-                if not cmd.targetEncrypted:
-                    rsp.success = False
-                    rsp.error = "RBD image is not LUKS formatted: %s" % cmd.installPath
-                    return jsonobject.dumps(rsp)
-                src_arg = "-f raw %s" % self._rbd_uri(src_path, conf)
+                target_format = "-O raw"
+            shell.call(
+                "/usr/bin/qemu-img convert "
+                "--object secret,id=luks_sec,format=raw,file=%s "
+                "-m 16 -W %s %s %s" % (
+                    sec,
+                    src_arg,
+                    target_format,
+                    self._rbd_uri(target_path, conf, "rbd_cache=false:rbd_concurrent_management_ops=20"),
+                )
+            )
 
+        virtual_size = getattr(cmd, "virtualSize", None)
+        if cmd.targetEncrypted and virtual_size:
+            pool, image = target_path.split("/", 1)
             with volume_secret.luks_secret_channel(cmd.encryptedDek) as sec:
-                if cmd.targetEncrypted:
-                    target_format = "-O luks -o key-secret=luks_sec"
-                else:
-                    target_format = "-O raw"
                 shell.call(
-                    "/usr/bin/qemu-img convert "
+                    "/usr/bin/qemu-img resize "
                     "--object secret,id=luks_sec,format=raw,file=%s "
-                    "-m 16 -W %s %s %s" % (
-                        sec,
-                        src_arg,
-                        target_format,
-                        self._rbd_uri(tmp_path, conf, "rbd_cache=false:rbd_concurrent_management_ops=20"),
+                    "--image-opts driver=luks,key-secret=luks_sec,"
+                    "file.driver=rbd,file.pool=%s,file.image=%s,file.conf=%s %s" % (
+                        sec, pool, image, conf, virtual_size,
                     )
                 )
 
-            virtual_size = getattr(cmd, "virtualSize", None)
-            if cmd.targetEncrypted and virtual_size:
-                pool, image = tmp_path.split("/", 1)
-                with volume_secret.luks_secret_channel(cmd.encryptedDek) as sec:
-                    shell.call(
-                        "/usr/bin/qemu-img resize "
-                        "--object secret,id=luks_sec,format=raw,file=%s "
-                        "--image-opts driver=luks,key-secret=luks_sec,"
-                        "file.driver=rbd,file.pool=%s,file.image=%s,file.conf=%s %s" % (
-                            sec, pool, image, conf, virtual_size,
-                        )
-                    )
-
-            shell.call("%s mv %s %s" % (rbd_prefix, src_path, trash_path))
-            moved_original = True
-            try:
-                shell.call("%s mv %s %s" % (rbd_prefix, tmp_path, target_path))
-                converted = True
-                moved_original = False
-            except Exception:
-                shell.call("%s mv %s %s" % (rbd_prefix, trash_path, src_path))
-                moved_original = False
-                raise
-        finally:
-            if shell.run("%s info %s" % (rbd_prefix, tmp_path)) == 0:
-                shell.run("%s rm %s" % (rbd_prefix, tmp_path))
-            if moved_original:
-                shell.run("%s mv %s %s" % (rbd_prefix, trash_path, src_path))
-
-        if converted:
-            rsp.actualSize = self._rbd_actual_size(target_path, conf)
+        rsp.installPath = cmd.targetInstallPath
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
@@ -492,7 +437,6 @@ class CephStoragePlugin(kvmagent.KvmAgent):
         finally:
             pass
 
-        rsp.actualSize = self._rbd_actual_size(install_path, conf)
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
@@ -503,73 +447,28 @@ class CephStoragePlugin(kvmagent.KvmAgent):
         if conf is None:
             return jsonobject.dumps(rsp)
         install_path = cmd.installPath.replace("ceph://", "")
-        tmp_path = "%s-encrypting-%s" % (install_path, uuidlib.uuid4().hex[:8])
-        old_path = "%s-plain-%s" % (install_path, uuidlib.uuid4().hex[:8])
-        moved_original = False
-        rbd_prefix = "rbd --conf %s" % conf
-        try:
-            logger.info("start in-place LUKS encryption for RBD image: image[%s], temporary[%s], original-backup[%s]" % (
-                install_path, tmp_path, old_path,
-            ))
-            with volume_secret.luks_secret_channel(cmd.encryptedDek) as sec:
-                shell.call(
-                    "/usr/bin/qemu-img convert "
-                    "--object secret,id=luks_sec,format=raw,file=%s "
-                    "-m 16 -W -O luks -o key-secret=luks_sec %s %s" % (
-                        sec,
-                        self._rbd_uri(install_path, conf),
-                        self._rbd_uri(tmp_path, conf, "rbd_cache=false:rbd_concurrent_management_ops=20"),
-                    )
+        target_path = getattr(cmd, "targetInstallPath", None)
+        if not target_path:
+            rsp.success = False
+            rsp.error = "targetInstallPath is required for RBD LUKS encrypt-in-place"
+            return jsonobject.dumps(rsp)
+        target_path = target_path.replace("ceph://", "")
+
+        logger.info("start LUKS encryption for RBD image: source[%s], target[%s]" % (
+            install_path, target_path,
+        ))
+        with volume_secret.luks_secret_channel(cmd.encryptedDek) as sec:
+            shell.call(
+                "/usr/bin/qemu-img convert "
+                "--object secret,id=luks_sec,format=raw,file=%s "
+                "-m 16 -W -f raw -O luks -o key-secret=luks_sec %s %s" % (
+                    sec,
+                    self._rbd_uri(install_path, conf),
+                    self._rbd_uri(target_path, conf, "rbd_cache=false:rbd_concurrent_management_ops=20"),
                 )
-            logger.info("created temporary encrypted RBD image: source[%s], temporary[%s]" % (install_path, tmp_path))
-
-            logger.info("move original RBD image to backup before replacement: source[%s], backup[%s]" % (
-                install_path, old_path,
-            ))
-            shell.call("%s mv %s %s" % (rbd_prefix, install_path, old_path))
-            moved_original = True
-            logger.info("moved original RBD image to backup: backup[%s]" % old_path)
-            try:
-                logger.info("move temporary encrypted RBD image into place: temporary[%s], target[%s]" % (
-                    tmp_path, install_path,
-                ))
-                shell.call("%s mv %s %s" % (rbd_prefix, tmp_path, install_path))
-                logger.info("moved temporary encrypted RBD image into place: target[%s]" % install_path)
-            except Exception as e:
-                logger.warn("failed to move temporary encrypted RBD image into place, rollback original RBD image: temporary[%s], target[%s], backup[%s], error[%s]" % (
-                    tmp_path, install_path, old_path, e,
-                ))
-                shell.call("%s mv %s %s" % (rbd_prefix, old_path, install_path))
-                moved_original = False
-                logger.info("rolled back original RBD image after failed replacement: backup[%s], target[%s]" % (
-                    old_path, install_path,
-                ))
-                raise
-            logger.info("remove old plain RBD image after successful in-place encryption: backup[%s]" % old_path)
-            shell.call("%s rm %s" % (rbd_prefix, old_path))
-            moved_original = False
-            logger.info("removed old plain RBD image after successful in-place encryption: backup[%s]" % old_path)
-        finally:
-            if shell.run("%s info %s" % (rbd_prefix, tmp_path)) == 0:
-                logger.info("cleanup remaining temporary RBD image: temporary[%s]" % tmp_path)
-                if shell.run("%s rm %s" % (rbd_prefix, tmp_path)) == 0:
-                    logger.info("cleaned remaining temporary RBD image: temporary[%s]" % tmp_path)
-                else:
-                    logger.warn("failed to cleanup remaining temporary RBD image: temporary[%s]" % tmp_path)
-            if moved_original:
-                logger.warn("original RBD image was moved but not restored, rollback in finally: backup[%s], target[%s]" % (
-                    old_path, install_path,
-                ))
-                if shell.run("%s mv %s %s" % (rbd_prefix, old_path, install_path)) == 0:
-                    logger.info("rolled back original RBD image in finally: backup[%s], target[%s]" % (
-                        old_path, install_path,
-                    ))
-                else:
-                    logger.warn("failed to rollback original RBD image in finally: backup[%s], target[%s]" % (
-                        old_path, install_path,
-                    ))
-
-        rsp.actualSize = self._rbd_actual_size(install_path, conf)
+            )
+        logger.info("created encrypted RBD image: source[%s], target[%s]" % (install_path, target_path))
+        rsp.installPath = cmd.targetInstallPath
         return jsonobject.dumps(rsp)
 
     def stop(self):
