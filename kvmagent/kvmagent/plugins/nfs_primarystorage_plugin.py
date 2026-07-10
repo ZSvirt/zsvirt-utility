@@ -1024,55 +1024,28 @@ class NfsPrimaryStoragePlugin(kvmagent.KvmAgent):
         actual_sizes = {}
         encrypted_dek = getattr(cmd, 'encryptedDek', None)
         converted_items = []
-        converted_target_paths = {}
-        renamed_sources = []
-        finalized_targets = []
-
-        def rebase_secret_file(reason):
-            return volume_secret.luks_secret_channel(encrypted_dek)
 
         try:
             if cmd.targetEncrypted and not encrypted_dek:
                 raise Exception("target encrypted conversion requires encryptedDek")
 
             for index, item in enumerate(cmd.items):
-                effective_target_path = "%s.converted.%s" % (item.targetInstallPath, uuidhelper.uuid())
+                if not os.path.exists(item.sourceInstallPath):
+                    raise Exception("source file %s does not exist" % item.sourceInstallPath)
+                if os.path.exists(item.targetInstallPath):
+                    raise Exception("target file %s already exists" % item.targetInstallPath)
                 target_backing_path = getattr(item, 'targetBackingInstallPath', None)
-                effective_backing_path = converted_target_paths.get(target_backing_path, target_backing_path)
                 secret_file_provider = (lambda: volume_secret.luks_secret_channel(encrypted_dek)) if encrypted_dek else None
+                converted_items.append(item)
                 actual_size = linux.convert_qcow2_volume_encryption(
-                    item.sourceInstallPath, effective_target_path, cmd.targetEncrypted,
-                    secret_file_provider, effective_backing_path)
+                    item.sourceInstallPath, item.targetInstallPath, cmd.targetEncrypted,
+                    secret_file_provider, target_backing_path)
                 actual_sizes[item.resourceUuid] = long(actual_size)
-                converted_items.append((item, effective_target_path, effective_backing_path, target_backing_path))
-                converted_target_paths[item.targetInstallPath] = effective_target_path
-
-            for item, _, _, _ in converted_items:
-                source_trash_path = getattr(item, 'sourceTrashInstallPath', None)
-                if source_trash_path:
-                    linux.move_file_no_overwrite(item.sourceInstallPath, source_trash_path)
-                    renamed_sources.append((source_trash_path, item.sourceInstallPath))
-
-            for item, effective_target_path, effective_backing_path, target_backing_path in converted_items:
-                if target_backing_path and effective_backing_path != target_backing_path:
-                    if cmd.targetEncrypted:
-                        with rebase_secret_file("final encrypted backing rebase") as reset_secret_file:
-                            linux.qcow2_rebase_no_check_with_secret(target_backing_path, effective_target_path, reset_secret_file)
-                    else:
-                        linux.qcow2_rebase_no_check(target_backing_path, effective_target_path)
-                if effective_target_path != item.targetInstallPath:
-                    linux.move_file_no_overwrite(effective_target_path, item.targetInstallPath)
-                    finalized_targets.append(item.targetInstallPath)
             rsp.actualSizes = actual_sizes
         except Exception as e:
             logger.warn(linux.get_exception_stacktrace())
-            for target_path in finalized_targets:
-                linux.rm_file_force(target_path)
-            for item, effective_target_path, _, _ in converted_items:
-                linux.rm_file_force(effective_target_path)
-            for source_trash_path, source_path in reversed(renamed_sources):
-                if os.path.exists(source_trash_path) and not os.path.exists(source_path):
-                    linux.move_file_no_overwrite(source_trash_path, source_path)
+            for item in converted_items:
+                linux.rm_file_force(item.targetInstallPath)
             rsp.success = False
             rsp.error = 'failed to convert volume[%s] encryption: %s' % (cmd.volumeUuid, str(e))
         return jsonobject.dumps(rsp)

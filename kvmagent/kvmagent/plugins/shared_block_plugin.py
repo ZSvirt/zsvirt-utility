@@ -1575,13 +1575,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = ConvertVolumeEncryptionRsp()
         encrypted_dek = getattr(cmd, 'encryptedDek', None)
-        converted_items = []
-        converted_target_paths = {}
-        renamed_sources = []
-        finalized_targets = []
-
-        def rebase_secret_file(reason):
-            return volume_secret.luks_secret_channel(encrypted_dek)
+        converted_targets = []
 
         try:
             if cmd.targetEncrypted and not encrypted_dek:
@@ -1591,71 +1585,41 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
             for index, item in enumerate(cmd.items):
                 source_abs_path = translate_absolute_path_from_install_path(item.sourceInstallPath)
                 target_abs_path = translate_absolute_path_from_install_path(item.targetInstallPath)
-                temp_abs_path = "%s_converted_%s" % (target_abs_path, uuidhelper.uuid())
+                if not lvm.lv_exists(source_abs_path):
+                    raise Exception("source lv %s does not exist" % source_abs_path)
+                if lvm.lv_exists(target_abs_path):
+                    raise Exception("target lv %s already exists" % target_abs_path)
 
                 target_backing_abs_path = None
                 if getattr(item, 'targetBackingInstallPath', None):
                     target_backing_abs_path = translate_absolute_path_from_install_path(item.targetBackingInstallPath)
-                effective_backing_abs_path = converted_target_paths.get(target_backing_abs_path, target_backing_abs_path)
-
-                if lvm.lv_exists(temp_abs_path):
-                    lvm.delete_lv(temp_abs_path)
 
                 secret_file_provider = (lambda: volume_secret.luks_secret_channel(encrypted_dek)) if encrypted_dek else None
                 with lvm.RecursiveOperateLv(source_abs_path, shared=True):
                     lv_size = self.get_convert_volume_encryption_lv_size(
-                        source_abs_path, cmd.targetEncrypted, effective_backing_abs_path)
-                    lvm.create_lv_from_absolute_path(temp_abs_path, lv_size, exact_size=True)
+                        source_abs_path, cmd.targetEncrypted, target_backing_abs_path)
+                    lvm.create_lv_from_absolute_path(target_abs_path, lv_size, exact_size=True)
+                    converted_targets.append(target_abs_path)
 
-                    if effective_backing_abs_path:
-                        with lvm.RecursiveOperateLv(effective_backing_abs_path, shared=True):
-                            with lvm.OperateLv(temp_abs_path, shared=False, delete_when_exception=True):
+                    if target_backing_abs_path:
+                        with lvm.RecursiveOperateLv(target_backing_abs_path, shared=True):
+                            with lvm.OperateLv(target_abs_path, shared=False, delete_when_exception=True):
                                 actual_size = linux.convert_qcow2_volume_encryption(
-                                    source_abs_path, temp_abs_path, cmd.targetEncrypted,
-                                    secret_file_provider, effective_backing_abs_path)
+                                    source_abs_path, target_abs_path, cmd.targetEncrypted,
+                                    secret_file_provider, target_backing_abs_path)
                     else:
-                        with lvm.OperateLv(temp_abs_path, shared=False, delete_when_exception=True):
+                        with lvm.OperateLv(target_abs_path, shared=False, delete_when_exception=True):
                             actual_size = linux.convert_qcow2_volume_encryption(
-                                source_abs_path, temp_abs_path, cmd.targetEncrypted,
-                                secret_file_provider, effective_backing_abs_path)
+                                source_abs_path, target_abs_path, cmd.targetEncrypted,
+                                secret_file_provider, target_backing_abs_path)
 
-                rsp.actualSizes[item.resourceUuid] = long(lvm.get_lv_size(temp_abs_path) or actual_size)
-                converted_items.append((item, source_abs_path, temp_abs_path, target_abs_path,
-                                        effective_backing_abs_path, target_backing_abs_path))
-                converted_target_paths[target_abs_path] = temp_abs_path
-
-            for item, source_abs_path, _, _, _, _ in converted_items:
-                source_trash_path = getattr(item, 'sourceTrashInstallPath', None)
-                if source_trash_path:
-                    source_trash_abs_path = translate_absolute_path_from_install_path(source_trash_path)
-                    r, o, e = lvm.lv_rename(source_abs_path, source_trash_abs_path, False)
-                    if r != 0:
-                        raise Exception("rename lv %s to trash %s failed: stdout: %s, stderr: %s" %
-                                        (source_abs_path, source_trash_abs_path, o, e))
-                    renamed_sources.append((source_trash_abs_path, source_abs_path))
-
-            for _, _, temp_abs_path, target_abs_path, effective_backing_abs_path, target_backing_abs_path in converted_items:
-                if target_backing_abs_path and effective_backing_abs_path != target_backing_abs_path:
-                    with lvm.RecursiveOperateLv(target_backing_abs_path, shared=True):
-                        with lvm.OperateLv(temp_abs_path, shared=False):
-                            if cmd.targetEncrypted:
-                                with rebase_secret_file("final encrypted backing rebase") as reset_secret_file:
-                                    linux.qcow2_rebase_no_check_with_secret(target_backing_abs_path, temp_abs_path, reset_secret_file)
-                            else:
-                                linux.qcow2_rebase_no_check(target_backing_abs_path, temp_abs_path)
-                lvm.lv_rename(temp_abs_path, target_abs_path, False)
-                finalized_targets.append(target_abs_path)
+                rsp.actualSizes[item.resourceUuid] = long(lvm.get_lv_size(target_abs_path) or actual_size)
 
             rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
         except Exception as e:
             logger.warn(linux.get_exception_stacktrace())
-            for target_abs_path in finalized_targets:
+            for target_abs_path in converted_targets:
                 lvm.delete_lv(target_abs_path, False)
-            for _, _, temp_abs_path, _, _, _ in converted_items:
-                lvm.delete_lv(temp_abs_path, False)
-            for source_trash_abs_path, source_abs_path in reversed(renamed_sources):
-                if lvm.lv_exists(source_trash_abs_path) and not lvm.lv_exists(source_abs_path):
-                    lvm.lv_rename(source_trash_abs_path, source_abs_path, False)
             rsp.success = False
             rsp.error = 'failed to convert volume[%s] encryption: %s' % (cmd.volumeUuid, str(e))
 
