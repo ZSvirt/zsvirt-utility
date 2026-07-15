@@ -57,6 +57,7 @@ class ZbsStoragePlugin(kvmagent.KvmAgent):
     LUKS_CLONE_PATH = "/zbs/primarystorage/kvmhost/luksclone"
     LUKS_CREATE_EMPTY_PATH = "/zbs/primarystorage/kvmhost/lukscreateempty"
     LUKS_ENCRYPT_IN_PLACE_PATH = "/zbs/primarystorage/kvmhost/encryptinplace"
+    LUKS_CONVERT_PATH = "/zbs/primarystorage/kvmhost/luksconvert"
     LUKS_RESIZE_PATH = "/zbs/primarystorage/kvmhost/luksresize"
 
     def start(self):
@@ -65,6 +66,7 @@ class ZbsStoragePlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.LUKS_CLONE_PATH, self.luks_clone)
         http_server.register_async_uri(self.LUKS_CREATE_EMPTY_PATH, self.luks_create_empty)
         http_server.register_async_uri(self.LUKS_ENCRYPT_IN_PLACE_PATH, self.luks_encrypt_in_place)
+        http_server.register_async_uri(self.LUKS_CONVERT_PATH, self.luks_convert)
         http_server.register_async_uri(self.LUKS_RESIZE_PATH, self.luks_resize)
 
     def _cbd_qemu_path(self, install_path):
@@ -259,6 +261,55 @@ class ZbsStoragePlugin(kvmagent.KvmAgent):
             logger.warn(linux.get_exception_stacktrace())
             rsp.success = False
             rsp.error = 'failed to clone ZBS LUKS volume from[%s] to[%s]: %s' % (
+                src_path or '<missing>', dst_path or '<missing>', str(e))
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    @bash.in_bash
+    def luks_convert(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        rsp = ZbsLuksRsp()
+        src_path = '<missing>'
+        dst_path = '<missing>'
+        try:
+            src_path = cmd_attr(cmd, 'installPath')
+            dst_path = cmd_attr(cmd, 'targetInstallPath')
+            if not src_path or not dst_path:
+                raise Exception('installPath and targetInstallPath are required')
+            encrypted_dek = cmd_attr(cmd, 'encryptedDek')
+            if not encrypted_dek:
+                raise Exception('encryptedDek is required')
+            virtual_size = int(cmd_attr(cmd, 'virtualSize') or 0)
+            if virtual_size <= 0:
+                raise Exception('virtualSize is required and must be greater than 0')
+            target_encrypted = cmd_attr(cmd, 'targetEncrypted')
+            if not isinstance(target_encrypted, bool):
+                raise Exception('targetEncrypted is required and must be a boolean')
+            source_is_luks = self._is_luks_volume(src_path)
+            if source_is_luks == bool(target_encrypted):
+                raise Exception('ZBS source format does not match requested encryption conversion')
+            secret_file_provider = lambda: volume_secret.luks_secret_channel(encrypted_dek)
+            if target_encrypted:
+                with secret_file_provider() as secret_file:
+                    self._initialize_luks_cbd_volume(dst_path, virtual_size, secret_file)
+                with secret_file_provider() as secret_file:
+                    linux.convert_volume_encryption(
+                        self._plain_image_arg(src_path),
+                        linux.shellquote(self._luks_image_opts_value(dst_path)),
+                        linux.shellquote(secret_file), bash.bash_errorout,
+                        target_is_precreated=True, use_target_image_opts=True)
+            else:
+                with secret_file_provider() as secret_file:
+                    linux.convert_volume_encryption(
+                        self._luks_image_opts(src_path),
+                        linux.shellquote(self._cbd_qemu_path(dst_path)),
+                        linux.shellquote(secret_file), bash.bash_errorout,
+                        target_format_options="-O raw", target_is_precreated=True)
+            rsp.actualSize = self._raw_cbd_actual_size(dst_path)
+        except Exception as e:
+            logger.warn(linux.get_exception_stacktrace())
+            rsp.success = False
+            rsp.error = 'failed to convert ZBS volume encryption from[%s] to[%s]: %s' % (
                 src_path or '<missing>', dst_path or '<missing>', str(e))
         return jsonobject.dumps(rsp)
 

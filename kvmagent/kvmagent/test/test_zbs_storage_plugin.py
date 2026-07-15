@@ -89,6 +89,23 @@ def _install_import_stubs():
     linux_mod.catch_bad_alloc_exception = lambda ret, err: False
     linux_mod.read_luks_secret_material_file = lambda path: b"secret-material"
 
+    def convert_volume_encryption(source_image_arg, target_arg, secret_file_arg, command_runner,
+                                  target_format_options=None, target_is_precreated=False,
+                                  use_target_image_opts=False):
+        options = []
+        if target_is_precreated:
+            options.append("-n")
+        if use_target_image_opts:
+            options.append("--target-image-opts")
+        options.append("--object secret,id=luks_sec,format=raw,file=%s" % secret_file_arg)
+        options.extend(["-m 16 -W", source_image_arg])
+        if target_format_options:
+            options.append(target_format_options)
+        options.append(target_arg)
+        return command_runner("/usr/bin/qemu-img convert %s" % " ".join(options))
+
+    linux_mod.convert_volume_encryption = convert_volume_encryption
+
     @contextlib.contextmanager
     def temporary_luks_secret_file(secret_material):
         yield "/tmp/luks-secret-persistent"
@@ -119,6 +136,36 @@ from zstacklib.utils import jsonobject
 
 
 class TestZbsStoragePlugin(unittest.TestCase):
+    def _call_luks_convert(self, plugin, target_encrypted):
+        return jsonobject.loads(plugin.luks_convert({
+            "body": json.dumps({
+                "psUuid": "ps-uuid",
+                "installPath": "cbd:physical/logical/source",
+                "targetInstallPath": "cbd:physical/logical/target",
+                "targetEncrypted": target_encrypted,
+                "virtualSize": 13631488,
+                "encryptedDek": "sealed-dek"
+            })
+        }))
+
+    def test_start_registers_luks_convert_path(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        paths = []
+
+        class HttpServer(object):
+            def register_async_uri(self, path, handler):
+                paths.append((path, handler.__name__))
+
+        original_get_http_server = zbs_storage_plugin.kvmagent.get_http_server
+        try:
+            zbs_storage_plugin.kvmagent.get_http_server = lambda: HttpServer()
+
+            plugin.start()
+
+            self.assertEqual(1, paths.count((plugin.LUKS_CONVERT_PATH, "luks_convert")))
+        finally:
+            zbs_storage_plugin.kvmagent.get_http_server = original_get_http_server
+
     def test_start_registers_luks_resize_path(self):
         plugin = zbs_storage_plugin.ZbsStoragePlugin()
         paths = []
@@ -150,6 +197,240 @@ class TestZbsStoragePlugin(unittest.TestCase):
         path = plugin._cbd_qemu_path("physical/logical/volume@1")
 
         self.assertEqual("cbd:physical/logical/volume@1_zbs_:/etc/zbs/client.conf", path)
+
+    def test_luks_convert_plain_to_encrypted_initializes_fixed_offset_target(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        commands = []
+        original_errorout = zbs_storage_plugin.bash.bash_errorout
+        try:
+            zbs_storage_plugin.bash.bash_errorout = lambda cmd: commands.append(cmd) or ""
+            plugin._is_luks_volume = lambda install_path, encrypted_dek=None: False
+            plugin._new_luks_temp_path = lambda: "/tmp/zbs-luks-convert.img"
+            plugin._raw_cbd_actual_size = lambda install_path: 0
+
+            rsp = self._call_luks_convert(plugin, True)
+
+            self.assertTrue(rsp.success)
+            self.assertIn("/usr/bin/truncate -s 22020096 /tmp/zbs-luks-convert.img", commands[0])
+            self.assertIn("--align-payload=16384", commands[1])
+            self.assertIn("convert -n --target-image-opts", commands[-1])
+            self.assertIn("driver=luks,key-secret=luks_sec", commands[-1])
+        finally:
+            zbs_storage_plugin.bash.bash_errorout = original_errorout
+
+    def test_luks_convert_encrypted_to_plain_uses_luks_source_image_opts(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        commands = []
+        original_errorout = zbs_storage_plugin.bash.bash_errorout
+        try:
+            zbs_storage_plugin.bash.bash_errorout = lambda cmd: commands.append(cmd) or ""
+            plugin._is_luks_volume = lambda install_path, encrypted_dek=None: True
+            plugin._raw_cbd_actual_size = lambda install_path: 0
+
+            rsp = self._call_luks_convert(plugin, False)
+
+            self.assertTrue(rsp.success)
+            self.assertEqual(1, len(commands))
+            self.assertIn("convert -n", commands[0])
+            self.assertIn("--image-opts driver=luks,key-secret=luks_sec", commands[0])
+            self.assertIn("-O raw", commands[0])
+            self.assertNotIn("truncate", commands[0])
+            self.assertNotIn("cryptsetup", commands[0])
+        finally:
+            zbs_storage_plugin.bash.bash_errorout = original_errorout
+
+    def test_luks_convert_plain_to_encrypted_delegates_copy_to_linux_helper(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        calls = []
+        helper_name = "convert_volume_encryption"
+        original_helper = getattr(zbs_storage_plugin.linux, helper_name, None)
+        try:
+            setattr(zbs_storage_plugin.linux, helper_name,
+                    lambda *args, **kwargs: calls.append((args, kwargs)))
+            plugin._is_luks_volume = lambda install_path, encrypted_dek=None: False
+            plugin._initialize_luks_cbd_volume = lambda install_path, size, secret_file: None
+            plugin._raw_cbd_actual_size = lambda install_path: 0
+
+            rsp = self._call_luks_convert(plugin, True)
+
+            self.assertTrue(rsp.success)
+            self.assertEqual(1, len(calls))
+            args, kwargs = calls[0]
+            self.assertIn("-f raw cbd:physical/logical/source_zbs_:/etc/zbs/client.conf", args[0])
+            self.assertIn("driver=luks,key-secret=luks_sec,file.driver=cbd", args[1])
+            self.assertEqual("/tmp/luks-secret", args[2])
+            self.assertIs(zbs_storage_plugin.bash.bash_errorout, args[3])
+            self.assertTrue(kwargs["target_is_precreated"])
+            self.assertTrue(kwargs["use_target_image_opts"])
+            self.assertNotIn("target_format_options", kwargs)
+        finally:
+            if original_helper is None:
+                delattr(zbs_storage_plugin.linux, helper_name)
+            else:
+                setattr(zbs_storage_plugin.linux, helper_name, original_helper)
+
+    def test_luks_convert_encrypted_to_plain_delegates_copy_to_linux_helper(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        calls = []
+        helper_name = "convert_volume_encryption"
+        original_helper = getattr(zbs_storage_plugin.linux, helper_name, None)
+        try:
+            setattr(zbs_storage_plugin.linux, helper_name,
+                    lambda *args, **kwargs: calls.append((args, kwargs)))
+            plugin._is_luks_volume = lambda install_path, encrypted_dek=None: True
+            plugin._raw_cbd_actual_size = lambda install_path: 0
+
+            rsp = self._call_luks_convert(plugin, False)
+
+            self.assertTrue(rsp.success)
+            self.assertEqual(1, len(calls))
+            args, kwargs = calls[0]
+            self.assertIn("--image-opts driver=luks,key-secret=luks_sec", args[0])
+            self.assertEqual("cbd:physical/logical/target_zbs_:/etc/zbs/client.conf", args[1])
+            self.assertEqual("/tmp/luks-secret", args[2])
+            self.assertIs(zbs_storage_plugin.bash.bash_errorout, args[3])
+            self.assertEqual("-O raw", kwargs["target_format_options"])
+            self.assertTrue(kwargs["target_is_precreated"])
+            self.assertNotIn("use_target_image_opts", kwargs)
+        finally:
+            if original_helper is None:
+                delattr(zbs_storage_plugin.linux, helper_name)
+            else:
+                setattr(zbs_storage_plugin.linux, helper_name, original_helper)
+
+    def test_luks_convert_requires_source_target_dek_and_virtual_size(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        commands = []
+        original_errorout = zbs_storage_plugin.bash.bash_errorout
+        try:
+            zbs_storage_plugin.bash.bash_errorout = lambda cmd: commands.append(cmd) or ""
+            valid = {
+                "psUuid": "ps-uuid",
+                "installPath": "cbd:physical/logical/source",
+                "targetInstallPath": "cbd:physical/logical/target",
+                "targetEncrypted": True,
+                "virtualSize": 13631488,
+                "encryptedDek": "sealed-dek"
+            }
+            cases = []
+            for field in ["installPath", "targetInstallPath", "encryptedDek"]:
+                body = dict(valid)
+                del body[field]
+                cases.append(body)
+            body = dict(valid)
+            body["virtualSize"] = 0
+            cases.append(body)
+
+            for body in cases:
+                rsp = jsonobject.loads(plugin.luks_convert({"body": json.dumps(body)}))
+
+                self.assertFalse(rsp.success)
+
+            self.assertFalse(any("qemu-img convert" in cmd for cmd in commands))
+        finally:
+            zbs_storage_plugin.bash.bash_errorout = original_errorout
+
+    def test_luks_convert_requires_boolean_target_encrypted_before_probing_source(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        probe_calls = []
+        original_helper = zbs_storage_plugin.linux.convert_volume_encryption
+        zbs_storage_plugin.linux.convert_volume_encryption = lambda *args, **kwargs: None
+        plugin._initialize_luks_cbd_volume = lambda install_path, size, secret_file: None
+        plugin._raw_cbd_actual_size = lambda install_path: 0
+        valid = {
+            "psUuid": "ps-uuid",
+            "installPath": "cbd:physical/logical/source",
+            "targetInstallPath": "cbd:physical/logical/target",
+            "virtualSize": 13631488,
+            "encryptedDek": "sealed-dek"
+        }
+        cases = [(dict(valid), True), (dict(valid, targetEncrypted="false"), False)]
+        try:
+            for body, source_is_luks in cases:
+                plugin._is_luks_volume = lambda install_path, encrypted_dek=None, value=source_is_luks: \
+                    probe_calls.append(install_path) or value
+                rsp = jsonobject.loads(plugin.luks_convert({"body": json.dumps(body)}))
+
+                self.assertFalse(rsp.success)
+                self.assertIn("targetEncrypted", rsp.error)
+            self.assertEqual([], probe_calls)
+        finally:
+            zbs_storage_plugin.linux.convert_volume_encryption = original_helper
+
+    def test_luks_convert_rejects_source_format_mismatch_before_writing(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        commands = []
+        original_errorout = zbs_storage_plugin.bash.bash_errorout
+        try:
+            zbs_storage_plugin.bash.bash_errorout = lambda cmd: commands.append(cmd) or ""
+            for source_is_luks, target_encrypted in [(False, False), (True, True)]:
+                plugin._is_luks_volume = lambda install_path, encrypted_dek=None, value=source_is_luks: value
+
+                rsp = self._call_luks_convert(plugin, target_encrypted)
+
+                self.assertFalse(rsp.success)
+                self.assertIn("source format does not match", rsp.error)
+
+            self.assertEqual([], commands)
+        finally:
+            zbs_storage_plugin.bash.bash_errorout = original_errorout
+
+    def test_luks_convert_failure_returns_error_without_deleting_cbd_paths(self):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        commands = []
+        original_errorout = zbs_storage_plugin.bash.bash_errorout
+        try:
+            def fail_convert(cmd):
+                commands.append(cmd)
+                raise Exception("qemu-img conversion failed")
+
+            zbs_storage_plugin.bash.bash_errorout = fail_convert
+            plugin._is_luks_volume = lambda install_path, encrypted_dek=None: True
+            source = "cbd:physical/logical/source"
+            target = "cbd:physical/logical/target"
+
+            rsp = jsonobject.loads(plugin.luks_convert({
+                "body": json.dumps({
+                    "psUuid": "ps-uuid",
+                    "installPath": source,
+                    "targetInstallPath": target,
+                    "targetEncrypted": False,
+                    "virtualSize": 13631488,
+                    "encryptedDek": "sealed-dek"
+                })
+            }))
+
+            self.assertFalse(rsp.success)
+            self.assertIn(source, rsp.error)
+            self.assertIn(target, rsp.error)
+            self.assertFalse(any("delete" in cmd.lower() for cmd in commands))
+        finally:
+            zbs_storage_plugin.bash.bash_errorout = original_errorout
+
+    def test_luks_convert_reports_target_actual_size(self):
+        target = "cbd:physical/logical/target"
+        for target_encrypted in (True, False):
+            plugin = zbs_storage_plugin.ZbsStoragePlugin()
+            calls = []
+            plugin._is_luks_volume = \
+                lambda install_path, encrypted_dek=None, value=target_encrypted: not value
+            plugin._initialize_luks_cbd_volume = lambda install_path, size, secret_file: None
+            original_helper = zbs_storage_plugin.linux.convert_volume_encryption
+            zbs_storage_plugin.linux.convert_volume_encryption = (
+                lambda *args, **kwargs: calls.append(("convert", target_encrypted)))
+            plugin._raw_cbd_actual_size = lambda install_path: calls.append(
+                ("actual-size", install_path)) or 4096
+            try:
+                rsp = self._call_luks_convert(plugin, target_encrypted)
+
+                self.assertTrue(rsp.success)
+                self.assertEqual(4096, rsp.actualSize)
+                self.assertEqual([
+                    ("convert", target_encrypted),
+                    ("actual-size", target)
+                ], calls)
+            finally:
+                zbs_storage_plugin.linux.convert_volume_encryption = original_helper
 
     def test_luks_clone_preserves_luks_source_bits(self):
         plugin = zbs_storage_plugin.ZbsStoragePlugin()

@@ -372,16 +372,10 @@ class CephStoragePlugin(kvmagent.KvmAgent):
                 target_format = "-O luks -o key-secret=luks_sec"
             else:
                 target_format = "-O raw"
-            shell.call(
-                "/usr/bin/qemu-img convert "
-                "--object secret,id=luks_sec,format=raw,file=%s "
-                "-m 16 -W %s %s %s" % (
-                    sec,
-                    src_arg,
-                    target_format,
-                    self._rbd_uri(target_path, conf, "rbd_cache=false:rbd_concurrent_management_ops=20"),
-                )
-            )
+            linux.convert_volume_encryption(
+                src_arg,
+                self._rbd_uri(target_path, conf, "rbd_cache=false:rbd_concurrent_management_ops=20"),
+                sec, shell.call, target_format_options=target_format)
 
         virtual_size = getattr(cmd, "virtualSize", None)
         if cmd.targetEncrypted and virtual_size:

@@ -1942,6 +1942,21 @@ def qcow2_rebase_no_check_with_secret(backing_file, target, secret_material_file
     finally:
         rm_file_force(secret_material_file)
 
+def convert_volume_encryption(source_image_arg, target_arg, secret_file_arg, command_runner,
+                              target_format_options=None, target_is_precreated=False,
+                              use_target_image_opts=False):
+    options = []
+    if target_is_precreated:
+        options.append("-n")
+    if use_target_image_opts:
+        options.append("--target-image-opts")
+    options.append("--object secret,id=luks_sec,format=raw,file=%s" % secret_file_arg)
+    options.extend(["-m 16 -W", source_image_arg])
+    if target_format_options:
+        options.append(target_format_options)
+    options.append(target_arg)
+    command_runner("/usr/bin/qemu-img convert %s" % " ".join(options))
+
 def convert_qcow2_volume_encryption(src, dst, target_encrypted, secret_file_provider=None,
                                     target_backing_file=None):
     if not os.path.exists(src):
@@ -1956,7 +1971,9 @@ def convert_qcow2_volume_encryption(src, dst, target_encrypted, secret_file_prov
         os.makedirs(dst_dir)
 
     dst_is_block = _is_block_device(dst)
-    target_path = dst if dst_is_block else ("%s.creating.%s" % (dst, uuid.uuid4().hex))
+    if not dst_is_block and os.path.exists(dst):
+        raise Exception("target image %s already exists" % dst)
+    completed = False
     backing_arg = target_backing_file
     backing_fmt = None
     backing_needs_reset = False
@@ -1994,10 +2011,10 @@ def convert_qcow2_volume_encryption(src, dst, target_encrypted, secret_file_prov
                 with secret_file_provider() as secret_file:
                     secret_opt = "--object secret,id=luks_sec,format=raw,file=%s" % shellquote(secret_file)
                     shell.check_run("%s %s %s -O qcow2 %s %s %s" % (
-                        qemu_img.subcmd('convert'), secret_opt, src_arg, out_opt, backing_opt, shellquote(target_path)))
+                        qemu_img.subcmd('convert'), secret_opt, src_arg, out_opt, backing_opt, shellquote(dst)))
             else:
                 shell.check_run("%s %s -O qcow2 %s %s %s" % (
-                    qemu_img.subcmd('convert'), src_arg, out_opt, backing_opt, shellquote(target_path)))
+                    qemu_img.subcmd('convert'), src_arg, out_opt, backing_opt, shellquote(dst)))
 
         with src_arg_context() as src_arg:
             if backing_needs_reset:
@@ -2010,24 +2027,25 @@ def convert_qcow2_volume_encryption(src, dst, target_encrypted, secret_file_prov
             if target_encrypted:
                 with secret_file_provider() as reset_secret_file:
                     reset_secret_opt = "--object secret,id=luks_sec,format=raw,file=%s" % shellquote(reset_secret_file)
-                    with _qcow2_image_opts_with_secret_context(target_path, include_backing=False) as target_arg:
+                    with _qcow2_image_opts_with_secret_context(dst, include_backing=False) as target_arg:
                         shell.check_run("%s %s -F %s -u -b %s %s" % (
                             qemu_img.subcmd('rebase'), reset_secret_opt, backing_fmt,
                             shellquote(target_backing_file), target_arg))
             else:
                 reset_secret_opt = ""
-                target_arg = shellquote(target_path)
+                target_arg = shellquote(dst)
                 shell.check_run("%s %s -F %s -u -b %s %s" % (
                     qemu_img.subcmd('rebase'), reset_secret_opt, backing_fmt,
                     shellquote(target_backing_file), target_arg))
 
         if not dst_is_block:
-            shell.check_run("mv -f %s %s" % (shellquote(target_path), shellquote(dst)))
             os.chmod(dst, 0o660)
-        return os.path.getsize(dst)
+        actual_size = os.path.getsize(dst)
+        completed = True
+        return actual_size
     finally:
-        if not dst_is_block and os.path.exists(target_path):
-            rm_file_force(target_path)
+        if not completed and not dst_is_block and os.path.exists(dst):
+            rm_file_force(dst)
 
 def qcow2_create_with_backing_file(backing_file, dst, size=""):
     fmt = get_img_fmt(backing_file)
