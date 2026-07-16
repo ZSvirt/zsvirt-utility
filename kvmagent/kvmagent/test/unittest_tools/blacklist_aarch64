@@ -40,6 +40,7 @@ kvmagent/test/shareblock_testsuite/test_sharedblock_volume_migrate.py
 kvmagent/test/shareblock_testsuite/test_shareblock_create_data_volume_with_backing.py
 kvmagent/test/shareblock_testsuite/test_sharedblock_check_lock.py
 kvmagent/test/shareblock_testsuite/test_shareblock_get_qcow2_hashvalue.py
+kvmagent/test/shareblock_testsuite/test_sharedblock_dm_table_refresh.py
 kvmagent/test/shareblock_testsuite/test_sharedblock_takeover.py
 kvmagent/test/shareblock_testsuite/test_shareblock_metadata.py
 kvmagent/test/vm_plugin_testsuite/test_vm_cpu_model.py
