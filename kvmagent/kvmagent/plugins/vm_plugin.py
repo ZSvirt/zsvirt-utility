@@ -8458,8 +8458,8 @@ class VmPlugin(kvmagent.KvmAgent):
             if bool(cmd.forceStopIfNoOperatingSystemDetected) and strategy == "grace" and vm.state != vm.VM_STATE_SHUTDOWN:
                 has_os = vm.check_if_vm_has_operating_system_by_memory_state()
                 if not has_os:
-                    logger.info('vm has no operating system. stop it use \'force\' mode')
-                    strategy = "force"
+                    logger.info('vm has no operating system. stop it use \'cold\' mode')
+                    strategy = "cold"
 
             if strategy == "cold" or strategy == "force":
                 vm.stop(strategy=strategy)
