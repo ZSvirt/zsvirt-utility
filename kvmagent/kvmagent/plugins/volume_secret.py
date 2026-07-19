@@ -5,11 +5,13 @@ import re
 
 from zstacklib.utils import linux
 from zstacklib.utils import log
+from zstacklib.utils import rollback
 
 logger = log.get_logger(__name__)
 
 KEY_AGENT_UNIX_SOCKET = 'unix:///var/run/key-agent/key-agent.sock'
 KEY_AGENT_SOCKET_PATH = '/var/run/key-agent/key-agent.sock'
+IMAGE_STORE_ENCRYPTION_ADDON = 'ImageStoreEncryption'
 VOLUME_BACKUP_ENCRYPTION_ADDON = 'VolumeBackupEncryption'
 VOLUME_BACKUP_ENCRYPTION_SPECS = 'specs'
 
@@ -48,6 +50,27 @@ def _get_value(obj, key, default=None):
         return obj[key]
     except Exception:
         return getattr(obj, key, default)
+
+
+def make_image_store_encryption_option(addons, write_json_temp_file, key_agent_provider):
+    encryption = _get_value(addons, IMAGE_STORE_ENCRYPTION_ADDON)
+    encrypted_dek = _get_value(encryption, 'encryptedDek')
+    if not encrypted_dek:
+        return '', None
+
+    encryption_file = write_json_temp_file({
+        'encrypted': True,
+        'encryptedDek': encrypted_dek,
+    })
+
+    @rollback.rollbackable
+    def clean_encryption_file():
+        linux.rm_file_force(encryption_file)
+    clean_encryption_file()
+
+    option = '-encryption-json-file %s -secret-channel-provider %s' % (
+        encryption_file, key_agent_provider)
+    return option, encryption_file
 
 
 def _volume_backup_spec_to_json(spec):

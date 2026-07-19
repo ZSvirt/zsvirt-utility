@@ -384,6 +384,12 @@ class CheckDisk(object):
         return None
 
 
+class CommitToImageStoreCmd(kvmagent.AgentCommand):
+    @log.sensitive_fields("addons.ImageStoreEncryption.encryptedDek")
+    def __init__(self):
+        super(CommitToImageStoreCmd, self).__init__()
+
+
 class SharedBlockPlugin(kvmagent.KvmAgent):
 
     PING_PATH = "/sharedblock/ping"
@@ -463,7 +469,8 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.UPLOAD_BITS_TO_SFTP_BACKUPSTORAGE_PATH, self.upload_to_sftp)
         http_server.register_async_uri(self.DOWNLOAD_BITS_FROM_SFTP_BACKUPSTORAGE_PATH, self.download_from_sftp)
         http_server.register_async_uri(self.UPLOAD_BITS_TO_IMAGESTORE_PATH, self.upload_to_imagestore)
-        http_server.register_async_uri(self.COMMIT_BITS_TO_IMAGESTORE_PATH, self.commit_to_imagestore)
+        http_server.register_async_uri(self.COMMIT_BITS_TO_IMAGESTORE_PATH, self.commit_to_imagestore,
+                                       cmd=CommitToImageStoreCmd())
         http_server.register_async_uri(self.DOWNLOAD_BITS_FROM_IMAGESTORE_PATH, self.download_from_imagestore)
         http_server.register_async_uri(self.CLEAN_LV_META, self.clean_lv_meta)
         http_server.register_async_uri(self.REVERT_VOLUME_FROM_SNAPSHOT_PATH, self.revert_volume_from_snapshot)

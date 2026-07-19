@@ -8,6 +8,7 @@ import json
 from kvmagent import kvmagent
 from kvmagent.plugins import volume_secret
 from zstacklib.utils import jsonobject
+from zstacklib.utils import rollback
 from zstacklib.utils import shell
 from zstacklib.utils import traceable_shell
 from zstacklib.utils.bash import bash_progress_1, in_bash, bash_r, bash_roe
@@ -343,6 +344,7 @@ class ImageStoreClient(object):
         return jsonobject.dumps(rsp)
 
 
+    @rollback.rollback
     def commit_to_imagestore(self, cmd, req):
         self._check_zstore_cli()
 
@@ -351,12 +353,17 @@ class ImageStoreClient(object):
         # Synchronize cached writes for 'fpath'
         linux.sync_file(fpath)
 
+        add_ext_param, encryption_file = volume_secret.make_image_store_encryption_option(
+            getattr(cmd, 'addons', None), self._write_json_temp_file, self.KEY_AGENT_PROVIDER)
+
         # Add the image to registry
-        cmdstr = '%s -json  -callbackurl %s -taskid %s -imageUuid %s add -desc \'%s\' -file %s' % (self.ZSTORE_CLI_PATH, req[http.REQUEST_HEADER].get(http.CALLBACK_URI),
-                req[http.REQUEST_HEADER].get(http.TASK_UUID), cmd.imageUuid, cmd.description, fpath)
+        cmdstr = '%s -json  -callbackurl %s -taskid %s -imageUuid %s add %s -desc \'%s\' -file %s' % (self.ZSTORE_CLI_PATH, req[http.REQUEST_HEADER].get(http.CALLBACK_URI),
+                req[http.REQUEST_HEADER].get(http.TASK_UUID), cmd.imageUuid, add_ext_param, cmd.description, fpath)
         logger.debug('adding %s to local image store' % fpath)
         output = shell.call(cmdstr.encode(encoding="utf-8"))
         logger.debug('%s added to local image store' % fpath)
+        if encryption_file:
+            linux.rm_file_force(encryption_file)
 
         imf = jsonobject.loads(output.splitlines()[-1])
 
