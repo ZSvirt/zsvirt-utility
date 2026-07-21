@@ -2,6 +2,7 @@ import unittest
 import contextlib
 import json
 import os
+import shutil
 import sys
 import types
 
@@ -78,9 +79,53 @@ def _install_import_stubs():
     bash_mod = types.ModuleType("zstacklib.utils.bash")
     bash_mod.bash_errorout = lambda cmd: ""
     bash_mod.bash_roe = lambda cmd: (0, "", "")
+    bash_mod.bash_r = lambda cmd: 0
+    bash_mod.bash_progress_1 = lambda cmd, func=None: ""
     bash_mod.in_bash = lambda func: func
     zstacklib_utils_pkg.bash = bash_mod
     sys.modules["zstacklib.utils.bash"] = bash_mod
+
+    rollback_mod = types.ModuleType("zstacklib.utils.rollback")
+    rollback_mod.actions = []
+
+    def rollbackable(func):
+        def register(*args, **kwargs):
+            rollback_mod.actions.append((func, args, kwargs))
+        return register
+
+    def rollback(func):
+        def run(*args, **kwargs):
+            rollback_mod.actions = []
+            try:
+                return func(*args, **kwargs)
+            except Exception:
+                for action, action_args, action_kwargs in reversed(rollback_mod.actions):
+                    action(*action_args, **action_kwargs)
+                raise
+            finally:
+                rollback_mod.actions = []
+        return run
+
+    rollback_mod.rollback = rollback
+    rollback_mod.rollbackable = rollbackable
+    zstacklib_utils_pkg.rollback = rollback_mod
+    sys.modules["zstacklib.utils.rollback"] = rollback_mod
+
+    shell_mod = types.ModuleType("zstacklib.utils.shell")
+    shell_mod.call = lambda cmd: ""
+    shell_mod.check_run = lambda cmd: ""
+    zstacklib_utils_pkg.shell = shell_mod
+    sys.modules["zstacklib.utils.shell"] = shell_mod
+
+    traceable_shell_mod = types.ModuleType("zstacklib.utils.traceable_shell")
+    traceable_shell_mod.get_shell = lambda cmd=None: shell_mod
+    zstacklib_utils_pkg.traceable_shell = traceable_shell_mod
+    sys.modules["zstacklib.utils.traceable_shell"] = traceable_shell_mod
+
+    report_mod = types.ModuleType("zstacklib.utils.report")
+    report_mod.log = log_mod
+    zstacklib_utils_pkg.report = report_mod
+    sys.modules["zstacklib.utils.report"] = report_mod
 
     linux_mod = types.ModuleType("zstacklib.utils.linux")
     linux_mod.shellquote = lambda value: value
@@ -737,6 +782,191 @@ class TestZbsStoragePlugin(unittest.TestCase):
             self.assertIn("virtualSize is required", rsp.error)
 
         self.assertEqual([], calls)
+
+    def _capture_imagestore_nbd_conversion(self, source_encrypted, export_names=None,
+                                            socket_ready=True, qsd_exit=False,
+                                            convert_error=None):
+        plugin = zbs_storage_plugin.ZbsStoragePlugin()
+        qsd_args = []
+        commands = []
+        secret_files = []
+        killed = []
+        removed = []
+        original_mkdtemp = zbs_storage_plugin.tempfile.mkdtemp
+        original_exists = zbs_storage_plugin.os.path.exists
+        original_popen = zbs_storage_plugin.subprocess.Popen
+        original_errorout = zbs_storage_plugin.bash.bash_errorout
+        original_secret_channel = zbs_storage_plugin.volume_secret.luks_secret_channel
+        original_kill_process = getattr(zbs_storage_plugin.linux, "kill_process", None)
+        original_rm_dir = getattr(zbs_storage_plugin.linux, "rm_dir_force", None)
+        original_sleep = zbs_storage_plugin.time.sleep
+        work_paths = []
+        waited = []
+        failure = []
+
+        if export_names is None:
+            export_names = ["layer-top", "layer-base"]
+
+        class FakeProcess(object):
+            pid = 12345
+
+            def poll(self):
+                return 1 if qsd_exit else None
+
+            def wait(self):
+                waited.append(self.pid)
+                return 0
+
+        try:
+            def make_work_path(prefix):
+                work_path = original_mkdtemp(prefix=prefix)
+                work_paths.append(work_path)
+                return work_path
+
+            def popen(args, stdout=None, stderr=None, close_fds=True):
+                qsd_args.append(list(args))
+                return FakeProcess()
+
+            zbs_storage_plugin.tempfile.mkdtemp = make_work_path
+            zbs_storage_plugin.os.path.exists = lambda path: socket_ready and path.endswith("source.sock")
+            zbs_storage_plugin.subprocess.Popen = popen
+            def run_convert(cmd):
+                commands.append(cmd)
+                if convert_error is not None:
+                    raise Exception(convert_error)
+                return ""
+            zbs_storage_plugin.bash.bash_errorout = run_convert
+            zbs_storage_plugin.linux.kill_process = lambda pid, is_exception=False: killed.append(pid)
+            zbs_storage_plugin.linux.rm_dir_force = lambda path: removed.append(path)
+            zbs_storage_plugin.time.sleep = lambda seconds: None
+
+            @contextlib.contextmanager
+            def secret_channel(encrypted_dek):
+                self.assertEqual("sealed-dek", encrypted_dek)
+                secret_file = "/tmp/luks-secret-%d" % len(secret_files)
+                secret_files.append(secret_file)
+                yield secret_file
+
+            zbs_storage_plugin.volume_secret.luks_secret_channel = secret_channel
+
+            try:
+                plugin.download_encrypted_imagestore({
+                    "body": json.dumps({
+                        "backupStorageHostname": "bs-host",
+                        "backupStorageNbdPort": 10809,
+                        "backupStorageNbdExportNames": export_names,
+                        "primaryStorageInstallPath": "cbd:physical/logical/target",
+                        "encryptedDek": "sealed-dek",
+                        "sourceEncrypted": source_encrypted,
+                    })
+                })
+            except Exception as e:
+                failure.append(str(e))
+
+            return {
+                "qsd_args": qsd_args[0],
+                "commands": list(commands),
+                "secret_files": list(secret_files),
+                "killed": list(killed),
+                "removed": list(removed),
+                "waited": list(waited),
+                "failure": failure[0] if failure else None,
+            }
+        finally:
+            zbs_storage_plugin.tempfile.mkdtemp = original_mkdtemp
+            zbs_storage_plugin.os.path.exists = original_exists
+            zbs_storage_plugin.subprocess.Popen = original_popen
+            zbs_storage_plugin.bash.bash_errorout = original_errorout
+            zbs_storage_plugin.volume_secret.luks_secret_channel = original_secret_channel
+            if original_kill_process is None:
+                delattr(zbs_storage_plugin.linux, "kill_process")
+            else:
+                zbs_storage_plugin.linux.kill_process = original_kill_process
+            if original_rm_dir is None:
+                delattr(zbs_storage_plugin.linux, "rm_dir_force")
+            else:
+                zbs_storage_plugin.linux.rm_dir_force = original_rm_dir
+            zbs_storage_plugin.time.sleep = original_sleep
+            for work_path in work_paths:
+                shutil.rmtree(work_path, ignore_errors=True)
+
+    def test_imagestore_nbd_chain_uses_minimal_qsd_graph(self):
+        result = self._capture_imagestore_nbd_conversion(
+            False, ["layer-inc-2", "layer-inc-1", "layer-base"])
+        qsd_args = result["qsd_args"]
+
+        self.assertIsNone(result["failure"])
+        self.assertNotIn("--chardev", qsd_args)
+        self.assertNotIn("--monitor", qsd_args)
+        self.assertNotIn("--pidfile", qsd_args)
+        self.assertNotIn("--object", qsd_args)
+
+        blockdevs = [json.loads(qsd_args[index + 1])
+                     for index, value in enumerate(qsd_args) if value == "--blockdev"]
+        self.assertEqual(6, len(blockdevs))
+        self.assertEqual("layer-base", blockdevs[0]["export"])
+        self.assertEqual("source-nbd-2", blockdevs[1]["file"])
+        self.assertIsNone(blockdevs[1]["backing"])
+        self.assertNotIn("encrypt", blockdevs[1])
+        self.assertEqual("layer-inc-1", blockdevs[2]["export"])
+        self.assertEqual("source-nbd-1", blockdevs[3]["file"])
+        self.assertEqual("source-qcow2-2", blockdevs[3]["backing"])
+        self.assertNotIn("encrypt", blockdevs[3])
+        self.assertEqual("layer-inc-2", blockdevs[4]["export"])
+        self.assertEqual("source-nbd-0", blockdevs[5]["file"])
+        self.assertEqual("source-qcow2-1", blockdevs[5]["backing"])
+        self.assertNotIn("encrypt", blockdevs[5])
+
+        export = json.loads(qsd_args[qsd_args.index("--export") + 1])
+        self.assertEqual("source-qcow2-0", export["node-name"])
+        self.assertEqual(["/tmp/luks-secret-0"], result["secret_files"])
+        self.assertEqual(1, len(result["commands"]))
+        self.assertIn("file=/tmp/luks-secret-0", result["commands"][0])
+        self.assertEqual([12345], result["killed"])
+        self.assertEqual([12345], result["waited"])
+        self.assertEqual(1, len(result["removed"]))
+
+    def test_encrypted_imagestore_nbd_chain_uses_separate_secrets(self):
+        result = self._capture_imagestore_nbd_conversion(
+            True, ["layer-inc-2", "layer-inc-1", "layer-base"])
+
+        self.assertIsNone(result["failure"])
+        self.assertEqual(["/tmp/luks-secret-0", "/tmp/luks-secret-1"], result["secret_files"])
+        source_object = result["qsd_args"][result["qsd_args"].index("--object") + 1]
+        self.assertIn("file=/tmp/luks-secret-0", source_object)
+        self.assertNotIn("/tmp/luks-secret-1", source_object)
+        blockdevs = [json.loads(result["qsd_args"][index + 1])
+                     for index, value in enumerate(result["qsd_args"]) if value == "--blockdev"]
+        qcow2_nodes = [node for node in blockdevs if node["driver"] == "qcow2"]
+        self.assertEqual(3, len(qcow2_nodes))
+        for node in qcow2_nodes:
+            self.assertEqual({"format": "luks", "key-secret": "luks_sec"}, node["encrypt"])
+        self.assertIn("file=/tmp/luks-secret-1", result["commands"][0])
+        self.assertNotIn("/tmp/luks-secret-0", result["commands"][0])
+
+    def test_imagestore_nbd_chain_cleans_up_when_qsd_exits_before_socket_ready(self):
+        result = self._capture_imagestore_nbd_conversion(False, socket_ready=False, qsd_exit=True)
+
+        self.assertIn("failed to start ImageStore NBD source QSD", result["failure"])
+        self.assertEqual([], result["killed"])
+        self.assertEqual([], result["waited"])
+        self.assertEqual(1, len(result["removed"]))
+
+    def test_imagestore_nbd_chain_cleans_up_when_socket_wait_times_out(self):
+        result = self._capture_imagestore_nbd_conversion(False, socket_ready=False)
+
+        self.assertIn("timed out waiting for ImageStore NBD source QSD", result["failure"])
+        self.assertEqual([12345], result["killed"])
+        self.assertEqual([12345], result["waited"])
+        self.assertEqual(1, len(result["removed"]))
+
+    def test_imagestore_nbd_chain_cleans_up_when_convert_fails(self):
+        result = self._capture_imagestore_nbd_conversion(False, convert_error="qemu-img failed")
+
+        self.assertIn("qemu-img failed", result["failure"])
+        self.assertEqual([12345], result["killed"])
+        self.assertEqual([12345], result["waited"])
+        self.assertEqual(1, len(result["removed"]))
 
     def test_luks_encrypt_in_place_returns_new_install_path_without_replacing_original(self):
         plugin = zbs_storage_plugin.ZbsStoragePlugin()

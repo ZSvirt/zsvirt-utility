@@ -4,8 +4,15 @@ from zstacklib.utils import jsonobject
 from zstacklib.utils import log
 from zstacklib.utils import bash
 from zstacklib.utils import linux
+from zstacklib.utils import rollback
+from kvmagent.plugins.imagestore import ImageStoreClient
 from kvmagent.plugins import volume_secret
+import contextlib
 import json
+import os
+import subprocess
+import tempfile
+import time
 import uuid
 
 
@@ -59,6 +66,7 @@ class ZbsStoragePlugin(kvmagent.KvmAgent):
     LUKS_ENCRYPT_IN_PLACE_PATH = "/zbs/primarystorage/kvmhost/encryptinplace"
     LUKS_CONVERT_PATH = "/zbs/primarystorage/kvmhost/luksconvert"
     LUKS_RESIZE_PATH = "/zbs/primarystorage/kvmhost/luksresize"
+    IMAGESTORE_ENCRYPTED_DOWNLOAD_PATH = "/zbs/primarystorage/kvmhost/imagestore/encrypteddownload"
 
     def start(self):
         http_server = kvmagent.get_http_server()
@@ -68,6 +76,8 @@ class ZbsStoragePlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.LUKS_ENCRYPT_IN_PLACE_PATH, self.luks_encrypt_in_place)
         http_server.register_async_uri(self.LUKS_CONVERT_PATH, self.luks_convert)
         http_server.register_async_uri(self.LUKS_RESIZE_PATH, self.luks_resize)
+        http_server.register_async_uri(self.IMAGESTORE_ENCRYPTED_DOWNLOAD_PATH, self.download_encrypted_imagestore)
+        self.imagestore_client = ImageStoreClient()
 
     def _cbd_qemu_path(self, install_path):
         if not install_path.startswith(PROTOCOL_CBD_PREFIX):
@@ -371,6 +381,132 @@ class ZbsStoragePlugin(kvmagent.KvmAgent):
             rsp.success = False
             rsp.error = 'failed to resize ZBS LUKS volume[%s]: %s' % (install_path or '<missing>', str(e))
         return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    @rollback.rollback
+    @bash.in_bash
+    def download_encrypted_imagestore(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        rsp = ZbsLuksRsp()
+        hostname = cmd.backupStorageHostname
+        nbd_port = int(cmd.backupStorageNbdPort or 0)
+        export_names = list(cmd.backupStorageNbdExportNames)
+        target_path = cmd.primaryStorageInstallPath
+        encrypted_dek = cmd.encryptedDek
+        source_encrypted = cmd.sourceEncrypted or False
+
+        self._convert_imagestore_nbd_chain_to_luks_cbd(
+            hostname, nbd_port, export_names, target_path, encrypted_dek, source_encrypted)
+        return jsonobject.dumps(rsp)
+
+    def _convert_imagestore_nbd_chain_to_luks_cbd(self, hostname, nbd_port, export_names,
+                                                  target_path, encrypted_dek,
+                                                  source_encrypted=True):
+        work_path = tempfile.mkdtemp(prefix='zbs-imagestore-nbd-')
+        nbd_socket = os.path.join(work_path, 'source.sock')
+        qsd = None
+        qsd_log = None
+
+        @contextlib.contextmanager
+        def source_secret_channel():
+            if not source_encrypted:
+                yield None
+                return
+            with volume_secret.luks_secret_channel(encrypted_dek) as secret_file:
+                yield secret_file
+
+        def cleanup_qsd():
+            if qsd is not None and qsd.poll() is None:
+                linux.kill_process(qsd.pid, is_exception=False)
+                qsd.wait()
+            if qsd_log is not None:
+                qsd_log.close()
+            linux.rm_dir_force(work_path)
+
+        @rollback.rollbackable
+        def rollback_qsd():
+            cleanup_qsd()
+        rollback_qsd()
+
+        with source_secret_channel() as source_secret_file:
+            secret = 'luks_sec'
+            qsd_args = ['/usr/bin/qemu-storage-daemon']
+            if source_encrypted:
+                qsd_args.extend([
+                    '--object', 'secret,id=%s,format=raw,file=%s' % (secret, source_secret_file),
+                ])
+
+            parent_node = None
+            top_node = None
+            for index in reversed(range(len(export_names))):
+                nbd_node = 'source-nbd-%d' % index
+                qcow2_node = 'source-qcow2-%d' % index
+                qsd_args.extend([
+                    '--blockdev', json.dumps({
+                        'driver': 'nbd',
+                        'node-name': nbd_node,
+                        'server': {
+                            'type': 'inet',
+                            'host': str(hostname),
+                            'port': str(nbd_port),
+                        },
+                        'export': str(export_names[index]),
+                        'read-only': True,
+                    }, separators=(',', ':')),
+                ])
+                qcow2_options = {
+                    'driver': 'qcow2',
+                    'node-name': qcow2_node,
+                    'file': nbd_node,
+                    'backing': parent_node,
+                    'read-only': True,
+                }
+                if source_encrypted:
+                    qcow2_options['encrypt'] = {
+                        'format': 'luks',
+                        'key-secret': secret,
+                    }
+                qsd_args.extend([
+                    '--blockdev', json.dumps(qcow2_options, separators=(',', ':')),
+                ])
+                parent_node = qcow2_node
+                top_node = qcow2_node
+
+            qsd_args.extend([
+                '--nbd-server', 'addr.type=unix,addr.path=%s' % nbd_socket,
+                '--export', json.dumps({
+                    'type': 'nbd',
+                    'id': 'logical-top',
+                    'node-name': top_node,
+                    'name': 'top',
+                    'writable': False,
+                }, separators=(',', ':')),
+            ])
+            qsd_log = open(os.path.join(work_path, 'qsd.log'), 'w+')
+            qsd = subprocess.Popen(qsd_args, stdout=qsd_log, stderr=subprocess.STDOUT, close_fds=True)
+
+            for _ in range(100):
+                if os.path.exists(nbd_socket):
+                    break
+                if qsd.poll() is not None:
+                    qsd_log.flush()
+                    qsd_log.seek(0)
+                    raise Exception('failed to start ImageStore NBD source QSD: %s' % qsd_log.read())
+                time.sleep(0.1)
+            else:
+                raise Exception('timed out waiting for ImageStore NBD source QSD')
+
+        with volume_secret.luks_secret_channel(encrypted_dek) as target_secret_file:
+            source_path = 'nbd+unix:///top?socket=%s' % nbd_socket
+            cmd = '/usr/bin/qemu-img convert -n --target-image-opts ' \
+                  '--object secret,id=%s,format=raw,file=%s ' \
+                  '-m 16 -W -f raw %s %s' % (
+                      secret,
+                      linux.shellquote(target_secret_file),
+                      linux.shellquote(source_path),
+                      linux.shellquote(self._luks_image_opts_value(target_path)))
+            bash.bash_errorout(cmd)
+        cleanup_qsd()
 
 
     def stop(self):
