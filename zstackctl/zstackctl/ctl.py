@@ -109,12 +109,35 @@ if [ $? -ne 0 ]; then
 fi
 
 # Fixes ZSTAC-24460
-# if max_allowed_packet is not configured, then update from default value 1M to 4M
-grep 'max_allowed_packet' $mysql_conf >/dev/null 2>&1
-if [ $? -ne 0 ]; then
-    echo "max_allowed_packet=4M"
-    sed -i '/\[mysqld\]/a max_allowed_packet=4M\' $mysql_conf
-fi
+# add 64M when absent and raise smaller values to 64M
+awk -F= '
+    /^[[:space:]]*\[/ {
+        section = $0
+        sub(/^[[:space:]]*\[/, "", section)
+        sub(/\].*$/, "", section)
+        in_mysqld = (tolower(section) == "mysqld")
+    }
+    in_mysqld && /^[[:space:]]*max_allowed_packet[[:space:]]*=/ {
+        found = 1
+        value = $2
+        sub(/[[:space:]]*[#;].*$/, "", value)
+        sub(/^[[:space:]]*/, "", value)
+        sub(/[[:space:]]*$/, "", value)
+        if (value !~ /^[0-9]+[kKmMgG]?$/) next
+        unit = tolower(substr(value, length(value)))
+        bytes = value + 0
+        if (unit == "k") bytes *= 1024
+        if (unit == "m") bytes *= 1024 * 1024
+        if (unit == "g") bytes *= 1024 * 1024 * 1024
+        if (bytes < 64 * 1024 * 1024)
+            print NR "s/=[[:space:]]*[0-9]+[kKmMgG]?/=64M/"
+    }
+    END {
+        if (!found)
+            print "/^[[:space:]]*[[]mysqld[]][[:space:]]*([#;].*)?$/a max_allowed_packet=64M"
+    }
+' "$mysql_conf" | sed -i -E -f /dev/stdin "$mysql_conf"
+# end ZSTAC-24460
 
 # wanted_files = 10+max_connections+table_open_cache*2
 # 'table_open_cache' is default to 400 as of 5.5.x
@@ -8393,6 +8416,9 @@ class UpgradeDbCmd(Command):
         db_url = ctl.get_db_url()
         db_url_params = db_url.split('//')
         db_url = db_url_params[0] + '//' + db_url_params[1].split('/')[0]
+        rest_db_url = ctl.read_property('RESTApiDataSource.jdbcUrl')
+        if not rest_db_url:
+            rest_db_url = '%s/zstack_rest' % db_url.rstrip('/')
         db_url = '%s/zstack' % db_url.rstrip('/')
 
         db_hostname, db_port, db_user, db_password = ctl.get_live_mysql_portal()
@@ -8409,6 +8435,7 @@ class UpgradeDbCmd(Command):
         upgrading_schema_dirs = [
             os.path.join(ctl.zstack_home, 'WEB-INF/classes/db/upgrade/'),
         ]
+        rest_upgrading_schema_dir = os.path.join(ctl.zstack_home, 'WEB-INF/classes/db/zstack_rest/upgrade/')
 
         for upgrading_schema_dir in upgrading_schema_dirs:
             if not os.path.exists(upgrading_schema_dir):
@@ -8420,6 +8447,8 @@ class UpgradeDbCmd(Command):
             info('Dry run finished. Database could be upgraded. ')
             return True
 
+        if not os.path.exists(rest_upgrading_schema_dir):
+            raise CtlError('cannot find %s. Have you run upgrade_management_node?' % rest_upgrading_schema_dir)
         def update_db_config():
             update_db_config_script = mysql_db_config_script
 
@@ -8571,6 +8600,12 @@ class UpgradeDbCmd(Command):
                 execute_sql(sql)
                 raise e
 
+            if db_password:
+                shell_no_pipe('bash %s migrate -outOfOrder=true -user=%s -password=%s -url=%s -locations=filesystem:%s' % (
+                    flyway_path, db_user, db_password, shell_quote(rest_db_url), rest_upgrading_schema_dir))
+            else:
+                shell_no_pipe('bash %s migrate -outOfOrder=true -user=%s -url=%s -locations=filesystem:%s' % (
+                    flyway_path, db_user, shell_quote(rest_db_url), rest_upgrading_schema_dir))
             info('Successfully upgraded the database to the latest version.\n')
 
         update_db_config()

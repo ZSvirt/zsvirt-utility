@@ -2079,12 +2079,35 @@ upgrade_mysql_configuration(){
     fi
 
     # Fixes ZSTAC-24460
-    # if max_allowed_packet is not configured, then update from default value 1M to 2M
-    grep 'max_allowed_packet' $MYSQL_CONF_FILE >/dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo "max_allowed_packet=2M" >>$ZSTACK_INSTALL_LOG 2>&1
-        sed -i '/\[mysqld\]/a max_allowed_packet=2M\' $MYSQL_CONF_FILE
-    fi
+    # add 64M when absent and raise smaller values to 64M
+    awk -F= '
+        /^[[:space:]]*\[/ {
+            section = $0
+            sub(/^[[:space:]]*\[/, "", section)
+            sub(/\].*$/, "", section)
+            in_mysqld = (tolower(section) == "mysqld")
+        }
+        in_mysqld && /^[[:space:]]*max_allowed_packet[[:space:]]*=/ {
+            found = 1
+            value = $2
+            sub(/[[:space:]]*[#;].*$/, "", value)
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            if (value !~ /^[0-9]+[kKmMgG]?$/) next
+            unit = tolower(substr(value, length(value)))
+            bytes = value + 0
+            if (unit == "k") bytes *= 1024
+            if (unit == "m") bytes *= 1024 * 1024
+            if (unit == "g") bytes *= 1024 * 1024 * 1024
+            if (bytes < 64 * 1024 * 1024)
+                print NR "s/=[[:space:]]*[0-9]+[kKmMgG]?/=64M/"
+        }
+        END {
+            if (!found)
+                print "/^[[:space:]]*[[]mysqld[]][[:space:]]*([#;].*)?$/a max_allowed_packet=64M"
+        }
+    ' "$MYSQL_CONF_FILE" | sed -i -E -f /dev/stdin "$MYSQL_CONF_FILE"
+    # end ZSTAC-24460
 
     grep 'interactive_timeout' $MYSQL_CONF_FILE >/dev/null 2>&1
     if [ $? -ne 0 ]; then
