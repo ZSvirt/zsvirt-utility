@@ -51,6 +51,17 @@ class ImageStoreClient(object):
     def _build_install_path(self, name, imgid):
         return "{0}{1}/{2}".format(self.ZSTORE_PROTOSTR, name, imgid)
 
+    def change_backup_encryption(self, request):
+        args_file = self._write_json_temp_file(request)
+        try:
+            cmdstr = '%s -url %s:%s bakconvert -args-json-file %s -secret-channel-provider %s' % (
+                self.ZSTORE_CLI_BIN, request['bsAgentHost'], request['bsAgentPort'],
+                linux.shellquote(args_file), self.KEY_AGENT_PROVIDER)
+            output = shell.call(cmdstr)
+        finally:
+            linux.rm_file_force(args_file)
+        return json.loads(output)['installPaths']
+
     def upload_image(self, hostname, fpath, concurrency=None, encryption_spec=None):
         imf = self.commit_image(fpath, encryption_spec)
 

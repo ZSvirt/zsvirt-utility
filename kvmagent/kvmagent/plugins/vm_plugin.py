@@ -807,6 +807,27 @@ class TakeVolumesBackupsResponse(kvmagent.AgentResponse):
         self.backupInfos = [] # type: list[VolumeBackupInfo]
 
 
+class ConvertVolumeBackupCmd(kvmagent.AgentCommand):
+    @log.sensitive_fields("encryptedDek")
+    def __init__(self):
+        super(ConvertVolumeBackupCmd, self).__init__()
+        self.taskUuid = None
+        self.bsAgentHost = None
+        self.bsAgentPort = 0
+        self.nbdHost = None
+        self.targetChainName = None
+        self.targetEncrypted = False
+        self.uploadConcurrency = 0
+        self.encryptedDek = None
+        self.leafInstallPaths = []
+
+
+class ConvertVolumeBackupRsp(kvmagent.AgentResponse):
+    def __init__(self):
+        super(ConvertVolumeBackupRsp, self).__init__()
+        self.installPaths = {}
+
+
 class TakeSnapshotsCmd(kvmagent.AgentCommand):
     snapshotJobs = None  # type: list[VolumeSnapshotJobStruct]
 
@@ -7441,6 +7462,7 @@ class VmPlugin(kvmagent.KvmAgent):
     KVM_BLOCK_PULL_VOLUME_PATH = "/vm/volume/blockpull"
     KVM_TAKE_VOLUMES_SNAPSHOT_PATH = "/vm/volumes/takesnapshot"
     KVM_TAKE_VOLUMES_BACKUP_PATH = "/vm/volumes/takebackup"
+    KVM_CONVERT_VOLUME_BACKUP_PATH = "/vm/volumes/backup/convertencryption"
     KVM_CANCEL_VOLUME_BACKUP_JOBS_PATH = "/vm/volume/cancel/backupjobs"
     KVM_CANCEL_VOLUME_BACKUP_JOB_PATH = "/vm/volume/cancel/backupjob"
     KVM_MERGE_SNAPSHOT_PATH = "/vm/volume/mergesnapshot"
@@ -9727,6 +9749,12 @@ host side snapshot files chian:
         finally:
             storage.disconnect()
 
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    def convert_volume_backup(self, req):
+        rsp = ConvertVolumeBackupRsp()
+        rsp.installPaths = ImageStoreClient().change_backup_encryption(json.loads(req[http.REQUEST_BODY]))
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
@@ -12136,6 +12164,9 @@ host side snapshot files chian:
         http_server.register_async_uri(self.KVM_QUERY_BLOCKJOB_STATUS, self.query_block_job_status)
         http_server.register_async_uri(self.KVM_TAKE_VOLUMES_SNAPSHOT_PATH, self.take_volumes_snapshots)
         http_server.register_async_uri(self.KVM_TAKE_VOLUMES_BACKUP_PATH, self.take_volumes_backups, cmd=TakeVolumesBackupsCommand())
+        http_server.register_async_uri(self.KVM_CONVERT_VOLUME_BACKUP_PATH,
+                                       self.convert_volume_backup,
+                                       cmd=ConvertVolumeBackupCmd())
         http_server.register_async_uri(self.KVM_CANCEL_VOLUME_BACKUP_JOBS_PATH, self.cancel_backup_jobs)
         http_server.register_async_uri(self.KVM_CANCEL_VOLUME_BACKUP_JOB_PATH, self.cancel_backup_job)
         http_server.register_async_uri(self.KVM_BLOCK_STREAM_VOLUME_PATH, self.block_stream)
