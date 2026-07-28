@@ -410,9 +410,8 @@ class ZbsAgent(plugin.TaskManager):
         if ret.error.code != 0:
             raise Exception('failed to rollback snapshot[%s@%s], error[%s]' % (volume, snapshot, ret.error.message))
 
-        o = zbsutils.query_volume_info(logical_pool, volume)
-        rsp.size = jsonobject.loads(o).result.info.fileInfo.length
         rsp.installPath = zbsutils.CBD_VOLUME_PATH.format(physical_pool, logical_pool, volume)
+        rsp.size = zbsutils.get_volume_virtual_size(rsp.installPath)
 
         return jsonobject.dumps(rsp)
 

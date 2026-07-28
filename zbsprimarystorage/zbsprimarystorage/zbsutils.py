@@ -218,6 +218,11 @@ def rollback_snapshot(logical_pool, volume, snapshot):
     return shell.call("%s rollback --snappath %s/%s@%s --format json" % (ZBS_BIN_PATH, logical_pool, volume, snapshot))
 
 
+def get_volume_virtual_size(install_path):
+    qemu_path = "%s_%s_:%s" % (install_path, ZBS_USER_NAME, ZBS_CLIENT_CONF_PATH)
+    return linux.qcow2_virtualsize(qemu_path)
+
+
 def cbd_to_nbd(desc, port, install_path):
     cmd = "qemu-nbd -D %s -f raw -p %d --fork %s_%s_:%s" % (
         desc, port, install_path, ZBS_USER_NAME, ZBS_CLIENT_CONF_PATH)
