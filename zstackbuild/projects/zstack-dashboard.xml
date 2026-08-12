@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project name="zstack-dashboard builder" basedir="../">
+    <property name="zstackdashboard.bdir" location="${build.dir}/zstackdashboard" />
+
+    <target name="build-zstack-dashboard" >
+        <makeDir dir="${zstackdashboard.bdir}" />
+
+        <condition property="zstackui.source" value="${mevocoui.source}" else="${zstackdashboard.source}">
+            <and>
+                <isset property="build_war_flag"/>
+            </and>
+        </condition>
+
+        <checkProperty property="zstackui.source" />
+        <checkFile file="${zstackui.source}" />
+        <checkFile file="${zstackui.source}/setup.py" />
+
+        <delete dir="${zstackui.source}/dist" />
+
+        <exec executable="python" dir="${zstackui.source}" failonerror="true">
+            <arg value="setup.py" />
+            <arg value="sdist" />
+        </exec>
+
+        <copy todir="${zstackdashboard.bdir}/">
+            <fileset dir="${zstackui.source}/">
+                <exclude name="**/*~" />
+                <include name="dist/*.tar.gz" />
+            </fileset>
+        </copy>
+    </target>
+
+    <target name="assemble-zstack-dashboard">
+        <copy todir="${tools.dir}">
+            <fileset dir="${zstackdashboard.bdir}/dist">
+                <include name="**/*" />
+            </fileset>
+        </copy>
+    </target>
+</project>

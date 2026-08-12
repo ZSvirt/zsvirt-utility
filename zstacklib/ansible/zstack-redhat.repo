@@ -1,0 +1,15 @@
+# This repo for install centos-release-qemu-ev
+[extras]
+name=CentOS-7 - Extras
+mirrorlist=http://mirrorlist.centos.org/?release=7&arch=$basearch&repo=extras&infra=$infra
+enabled=0
+#baseurl=http://mirror.centos.org/centos/7/extras/$basearch/
+gpgcheck=0
+#gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-7
+#
+[centos-qemu-ev]
+name=CentOS-7 - QEMU EV
+baseurl=http://mirror.centos.org/centos/7/virt/$basearch/kvm-common/
+enabled=0
+gpgcheck=0
+#gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-CentOS-SIG-Virtualization

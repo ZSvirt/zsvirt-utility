@@ -1,0 +1,34 @@
+#!/bin/sh
+VIRTUAL_ENV=/var/lib/zstack/virtualenv/zstackctl
+if [ ! -d $VIRTUAL_ENV ]; then
+    echo "Need to install zstackctl before using it"
+    exit 1
+fi
+
+# set utf-8
+LANG=en_US.UTF-8
+LC_ALL=en_US.utf8
+export LANG LC_ALL
+unset http_proxy
+unset ftp_proxy
+unset https_proxy
+
+# check disk space
+all_full=true
+for path in '/tmp' '/var/tmp' '/usr/tmp' '/root'; do
+  percent="100%"
+  if [ -d $path ]; then
+      percent=`df -H $path | sed '1d' | awk '{print $(NF-1)}'`
+  fi
+  if [ x"$percent" != x"100%" ]; then
+      all_full=false
+      break
+  fi
+done
+if [ $all_full = true ]; then
+  echo -e "\033[31m There is not enough disk space available for zstack-ctl! \033[0m"
+  exit 1
+fi
+
+. $VIRTUAL_ENV/bin/activate
+python -u -c "from zstackctl import ctl; ctl.main()" "$@"

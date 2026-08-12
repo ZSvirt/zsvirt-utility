@@ -1,0 +1,204 @@
+host:
+    description: host server
+    type: target
+    list: {exec: "select h.managementIp from HostVO h where h.hypervisorType = \"KVM\""}
+    logs:
+     - {name: kvmagent-logs, dir: /var/log/zstack/, file: zstack-kvmagent.log*}
+     - {name: mini-fencer-logs, dir: /var/log/zstack/, file: mini-fencer.log*}
+     - {name: zstack-logs, dir: /var/log/zstack/, file: zstack.log*}
+     - {name: iscsi-logs, dir: /var/log/zstack/, file: zstack-iscsi-filesystem-agent*}
+     - {name: agentcollectd-logs, dir: /var/log/zstack/zstack-agent/, file: collectd.log*}
+     - {name: agentserver-logs, dir: /var/log/zstack/zstack-agent/, file: server.log*}
+     - {name: yum-repos, dir: /etc/yum.repos.d/, file: '*.repo'}
+     - {name: dmesg-logs, exec: 'dmesg'}
+     - {name: message-logs, dir: /var/log/, file: messages*}
+     - {name: route-logs, exec: 'route -n'}
+     - {name: iptables-logs, exec: 'iptables-save'}
+     - {name: ebtables-logs, exec: 'ebtables-save'}
+     - {name: fdb-logs, exec: 'bridge fdb show'}
+     - {name: journalctl-info, exec: 'journalctl -x'}
+     - {name: pkg-list, exec: 'rpm -qa | sort'}
+     - {name: host-info, exec: 'uptime && last reboot && free -h && cat /proc/cpuinfo && ip add && df -h &&
+       file_paths=$(ls /sys/devices/system/node|grep node);
+       for file_path in $file_paths; do cat /sys/devices/system/node/$file_path/meminfo; done &&
+       ps ax -eTo ppid,pid,pcpu,pmem,maj_flt,min_flt,tid,vsz,rss,pgid,sid,tty,tgid,stat,uid,lstart,etime,time,command --sort ppid'}
+     - {name: qemu-log, dir: /var/log/libvirt/, file: }
+     - {name: sar-log, dir: /var/log/sa/, file: 'sa[0-9]*'}
+     - {name: vrouter-console-log, dir: /tmp/, file: '*-vm-kernel.log'}
+     - {name: zstcli-logs, dir: /var/log/zstack/zstcli/, file: zstcli*}
+mn:
+    description: management node
+    type: target
+    list: {exec: "AutoCollect"}
+    logs:
+      - {name: ui3-cfg, dir: /var/lib/zstack/ui/product-info/, file: 'data.json', mode: "All"}
+      - {name: ui4-cfg, dir: $ZSTACK_HOME/../../../zstack-ui/public/theme/, file: , mode: "Hierarchy"}
+      - {name: lic-app-code, dir: /var/lib/zstack/license/, file: 'lic-application-code.txt', mode: "All"}
+      - {name: customer-identifier, exec: 'AutoCollect'}
+      - {name: mn-logs, dir: $ZSTACK_HOME/../../logs/, file: 'management-server*'}
+      - {name: ui-logs, dir: $ZSTACK_HOME/../../../zstack-ui/logs/, file: 'zstack-ui*'}
+      - {name: sar-log, dir: /var/log/sa/, file: 'sa[0-9]*'}
+      - {name: api-logs, dir: $ZSTACK_HOME/../../logs/, file: 'zstack-api*'}
+      - {name: catalina-logs, dir: $ZSTACK_HOME/../../logs/, file: 'catalina*'}
+      - {name: deploy-logs, dir: /var/log/zstack/, file: 'deploy.log*'}
+      - {name: ctl-logs, dir: /var/log/zstack/, file: 'zstack-ctl*'}
+      - {name: cli-logs, dir: /var/log/zstack/, file: 'zstack-cli*'}
+      - {name: dashboard-logs, dir: /var/log/zstack/, file: 'zstack-dashboard.log*'}
+      - {name: zstack-console-logs, dir: /var/log/zstack/, file: 'zstack-console-proxy*'}
+      - {name: dmesg-logs, exec: 'dmesg'}
+      - {name: message-logs, dir: /var/log/, file: messages*}
+      - {name: route-logs, exec: 'route -n'}
+      - {name: iptables-logs, exec: 'iptables-save'}
+      - {name: ebtables-logs, exec: 'ebtables-save'}
+      - {name: journalctl-info, exec: 'journalctl -x'}
+      - {name: host-info, exec: 'uptime && last reboot && free -h && cat /proc/cpuinfo && ip add && df -h &&
+       file_paths=$(ls /sys/devices/system/node|grep node);
+       for file_path in $file_paths; do cat /sys/devices/system/node/$file_path/meminfo; done &&
+       ps ax -eTo ppid,pid,pcpu,pmem,maj_flt,min_flt,tid,vsz,rss,pgid,sid,tty,tgid,stat,uid,lstart,etime,time,command --sort ppid'}
+      - {name: pkg-list, exec: 'rpm -qa | sort'}
+      - {name: git-commit, dir: $ZSTACK_HOME/../../webapps/zstack/, file: '*git-commit', mode: "All"}
+      - {name: zstack-logs, dir: /var/log/zstack/, file: zstack.log*}
+      - {name: zstack-installation-logs, dir: /tmp/, file: zstack_installation.log*}
+      - {name: audit-log, dir: /var/log/audit/, file: 'audit.log*'}
+      - {name: mariadb-log, dir: /var/log/mariadb/, file: 'mariadb.log*'}
+      - {name: zsha2-log, exec: 'which zsha2 && zsha2 collect-log', exec_type: "CdAndRun"}
+vrouter:
+    description: vrouter
+    type: target
+    list: {exec: "select ip from VmNicVO where deviceId = 0 and vmInstanceUuid in (select uuid from VirtualRouterVmVO)"}
+    logs:
+      - {name: config-boot, dir: /config/, file: 'config.boot*'}
+      - {name: zstack-log, dir: /var/log/zstack/, file: }
+      - {name: vrouter-zvr-log, dir: /home/vyos/zvr/, file: 'zvr.log*' }
+      - {name: vrouter-zvrboot-log, dir: /home/vyos/zvr/, file: 'zvrboot.log' }
+      - {name: vrouter-zvrMonitor-log, dir: /home/vyos/zvr/, file: 'zvrMonitor.log' }
+      - {name: vrouter-zvrReboot-log, dir: /home/vyos/zvr/, file: 'zvrReboot.log' }
+      - {name: vrouter-zvrstartup-log, dir: /home/vyos/zvr/, file: 'zvrstartup.log' }
+      - {name: iptables-logs, exec: 'iptables-save'}
+      - {name: host-info, exec: 'uptime && last reboot && free && cat /proc/cpuinfo && ip add && ip route && df -h'}
+      - {name: ps-info, exec: 'ps ax -eTo ppid,pid,pcpu,pmem,maj_flt,min_flt,tid,vsz,rss,pgid,sid,tty,stat,uid,lstart,etime,time,command --sort ppid' }
+      - {name: haproxy-log, dir: /var/log/, file: 'haproxy.log*'}
+      - {name: keeplived-log, dir: /var/log/, file: 'keepalived.log*'}
+      - {name: messages-log, dir: /var/log/, file: 'messages*'}
+      - {name: charon-log, dir: /var/log/, file: 'charon.log*'}
+      - {name: history-log-vyos, exec: 'echo history | su - vyos -c ''bash -i'''}
+      - {name: history-log-root,  exec: 'echo history | sudo bash -i'}
+ceph-bs:
+    description: ceph backstorage
+    type: target
+    list: {exec: "select hostname from CephBackupStorageMonVO"}
+    logs:
+      - {name: cephbs-log, dir: /var/log/zstack/, file: ceph-backupstorage*}
+      - {name: dmesg-logs, exec: 'dmesg'}
+      - {name: message-logs, dir: /var/log/, file: messages*}
+      - {name: route-logs, exec: 'route -n'}
+      - {name: iptables-logs, exec: 'iptables-save'}
+      - {name: ebtables-logs, exec: 'ebtables-save'}
+      - {name: journalctl-info, exec: 'journalctl -x'}
+      - {name: host-info, exec: 'uptime && last reboot && free -h && cat /proc/cpuinfo && ip add && df -h &&
+       file_paths=$(ls /sys/devices/system/node|grep node);
+       for file_path in $file_paths; do cat /sys/devices/system/node/$file_path/meminfo; done &&
+       ps ax -eTo ppid,pid,pcpu,pmem,maj_flt,min_flt,tid,vsz,rss,pgid,sid,tty,tgid,stat,uid,lstart,etime,time,command --sort ppid'}
+      - {name: pkg-list, exec: 'rpm -qa | sort'}
+      - {name: zstack-logs, dir: /var/log/zstack/, file: zstack.log*}
+sftp-bs:
+    description: sftp backstorage
+    type: target
+    list: {exec: "select hostname from SftpBackupStorageVO"}
+    logs:
+      - {name: sftpbs-log, dir: /var/log/zstack/, file: zstack-sftpbackupstorage*}
+      - {name: dmesg-logs, exec: 'dmesg'}
+      - {name: message-logs, dir: /var/log/, file: messages*}
+      - {name: route-logs, exec: 'route -n'}
+      - {name: iptables-logs, exec: 'iptables-save'}
+      - {name: ebtables-logs, exec: 'ebtables-save'}
+      - {name: journalctl-info, exec: 'journalctl -x'}
+      - {name: host-info, exec: 'uptime && last reboot && free -h && cat /proc/cpuinfo && ip add && df -h'}
+      - {name: pkg-list, exec: 'rpm -qa | sort'}
+      - {name: zstack-logs, dir: /var/log/zstack/, file: zstack.log*}
+imageStore-bs:
+    description: imagestore backstorage
+    type: target
+    list: {exec: "select hostname from ImageStoreBackupStorageVO"}
+    logs:
+      - {name: zstore-log, dir: /var/log/zstack/zstack-store/, file: zstore*}
+      - {name: dmesg-logs, exec: 'dmesg'}
+      - {name: message-logs, dir: /var/log/, file: messages*}
+      - {name: route-logs, exec: 'route -n'}
+      - {name: iptables-logs, exec: 'iptables-save'}
+      - {name: ebtables-logs, exec: 'ebtables-save'}
+      - {name: journalctl-info, exec: 'journalctl -x'}
+      - {name: host-info, exec: 'uptime && last reboot && free -h && cat /proc/cpuinfo && ip add && df -h &&
+       file_paths=$(ls /sys/devices/system/node|grep node);
+       for file_path in $file_paths; do cat /sys/devices/system/node/$file_path/meminfo; done &&
+       ps ax -eTo ppid,pid,pcpu,pmem,maj_flt,min_flt,tid,vsz,rss,pgid,sid,tty,tgid,stat,uid,lstart,etime,time,command --sort ppid'}
+      - {name: pkg-list, exec: 'rpm -qa | sort'}
+      - {name: zstack-logs, dir: /var/log/zstack/, file: zstack.log*}
+ceph-ps:
+    descrption: ceph primarystorage
+    type: target
+    list: {exec: "select hostname from CephPrimaryStorageMonVO"}
+    logs:
+      - {name: cephps-log, dir: /var/log/zstack/, file: ceph-primarystorage*}
+      - {name: dmesg-logs, exec: 'dmesg'}
+      - {name: message-logs, dir: /var/log/, file: messages*}
+      - {name: route-logs, exec: 'route -n'}
+      - {name: iptables-logs, exec: 'iptables-save'}
+      - {name: ebtables-logs, exec: 'ebtables-save'}
+      - {name: journalctl-info, exec: 'journalctl -x'}
+      - {name: host-info, exec: 'uptime && last reboot && free -h && cat /proc/cpuinfo && ip add && df -h &&
+       file_paths=$(ls /sys/devices/system/node|grep node);
+       for file_path in $file_paths; do cat /sys/devices/system/node/$file_path/meminfo; done &&
+       ps ax -eTo ppid,pid,pcpu,pmem,maj_flt,min_flt,tid,vsz,rss,pgid,sid,tty,tgid,stat,uid,lstart,etime,time,command --sort ppid'}
+      - {name: pkg-list, exec: 'rpm -qa | sort'}
+      - {name: zstack-logs, dir: /var/log/zstack/, file: zstack.log*}
+      - {name: zstcli-logs, dir: /var/log/zstack/zstcli/, file: zstcli*}
+sharedblock:
+    description: sharedblock log
+    type: target
+    list: {exec: "select h.managementIp from HostVO h where h.hypervisorType = \"KVM\""}
+    logs:
+      - {name: lsblk-info, exec: 'lsblk -p -o NAME,TYPE,FSTYPE,LABEL,UUID,VENDOR,MODEL,MODE,WWN,SIZE'}
+      - {name: ls_dev_disk_by-id_info, exec: 'ls -l /dev/disk/by-id'}
+      - {name: ls_dev_disk_by-path_info, exec: 'ls -l /dev/disk/by-path'}
+      - {name: multipath-info, exec: 'multipath -ll -v3'}
+      - {name: sanlock-logs, dir: /var/log/, file: sanlock.log*}
+      - {name: lvmlock-logs, dir: /var/log/lvmlock/, file: lvmlockd.log*}
+      - {name: sanlock_client_info, exec: 'sanlock client status -D'}
+      - {name: sanlock_host_info, exec: 'sanlock client host_status -D'}
+      - {name: lvm_lvs_info, exec: 'lvs --nolocking -t -oall'}
+      - {name: lvm_vgs_info, exec: 'vgs --nolocking -t -oall'}
+      - {name: lvm_config_diff_info, exec: 'lvmconfig --type diff'}
+      - {name: lvm-etc, dir: /etc/lvm/, file: }
+      - {name: sanlock-etc, dir: /etc/sanlock/, file: }
+      - {name: zsblk-agent, dir: /var/log/zstack/zsblk-agent/, file: }
+      - {name: lvmlockd-logs, dir: /var/log/lvmlockd/, file: lvmlockd.log*}
+pxeserver:
+    description: baremetal pxeserver log
+    type: target
+    list: {exec: "select hostname from BaremetalPxeServerVO"}
+    logs:
+      - {name: dnsmasq-logs, dir: /var/log/zstack/baremetal/, file: }
+      - {name: vsftpd-cfgs, dir: /var/lib/zstack/baremetal/vsftpd/, file: }
+      - {name: dnsmasq-confs, dir: /var/lib/zstack/baremetal/dnsmasq/, file: }
+      - {name: kickstart-confs, dir: /var/lib/zstack/baremetal/ftp/ks/, file: }
+      - {name: novnc-tokens, dir: /var/lib/zstack/baremetal/noVNC/tokens/, file: }
+      - {name: kickstart-scripts, dir: /var/lib/zstack/baremetal/ftp/scripts/, file: }
+      - {name: pxelinux-cfgs, dir: /var/lib/zstack/baremetal/tftpboot/pxelinux.cfg/, file: }
+      - {name: pxeserver-agent-logs, dir: /var/log/zstack/, file: zstack-baremetalpxeserver.log*}
+baremetalv2gateway:
+    description: baremetal v2 gateway log
+    type: target
+    list: {exec: "select h.managementIp from HostVO h where h.hypervisorType = \"baremetal2\""}
+    logs:
+      - {name: dnsmasq-conf, dir: /var/lib/zstack/baremetalv2/dnsmasq/, file: , mode: "All"}
+      - {name: dnsmasq-logs, dir: /var/log/zstack/baremetalv2/, file: dnsmasq.log }
+      - {name: nginx-conf, dir: /var/lib/zstack/nginx/baremetal/v2/gateway, file: , mode: "All"}
+      - {name: nginx-logs, dir: /var/log/zstack/zstack-baremetal-nginx/, file: , mode: "All"}
+      - {name: pxelinux.cfg, dir: /var/lib/zstack/baremetalv2/tftpboot/pxelinux.cfg, file: , mode: "All"}
+      - {name: inspector.ks, dir: /var/lib/zstack/baremetalv2/httpboot/, file: inspector.ks }
+      - {name: boot.ipxe, dir: /var/lib/zstack/baremetalv2/tftpboot/, file: boot.ipxe }
+      - {name: targetcli, exec: 'targetcli / ls' }
+      - {name: nbd, exec: 'ps -ef | grep qemu-nbd'}
+      - {name: nbd-socket, exec: 'ls -l /var/run/lock/zstack-qemu-nbd'}
+      - {name: device-mapper, exec: 'ls -l /dev/mapper'}

@@ -1,0 +1,71 @@
+---
+- name: state epel.repo
+  stat: path=/etc/yum.repos.d/epel.repo
+  register: epel_repo
+
+- name: install libselinux-python, since next step might use it.
+  when: ansible_os_family == 'RedHat' and yum_repos == 'false'
+  yum: name="{{item}}"
+  with_items:
+    - libselinux-python
+
+- name: install epel-release yum repo
+  when: ansible_os_family == 'RedHat' and epel_repo.stat.exists != true and yum_repos == 'false'
+  copy: src=files/zstacklib/epel-release-source.repo
+        dest=/etc/yum.repos.d/
+        owner=root group=root mode=0644
+
+- name: install epel-release
+  when: ansible_os_family == 'RedHat' and epel_repo.stat.exists != true and yum_repos == 'false'
+  yum: name=epel-release
+       enablerepo=epel-release-source
+       state=present
+
+- name: enable epel repository
+  when: ansible_os_family == 'RedHat' and yum_repos == 'false'
+  ini_file: dest=/etc/yum.repos.d/epel.repo
+            section=epel
+            option=enabled
+            value=1
+
+- name: set ALIYUN mirror yum repo
+  when: ansible_os_family == 'RedHat'
+  shell: echo -e "#aliyun base\n[alibase]\nname=CentOS-\$releasever - Base - mirrors.aliyun.com\nfailovermethod=priority\nbaseurl=http://mirrors.aliyun.com/centos/\$releasever/os/\$basearch/\ngpgcheck=0\nenabled=0\n \n#released updates \n[aliupdates]\nname=CentOS-\$releasever - Updates - mirrors.aliyun.com\nfailovermethod=priority\nbaseurl=http://mirrors.aliyun.com/centos/\$releasever/updates/\$basearch/\nenabled=0\ngpgcheck=0\n \n[aliextras]\nname=CentOS-\$releasever - Extras - mirrors.aliyun.com\nfailovermethod=priority\nbaseurl=http://mirrors.aliyun.com/centos/\$releasever/extras/\$basearch/\nenabled=0\ngpgcheck=0\n \n[aliepel]\nname=Extra Packages for Enterprise Linux \$releasever - \$basearce - mirrors.aliyun.com\nbaseurl=http://mirrors.aliyun.com/epel/\$releasever/\$basearch\nfailovermethod=priority\nenabled=0\ngpgcheck=0\n" > /etc/yum.repos.d/zstack-aliyun-yum.repo
+
+- name: set 163 mirror yum repo
+  when: ansible_os_family == 'RedHat' and yum_repos != 'false'
+  shell: echo -e "#163 base\n[163base]\nname=CentOS-\$releasever - Base - mirrors.163.com\nfailovermethod=priority\nbaseurl=http://mirrors.163.com/centos/\$releasever/os/\$basearch/\ngpgcheck=0\nenabled=0\n \n#released updates \n[163updates]\nname=CentOS-\$releasever - Updates - mirrors.163.com\nfailovermethod=priority\nbaseurl=http://mirrors.163.com/centos/\$releasever/updates/\$basearch/\nenabled=0\ngpgcheck=0\n \n#additional packages that may be useful\n[163extras]\nname=CentOS-\$releasever - Extras - mirrors.163.com\nfailovermethod=priority\nbaseurl=http://mirrors.163.com/centos/\$releasever/extras/\$basearch/\nenabled=0\ngpgcheck=0\n \n[ustcepel]\nname=Extra Packages for Enterprise Linux \$releasever - \$basearch - ustc \nbaseurl=http://centos.ustc.edu.cn/epel/\$releasever/\$basearch\nfailovermethod=priority\nenabled=0\ngpgcheck=0\n" > /etc/yum.repos.d/zstack-163-yum.repo
+
+- name: install libselinux-python and other command system libs from user defined repos
+  when: ansible_os_family == 'RedHat' and yum_repos != 'false'
+  shell: "yum --enablerepo=alibase clean metadata && yum --disablerepo=* --enablerepo={{yum_repos}} --nogpgcheck install -y  libselinux-python python-devel python-setuptools python-pip gcc autoconf"
+
+- name: install libselinux-python and other command system libs from system repos
+  when: ansible_os_family == 'RedHat' and yum_repos == 'false'
+  shell: "yum --enablerepo=alibase clean metadata && yum --nogpgcheck install -y libselinux-python python-devel python-setuptools python-pip gcc autoconf"
+
+- name: install dependency packages for Debian based OS
+  when: ansible_os_family == 'Debian' or ansible_os_family == 'Kylin'
+  apt: pkg="{{item}}" update_cache=yes
+  with_items:
+    - python-dev
+    - python-setuptools
+    - python-pip
+    - gcc
+    - autoconf
+
+- shell: pip --version | grep 7.0.3
+  register: pip_ret
+  ignore_errors: True
+
+- name: make dir for copy pip
+  shell: "mkdir -p {{zstack_root}}"
+  when: pip_ret.rc != 0
+
+- name: copy pip 7.0.3
+  copy: src="files/pip-7.0.3.tar.gz" dest="{{zstack_root}}/pip-7.0.3.tar.gz"
+  when: pip_ret.rc != 0
+
+- name: install pip 7.0.3
+  pip: name="{{zstack_root}}/pip-7.0.3.tar.gz" extra_args="--ignore-installed"
+  when: pip_ret.rc != 0

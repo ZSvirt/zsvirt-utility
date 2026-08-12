@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project name="zstack-zwatch builder" basedir="../">
+    <property name="zsw.bdir" location="${build.dir}/zwatch-vm-agent/" />
+    <property name="zsw.ansible.dir" location="${kvmagent.bdir}/ansible" />
+    <property name="guesttools.bdir" location="${build.dir}/guesttools/" />
+    <property name="tools.guesttools.dir" location="${tools.dir}/guesttools" />
+    <property name="guesttools.general.dir" location="${tools.guesttools.dir}/general" />
+
+    <target name="build-zstack-zwatch">
+        <makeDir dir="${zsw.bdir}" />
+
+        <checkProperty property="zstackzwatch.source" />
+        <checkFile file="${zstackzwatch.source}" />
+
+        <exec executable="make" dir="${zstackzwatch.source}" failonerror="true">
+            <env key="GOROOT" value="${zstackzwatch.goroot}" />
+            <arg value="clean" />
+        </exec>
+
+        <exec executable="make" dir="${zstackzwatch.source}" failonerror="true">
+            <env key="GOROOT" value="${zstackzwatch.goroot}" />
+            <arg value="all" />
+            <arg value="ARCH=${zstackzwatch.arch}" />
+        </exec>
+        <copy todir="${zsw.bdir}">
+            <fileset dir="${zstackzwatch.source}/target/zwatch_bin">
+                <include name="**" />
+            </fileset>
+        </copy>
+        <copy todir="${guesttools.bdir}">
+            <fileset dir="${zstackzwatch.source}/target/iso">
+                <include name="*.iso" />
+            </fileset>
+        </copy>
+    </target>
+
+    <target name="assemble-zstack-zwatch">
+        <copy todir="${zsw.ansible.dir}">
+            <fileset dir="${zsw.bdir}">
+                <include name="**" />
+            </fileset>
+        </copy>
+        <exec executable="/bin/python" dir="${zsw.ansible.dir}" failonerror="true">
+            <arg value="${agent.version.generator}" />
+            <arg value="-s ${zstackzwatch.source}" />
+            <arg value="-o agent_version" />
+        </exec>
+        <echo message="created agent_version file at ${zsw.ansible.dir}" />
+    </target>
+
+    <target name="assemble-guest-tools-iso">
+        <makeDir dir="${guesttools.general.dir}/KVM" />
+        <copy todir="${guesttools.general.dir}/KVM">
+            <fileset dir="${guesttools.bdir}">
+                <include name="*.iso" />
+            </fileset>
+        </copy>
+    </target>
+</project>

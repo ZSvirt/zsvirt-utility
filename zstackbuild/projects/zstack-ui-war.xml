@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project name="zstack ui war builder" basedir="../">
+    <property name="zstack.ui.bdir" location="${build.dir}/zstack-ui" />
+    <target name="build-zstack-ui-war" >
+        <makeDir dir="${zstack.ui.bdir}" />
+
+        <checkProperty property="zstack.ui.source" />
+        <checkFile file="${zstack.ui.source}/mevoco-ui2" />
+        <checkFile file="${zstack.ui.source}/mevoco-ui2/zstack-ui" />
+        <checkFile file="${zstack.ui.source}/mevoco-ui-server" />
+
+        <exec executable="bash" dir="${zstack.ui.source}" failonerror="true">
+            <env key="BUILD_VERSION" value="${vendor.name}" />
+            <env key="CUBE" value="${cube}" />
+            <env key="CUSTOM_PATH" value="${vendor.custom.path}" />
+            <arg value="${build.zstack.ui.war.script}" />
+            <arg value="${zstack.ui.source}" />
+        </exec>
+
+        <copy file="${zstack.ui.source}/mevoco-ui-server/build/libs/mevoco-ui-server-2.0.war" tofile="${zstack.ui.bdir}/zstack-ui.war" overwrite="true" />
+    </target>
+
+    <target name="assemble-zstack-ui-war">
+        <copy todir="${tools.dir}">
+            <fileset dir="${zstack.ui.bdir}">
+                <include name="zstack-ui.war" />
+            </fileset>
+        </copy>
+        <copy todir="${tools.dir}">
+            <fileset dir="${zstack.ui.source}/mevoco-ui2">
+                <include name="zstack-ui" />
+            </fileset>
+        </copy>
+    </target>
+</project>

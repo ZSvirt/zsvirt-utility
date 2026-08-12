@@ -1,0 +1,2 @@
+virtualenv-12.1.1.tar.gz
+virtualenv-clone-0.5.7.tar.gz
