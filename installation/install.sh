@@ -229,6 +229,7 @@ declare -a upgrade_params_array=(
     '4.10.16,-DupgradeFlatDhcpServerIp=true'
     '4.10.16,-DfstabDeviceToUuidUpdater=true'
     '4.10.20,-DupgradeZceXUsernamePasswordMigrate=true'
+    '5.1.1,-DfstabNonBlockingMountOptionsUpdater=true'
 )
 #other than the upon params_array, this one could be persisted in zstack.properties
 declare -a upgrade_persist_params_array=(
