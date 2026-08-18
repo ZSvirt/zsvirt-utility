@@ -2204,8 +2204,12 @@ def get_process_start_time(pid):
                         pid, e, fields[19] if len(fields) > 19 else "N/A")
             return None
 
-    with open('/proc/%s/stat' % pid, 'r') as f:
-        stats = f.read()
+    try:
+        with open('/proc/%s/stat' % pid, 'r') as f:
+            stats = f.read()
+    except (IOError, OSError) as e:
+        logger.warn("Failed to read stat for process %s: %s", pid, e)
+        return None
 
     start_ticks = _parse_starttime_from_stat(stats, pid)
     if start_ticks is None:
@@ -2213,8 +2217,12 @@ def get_process_start_time(pid):
 
     start_time = float(start_ticks) / os.sysconf('SC_CLK_TCK')
 
-    with open('/proc/uptime', 'r') as f:
-        uptime = float(f.read().split()[0])
+    try:
+        with open('/proc/uptime', 'r') as f:
+            uptime = float(f.read().split()[0])
+    except (IOError, OSError, ValueError, IndexError) as e:
+        logger.warn("Failed to read uptime for process %s: %s", pid, e)
+        return None
     current_time = time.time()
     boot_time = current_time - uptime
     return boot_time + start_time
