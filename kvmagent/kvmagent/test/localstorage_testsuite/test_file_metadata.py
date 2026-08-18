@@ -9,7 +9,7 @@ from unittest import TestCase
 from kvmagent.test.utils import pytest_utils
 from kvmagent.test.utils.stub import *
 
-from zstacklib.utils import bash, linux
+from zstacklib.utils import bash, file_metadata_handler, linux
 from zstacklib.utils.file_metadata_handler import (
     FileBasedMetadataHandler,
     qcow2_prefix_rebase_backing_files,
@@ -17,6 +17,7 @@ from zstacklib.utils.file_metadata_handler import (
     _get_rebase_lock_path,
     _validate_metadata_path,
 )
+from zstacklib.utils.vm_metadata_handler import StaleMetadataGeneration
 
 PKG_NAME = __name__
 
@@ -550,6 +551,140 @@ class TestFileMetadata(TestCase):
         self.handler._do_cleanup(meta_path)
         self.assertTrue(os.path.isdir(self.tmpdir))
 
+    # == cleanup_all_vm_metadata ================================================
+
+    def _test_cleanup_all_returns_error_on_directory_fsync_failure(self):
+        vm_uuid = 'f7' * 16
+        meta_path = self._meta_path(vm_uuid)
+        with open(meta_path, 'w') as f:
+            f.write('data')
+
+        original_fsync_directory = file_metadata_handler._fsync_directory
+
+        def _fsync_that_fails(path):
+            raise OSError("fsync failed")
+
+        file_metadata_handler._fsync_directory = _fsync_that_fails
+        try:
+            result = self.handler._do_cleanup_all(self.tmpdir)
+        finally:
+            file_metadata_handler._fsync_directory = original_fsync_directory
+
+        self.assertIn('error', result)
+        self.assertIn('fsync', result['error'])
+
+    def test_cleanup_all_generation_fences_delayed_cleanup(self):
+        vm_uuid = 'f8' * 16
+        meta_path = self._meta_path(vm_uuid)
+
+        self.handler._do_write(
+            meta_path, '{"generation":1}',
+            vmUuid=vm_uuid, vmName='vm1',
+            vmCategory='', architecture='',
+            schemaVersion='', metadataGeneration=1)
+        self.handler._do_cleanup_all(
+            self.tmpdir, metadataGeneration=2)
+        self.assertFalse(os.path.exists(meta_path))
+
+        self.handler._do_write(
+            meta_path, '{"generation":3}',
+            vmUuid=vm_uuid, vmName='vm1',
+            vmCategory='', architecture='',
+            schemaVersion='', metadataGeneration=3)
+
+        restarted_handler = FileBasedMetadataHandler()
+        restarted_handler._do_cleanup_all(
+            self.tmpdir, metadataGeneration=2)
+
+        self.assertTrue(os.path.isfile(meta_path))
+        self.assertEqual(
+            restarted_handler._do_get(meta_path)['metadata'],
+            '{"generation":3}')
+        with self.assertRaises(StaleMetadataGeneration):
+            restarted_handler._do_write(
+                meta_path, '{"generation":1}',
+                vmUuid=vm_uuid, vmName='vm1',
+                vmCategory='', architecture='',
+                schemaVersion='', metadataGeneration=1)
+
+        missing_dir = os.path.join(self.tmpdir, 'missing')
+        missing_meta_path = os.path.join(
+            missing_dir, vm_uuid + '.vmmeta')
+        restarted_handler._do_cleanup_all(
+            missing_dir, metadataGeneration=4)
+        with self.assertRaises(StaleMetadataGeneration):
+            restarted_handler._do_write(
+                missing_meta_path, '{"generation":3}',
+                vmUuid=vm_uuid, vmName='vm1',
+                vmCategory='', architecture='',
+                schemaVersion='', metadataGeneration=3)
+
+    def test_cleanup_all_serializes_generation_with_write(self):
+        vm_uuid = 'f9' * 16
+        meta_path = self._meta_path(vm_uuid)
+        self.handler._do_write(
+            meta_path, '{"generation":1}',
+            vmUuid=vm_uuid, vmName='vm1',
+            vmCategory='', architecture='',
+            schemaVersion='', metadataGeneration=1)
+
+        cleanup_entered = threading.Event()
+        release_cleanup = threading.Event()
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        errors = []
+        original_cleanup = self.handler._cleanup_all_metadata_files
+
+        def paused_cleanup(metadata_dir):
+            cleanup_entered.set()
+            if not release_cleanup.wait(5):
+                raise RuntimeError("timed out waiting to release cleanup")
+            return original_cleanup(metadata_dir)
+
+        def cleanup():
+            try:
+                self.handler._do_cleanup_all(
+                    self.tmpdir, metadataGeneration=2)
+            except Exception as e:
+                errors.append(e)
+
+        def write():
+            writer_started.set()
+            try:
+                self.handler._do_write(
+                    meta_path, '{"generation":3}',
+                    vmUuid=vm_uuid, vmName='vm1',
+                    vmCategory='', architecture='',
+                    schemaVersion='', metadataGeneration=3)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                writer_finished.set()
+
+        self.handler._cleanup_all_metadata_files = paused_cleanup
+        cleanup_thread = threading.Thread(target=cleanup)
+        writer_thread = threading.Thread(target=write)
+        try:
+            cleanup_thread.start()
+            self.assertTrue(cleanup_entered.wait(5))
+            writer_thread.start()
+            self.assertTrue(writer_started.wait(5))
+            self.assertFalse(
+                writer_finished.wait(0.2),
+                "metadata write entered while cleanup held the generation lock")
+        finally:
+            release_cleanup.set()
+            cleanup_thread.join(5)
+            writer_thread.join(5)
+            self.handler._cleanup_all_metadata_files = original_cleanup
+
+        self.assertFalse(cleanup_thread.is_alive())
+        self.assertFalse(writer_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(
+            '{"generation":3}',
+            self.handler._do_get(meta_path)['metadata'])
+
     # == prefix_rebase_backing_files ==========================================
 
     def _test_rebase_is_imagecache_path_positive(self):
@@ -970,6 +1105,8 @@ class TestFileMetadata(TestCase):
         self._test_cleanup_write_cleanup_read_returns_none()
         self._clean_tmpdir()
         self._test_cleanup_does_not_remove_parent_directory()
+        self._clean_tmpdir()
+        self._test_cleanup_all_returns_error_on_directory_fsync_failure()
         self._clean_tmpdir()
 
         # prefix_rebase - helper functions

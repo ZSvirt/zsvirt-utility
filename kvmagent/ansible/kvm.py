@@ -41,7 +41,7 @@ extra_packages = ""
 update_packages = 'false'
 zstack_lib_dir = "/var/lib/zstack"
 zstack_libvirt_nwfilter_dir = "%s/nwfilter" % zstack_lib_dir
-skipIpv6 = 'false'
+disableIp6Tables = 'false'
 bridgeDisableIptables = 'false'
 isBareMetal2Gateway='false'
 releasever = ''
@@ -697,7 +697,7 @@ def do_network_config():
         host_post_info.post_label_param = "bridge forward"
         run_remote_command(command, host_post_info)
 
-    if skipIpv6 != 'true':
+    if disableIp6Tables != 'true':
         if host_info.distro in RPM_BASED_OS:
             # name: copy ip6tables initial rules in RedHat
             IP6TABLE_SERVICE_FILE = '/usr/lib/systemd/system/ip6tables.service'

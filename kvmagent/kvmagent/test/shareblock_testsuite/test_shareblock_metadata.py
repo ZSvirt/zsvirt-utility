@@ -20,6 +20,7 @@ from kvmagent.test.utils import pytest_utils, storage_device_utils
 from kvmagent.plugins.shared_block_plugin import translate_absolute_path_from_install_path
 
 from zstacklib.test.utils import env
+from zstacklib.utils import lv_metadata as lv_metadata_module
 from zstacklib.utils import bash, lvm, linux
 from zstacklib.utils.lv_metadata import (
     SblkMetadataHandler,
@@ -136,6 +137,285 @@ class TestSharedBlockMetadata(TestCase, SharedBlockPluginTestStub):
 
     def _make_handler(self):
         return SblkMetadataHandler(lvm, bash)
+
+    def _test_scan_reads_metadata_lvs_concurrently_and_keeps_order(self):
+        class FakeBash(object):
+            def __init__(self, output):
+                self.output = output
+
+            def in_bash(self, func):
+                return func
+
+            def bash_ro(self, _cmd):
+                return 0, self.output
+
+        class FakeOperateLv(object):
+            def __init__(self, fake_lvm, lv_path, _shared):
+                self.fake_lvm = fake_lvm
+                self.lv_path = lv_path
+
+            def __enter__(self):
+                with self.fake_lvm.lock:
+                    self.fake_lvm.active += 1
+                    self.fake_lvm.max_active = max(
+                        self.fake_lvm.max_active, self.fake_lvm.active)
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                with self.fake_lvm.lock:
+                    self.fake_lvm.active -= 1
+
+        class FakeLvm(object):
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+                self.metadata_readers = 0
+                self.enough_metadata_readers = threading.Event()
+                self.release_metadata_readers = threading.Event()
+
+            def OperateLv(self, lv_path, shared=True):
+                return FakeOperateLv(self, lv_path, shared)
+
+        vm_uuids = [('%032x' % i) for i in range(1, 21)]
+        lines = []
+        for vm_uuid in vm_uuids:
+            lv_name = vm_uuid + LV_METADATA_SUFFIX
+            lines.append('%s|/dev/fakevg/%s|4194304' % (lv_name, lv_name))
+
+        fake_lvm = FakeLvm()
+        handler = SblkMetadataHandler(fake_lvm, FakeBash('\n'.join(lines)))
+        original_get_metadata_status = lv_metadata_module.get_metadata_status
+
+        def fake_get_metadata_status(lv_path, _lv_size):
+            with fake_lvm.lock:
+                fake_lvm.metadata_readers += 1
+                if fake_lvm.metadata_readers >= \
+                        lv_metadata_module.SBLK_METADATA_SCAN_CONCURRENCY:
+                    fake_lvm.enough_metadata_readers.set()
+                    fake_lvm.release_metadata_readers.set()
+
+            if not fake_lvm.release_metadata_readers.wait(5):
+                fake_lvm.release_metadata_readers.set()
+
+            lv_name = os.path.basename(lv_path)
+            vm_uuid = lv_name[:-len(LV_METADATA_SUFFIX)]
+            return {
+                'valid': True,
+                'schema_version': '1',
+                'last_update_time': 100,
+                'vm_name': 'vm-' + vm_uuid[-2:],
+                'architecture': 'x86_64',
+                'vm_category': 'AppCenter',
+            }
+
+        try:
+            lv_metadata_module.get_metadata_status = fake_get_metadata_status
+            entries = handler._do_scan('/dev/fakevg')
+        finally:
+            lv_metadata_module.get_metadata_status = original_get_metadata_status
+
+        self.assertTrue(
+            fake_lvm.enough_metadata_readers.is_set(),
+            "metadata scan should start 10 metadata readers before releasing them")
+        self.assertEqual(
+            10, fake_lvm.max_active,
+            "metadata scan should use bounded 10-way concurrency")
+        self.assertEqual(
+            ['/dev/fakevg/%s%s' % (vm_uuid, LV_METADATA_SUFFIX)
+             for vm_uuid in vm_uuids],
+            [entry.metadataPath for entry in entries])
+        self.assertEqual(['vm-%02x' % i for i in range(1, 21)],
+                         [entry.vmName for entry in entries])
+
+    def _test_overlapping_scans_share_global_worker_bound(self):
+        class FakeBash(object):
+            def __init__(self, output):
+                self.output = output
+                self.lock = threading.Lock()
+                self.scans_listed = 0
+                self.both_scans_listed = threading.Event()
+
+            def in_bash(self, func):
+                return func
+
+            def bash_ro(self, _cmd):
+                with self.lock:
+                    self.scans_listed += 1
+                    if self.scans_listed >= 2:
+                        self.both_scans_listed.set()
+                if not self.both_scans_listed.wait(5):
+                    self.both_scans_listed.set()
+                return 0, self.output
+
+        class FakeOperateLv(object):
+            def __init__(self, fake_lvm, _lv_path, _shared):
+                self.fake_lvm = fake_lvm
+
+            def __enter__(self):
+                with self.fake_lvm.lock:
+                    self.fake_lvm.active += 1
+                    self.fake_lvm.max_active = max(
+                        self.fake_lvm.max_active, self.fake_lvm.active)
+                    if self.fake_lvm.active >= \
+                            lv_metadata_module.SBLK_METADATA_SCAN_CONCURRENCY:
+                        self.fake_lvm.one_scan_full.set()
+                    if self.fake_lvm.active > \
+                            lv_metadata_module.SBLK_METADATA_SCAN_CONCURRENCY:
+                        self.fake_lvm.over_limit_seen.set()
+                return self
+
+            def __exit__(self, _exc_type, _exc, _tb):
+                with self.fake_lvm.lock:
+                    self.fake_lvm.active -= 1
+
+        class FakeLvm(object):
+            def __init__(self):
+                self.lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+                self.one_scan_full = threading.Event()
+                self.over_limit_seen = threading.Event()
+                self.release_metadata_readers = threading.Event()
+
+            def OperateLv(self, lv_path, shared=True):
+                return FakeOperateLv(self, lv_path, shared)
+
+        vm_uuids = [('%032x' % i) for i in range(1, 21)]
+        lines = []
+        for vm_uuid in vm_uuids:
+            lv_name = vm_uuid + LV_METADATA_SUFFIX
+            lines.append('%s|/dev/fakevg/%s|4194304' % (lv_name, lv_name))
+
+        fake_lvm = FakeLvm()
+        fake_bash = FakeBash('\n'.join(lines))
+        handler = SblkMetadataHandler(fake_lvm, fake_bash)
+        original_get_metadata_status = lv_metadata_module.get_metadata_status
+        entries_by_scan = []
+        errors = []
+
+        def fake_get_metadata_status(lv_path, _lv_size):
+            if not fake_lvm.release_metadata_readers.wait(5):
+                fake_lvm.release_metadata_readers.set()
+            lv_name = os.path.basename(lv_path)
+            vm_uuid = lv_name[:-len(LV_METADATA_SUFFIX)]
+            return {
+                'valid': True,
+                'schema_version': '1',
+                'last_update_time': 100,
+                'vm_name': 'vm-' + vm_uuid[-2:],
+                'architecture': 'x86_64',
+                'vm_category': 'AppCenter',
+            }
+
+        def scan():
+            try:
+                entries_by_scan.append(handler._do_scan('/dev/fakevg'))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=scan) for _ in range(2)]
+
+        try:
+            lv_metadata_module.get_metadata_status = fake_get_metadata_status
+            for thread in threads:
+                thread.start()
+
+            self.assertTrue(
+                fake_lvm.one_scan_full.wait(5),
+                "first scan should start 10 metadata readers before release")
+            fake_lvm.over_limit_seen.wait(1)
+            fake_lvm.release_metadata_readers.set()
+
+            for thread in threads:
+                thread.join(5)
+        finally:
+            lv_metadata_module.get_metadata_status = original_get_metadata_status
+
+        self.assertEqual([], errors)
+        self.assertEqual(2, len(entries_by_scan))
+        self.assertEqual(
+            lv_metadata_module.SBLK_METADATA_SCAN_CONCURRENCY,
+            fake_lvm.max_active,
+            "overlapping scans must share the same process-wide worker bound")
+        for entries in entries_by_scan:
+            self.assertEqual(20, len(entries))
+
+    def _test_get_libc_publishes_only_after_configured(self):
+        original_cdll = lv_metadata_module.ctypes.CDLL
+        original_libc = lv_metadata_module._libc
+        first_assignment_started = threading.Event()
+        release_config = threading.Event()
+        getter_returned = threading.Event()
+        init_errors = []
+        getter_errors = []
+        getter_results = []
+
+        class FakeFunction(object):
+            def __init__(self, name):
+                object.__setattr__(self, 'name', name)
+                object.__setattr__(self, 'restype', None)
+                object.__setattr__(self, 'argtypes', None)
+
+            def __setattr__(self, name, value):
+                object.__setattr__(self, name, value)
+                if self.name == 'pwrite' and name == 'restype':
+                    first_assignment_started.set()
+                    if not release_config.wait(5):
+                        release_config.set()
+
+        class FakeLibc(object):
+            def __init__(self):
+                self.pwrite = FakeFunction('pwrite')
+                self.pread = FakeFunction('pread')
+                self.posix_memalign = FakeFunction('posix_memalign')
+                self.free = FakeFunction('free')
+
+        def fake_cdll(_name, use_errno=True):
+            return FakeLibc()
+
+        def initialize_libc():
+            try:
+                lv_metadata_module._get_libc()
+            except Exception as e:
+                init_errors.append(e)
+
+        def get_libc_concurrently():
+            try:
+                getter_results.append(lv_metadata_module._get_libc())
+                getter_returned.set()
+            except Exception as e:
+                getter_errors.append(e)
+                getter_returned.set()
+
+        try:
+            lv_metadata_module._libc = None
+            lv_metadata_module.ctypes.CDLL = fake_cdll
+            init_thread = threading.Thread(target=initialize_libc)
+            init_thread.start()
+
+            self.assertTrue(
+                first_assignment_started.wait(5),
+                "test should pause while first libc initialization is incomplete")
+
+            getter_thread = threading.Thread(target=get_libc_concurrently)
+            getter_thread.start()
+            returned_before_configured = getter_returned.wait(1)
+
+            release_config.set()
+            init_thread.join(5)
+            getter_thread.join(5)
+        finally:
+            release_config.set()
+            lv_metadata_module.ctypes.CDLL = original_cdll
+            lv_metadata_module._libc = original_libc
+
+        self.assertEqual([], init_errors)
+        self.assertEqual([], getter_errors)
+        self.assertFalse(
+            returned_before_configured,
+            "_get_libc must not publish a partially configured libc handle")
+        self.assertEqual(1, len(getter_results))
 
     # -- low-level write/read helpers (bypass Handler, operate under lock) ----
 
@@ -1466,6 +1746,10 @@ class TestSharedBlockMetadata(TestCase, SharedBlockPluginTestStub):
 
     @pytest_utils.ztest_decorater
     def test_sblk_metadata_api(self):
+        self._test_scan_reads_metadata_lvs_concurrently_and_keeps_order()
+        self._test_overlapping_scans_share_global_worker_bound()
+        self._test_get_libc_publishes_only_after_configured()
+
         iscsi_server = env.get_vm_metadata('self')
         rsp = storage_device_utils.iscsi_login(
             iscsi_server.ip, "3260"

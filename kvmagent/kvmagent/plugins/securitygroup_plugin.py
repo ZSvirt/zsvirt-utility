@@ -658,7 +658,7 @@ class SecurityGroupPlugin(kvmagent.KvmAgent):
         rsp = CleanupUnusedRulesOnHostResponse()
 
         self._cleanup_unused_chain(self.IPV4)
-        if not cmd.skipIpv6:
+        if not cmd.disableIp6Tables:
             self._cleanup_unused_chain(self.IPV6)
 
         self._cleanup_unused_ipset()
@@ -715,7 +715,7 @@ class SecurityGroupPlugin(kvmagent.KvmAgent):
         filter_table = iptables.from_iptables_save()
         self._check_sg_default_rules(filter_table, self.IPV4)
 
-        if not cmd.skipIpv6:
+        if not cmd.disableIp6Tables:
             filter6_table = iptables.from_iptables_save(version=self.IPV6)
             self._check_sg_default_rules(filter6_table, self.IPV6)
 

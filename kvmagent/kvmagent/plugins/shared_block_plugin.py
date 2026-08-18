@@ -161,6 +161,13 @@ class CleanupVmMetadataRsp(AgentRsp):
         super(CleanupVmMetadataRsp, self).__init__()
 
 
+class CleanupAllVmMetadataRsp(AgentRsp):
+    def __init__(self):
+        super(CleanupAllVmMetadataRsp, self).__init__()
+        self.skipped = False
+        self.currentGeneration = None
+
+
 class GetVmInstanceMetadataRsp(AgentRsp):
     def __init__(self):
         super(GetVmInstanceMetadataRsp, self).__init__()
@@ -420,6 +427,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
     GET_VM_INSTANCE_METADATA_PATH = "/sharedblock/vm/metadata/get"
     SCAN_VM_METADATA_PATH = "/sharedblock/vm/metadata/scan"
     CLEANUP_VM_METADATA_PATH = "/sharedblock/vm/metadata/cleanup"
+    CLEANUP_ALL_VM_METADATA_PATH = "/sharedblock/vm/metadata/cleanupall"
     PREFIX_REBASE_BACKING_FILES_PATH = "/sharedblock/snapshot/prefixrebasebackingfiles"
 
     _metadata_handler = SblkMetadataHandler(lvm, bash)
@@ -481,6 +489,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.WRITE_VM_METADATA_PATH, self.write_vm_metadata)
         http_server.register_async_uri(self.SCAN_VM_METADATA_PATH, self.scan_vm_metadata)
         http_server.register_async_uri(self.CLEANUP_VM_METADATA_PATH, self.cleanup_vm_metadata)
+        http_server.register_async_uri(self.CLEANUP_ALL_VM_METADATA_PATH, self.cleanup_all_vm_metadata)
         http_server.register_async_uri(self.GET_VM_INSTANCE_METADATA_PATH, self.get_vm_instance_metadata)
         http_server.register_async_uri(self.PREFIX_REBASE_BACKING_FILES_PATH, self.prefix_rebase_backing_files)
 
@@ -715,8 +724,19 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         retry_times_for_checking_vg_lockspace = lvm.get_retry_times_for_checking_vg_lockspace()
 
         lvm.check_stuck_vglk_and_gllk()
+        running_lockspace = sanlock.get_lockspace(cmd.vgUuid)
+        if not running_lockspace:
+            logger.info("connect: remove stale device maps for %s before lock start" % cmd.vgUuid)
+            lvm.remove_device_map_for_vg(cmd.vgUuid)
+        else:
+            logger.info("connect: skip stale device map cleanup for %s, active lockspace exists: %s" %
+                        (cmd.vgUuid, running_lockspace))
         logger.debug("starting vg %s lock..." % cmd.vgUuid)
-        lvm.start_vg_lock(cmd.vgUuid, cmd.hostId, retry_times_for_checking_vg_lockspace)
+        try:
+            lvm.start_vg_lock(cmd.vgUuid, cmd.hostId, retry_times_for_checking_vg_lockspace)
+        except Exception:
+            lvm.log_vg_lock_diagnostics(cmd.vgUuid, "after connect lock start failure", warn=True)
+            raise
 
         if lvm.lvm_vgck(cmd.vgUuid, 60)[0] is False and lvm.lvm_check_operation(cmd.vgUuid) is False:
             lvm.drop_vg_lock(cmd.vgUuid)
@@ -1914,12 +1934,46 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         retry_times = lvm.get_retry_times_for_checking_vg_lockspace()
 
         active_vg_uuid = vg_uuid_on_storage
+        drop_lock_on_failure = False
         try:
-            lvm.start_vg_lock(vg_uuid_on_storage, cmd.hostId, retry_times)
-            lvm.reset_sanlock_lockspace(vg_uuid_on_storage)
-            lvm.drop_vg_lock(vg_uuid_on_storage)
-            lvm.start_vg_lock(vg_uuid_on_storage, cmd.hostId, retry_times)
-            logger.info("takeover[5/8] sanlock lockspace reset for %s" % vg_uuid_on_storage)
+            running_lockspace = sanlock.get_lockspace(vg_uuid_on_storage)
+            if not running_lockspace:
+                drop_lock_on_failure = True
+                logger.info("takeover[5/8] remove stale device maps for %s before lock start" %
+                            vg_uuid_on_storage)
+                lvm.remove_device_map_for_vg(vg_uuid_on_storage, raise_exception=True)
+            else:
+                logger.info("takeover[5/8] skip stale device map cleanup for %s, active lockspace exists: %s" %
+                            (vg_uuid_on_storage, running_lockspace))
+
+            reset_done = False
+            try:
+                lvm.start_vg_lock(vg_uuid_on_storage, cmd.hostId, retry_times)
+            except Exception as e:
+                if running_lockspace:
+                    raise
+                lockspace_after_failed_start = sanlock.get_lockspace(vg_uuid_on_storage)
+                if lockspace_after_failed_start:
+                    raise Exception("lockspace for %s became active after lock start failure, "
+                                    "skip offline reset: %s" %
+                                    (vg_uuid_on_storage, lockspace_after_failed_start))
+                logger.warn("takeover[5/8] initial lock start failed for %s, "
+                            "reset sanlock lockspace and retry: %s" % (vg_uuid_on_storage, str(e)))
+                lvm.reset_sanlock_lockspace(vg_uuid_on_storage, cmd.ioTimeout)
+                lvm.drop_vg_lock(vg_uuid_on_storage)
+                lvm.start_vg_lock(vg_uuid_on_storage, cmd.hostId, retry_times)
+                reset_done = True
+
+            if running_lockspace:
+                logger.info("takeover[5/8] sanlock lockspace already active for %s, skip reset" %
+                            vg_uuid_on_storage)
+            elif not reset_done:
+                lvm.reset_sanlock_lockspace(vg_uuid_on_storage, cmd.ioTimeout)
+                lvm.drop_vg_lock(vg_uuid_on_storage)
+                lvm.start_vg_lock(vg_uuid_on_storage, cmd.hostId, retry_times)
+                logger.info("takeover[5/8] sanlock lockspace reset for %s" % vg_uuid_on_storage)
+            else:
+                logger.info("takeover[5/8] sanlock lockspace reset for %s" % vg_uuid_on_storage)
 
             lvm.check_gl_lock()
 
@@ -1929,6 +1983,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
                 active_vg_uuid = cmd.vgUuid
                 logger.info("takeover[6/8] VG renamed %s -> %s" % (vg_uuid_on_storage, cmd.vgUuid))
                 lvm.start_vg_lock(cmd.vgUuid, cmd.hostId, retry_times)
+                drop_lock_on_failure = True
             else:
                 logger.info("takeover[6/8] VG name already matches, skip rename")
 
@@ -1945,13 +2000,17 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
             lvm.update_vg_tag(cmd.vgUuid, INIT_TAG, new_tag)
             logger.info("takeover[8/8] VG tag updated for %s" % cmd.vgUuid)
         except Exception:
-            logger.warn("takeover failed after lockspace established, "
-                        "dropping vg lock for %s to allow next host to retry" % active_vg_uuid)
-            try:
-                lvm.drop_vg_lock(active_vg_uuid)
-            except Exception as drop_err:
-                logger.warn("drop vg lock failed for %s during takeover cleanup: %s" %
-                            (active_vg_uuid, str(drop_err)))
+            if drop_lock_on_failure:
+                logger.warn("takeover failed after lockspace setup, "
+                            "dropping vg lock for %s to allow next host to retry" % active_vg_uuid)
+                try:
+                    lvm.drop_vg_lock(active_vg_uuid)
+                except Exception as drop_err:
+                    logger.warn("drop vg lock failed for %s during takeover cleanup: %s" %
+                                (active_vg_uuid, str(drop_err)))
+            else:
+                logger.warn("takeover failed while lockspace already active for %s, skip dropping vg lock" %
+                            active_vg_uuid)
             raise
 
         return jsonobject.dumps(rsp)
@@ -1988,6 +2047,18 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = CleanupVmMetadataRsp()
         self._metadata_handler.cleanup(cmd)
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    def cleanup_all_vm_metadata(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        rsp = CleanupAllVmMetadataRsp()
+        result = self._metadata_handler.cleanup_all(cmd) or {}
+        if result.get('error'):
+            rsp.success = False
+            rsp.error = result.get('error')
+        rsp.skipped = result.get('skipped', False)
+        rsp.currentGeneration = result.get('currentGeneration')
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror

@@ -5,7 +5,13 @@ import logging
 import os
 import re
 import struct
+import threading
 import time
+
+try:
+    import Queue as queue
+except ImportError:
+    import queue
 
 try:
     string_types = basestring
@@ -27,9 +33,19 @@ from .lv_protocol import (
     build_header, parse_header,
     build_slot, parse_slot,
 )
-from .vm_metadata_handler import VmMetadataHandler, VmMetadataScanEntry
+from .vm_metadata_handler import (
+    StaleMetadataGeneration,
+    VmMetadataHandler,
+    VmMetadataScanEntry,
+    command_metadata_generation,
+)
 
 logger = logging.getLogger(__name__)
+
+SBLK_METADATA_SCAN_CONCURRENCY = 10
+SBLK_METADATA_FENCE_LV_NAME = 'zstack_vmmeta_generation'
+SBLK_METADATA_FENCE_LV_TAG = 'zs::sharedblock::vmmeta::generation'
+_sblk_metadata_scan_lock = threading.Lock()
 
 
 # ###################################################################
@@ -60,9 +76,16 @@ class SblkMetadataHandler(VmMetadataHandler):
     # VG names in SharedBlock are UUIDs or LVM safe names (alnum + hyphen + underscore + period)
     _SAFE_VG_RE = re.compile(r'^[a-zA-Z0-9_.\-]+$')
 
-    def __init__(self, lvm_module, bash_module):
+    def __init__(self, lvm_module, bash_module, lock_module=None):
         self._lvm = lvm_module
         self._bash = bash_module
+        self._lock = lock_module
+
+    def _generation_lock(self, fence_path):
+        if self._lock is None:
+            from zstacklib.utils import lock as lock_module
+            self._lock = lock_module
+        return self._lock.NamedLock(fence_path)
 
     def _ensure_metadata_lv(self, metadata_path):
         """Create the metadata LV if it doesn't exist (no I/O initialization here)."""
@@ -83,6 +106,66 @@ class SblkMetadataHandler(VmMetadataHandler):
                 logger.debug("metadata LV %s created by concurrent operation", metadata_path)
             else:
                 raise
+
+    def _metadata_fence_path(self, vg_uuid):
+        return os.path.join('/dev', vg_uuid, SBLK_METADATA_FENCE_LV_NAME)
+
+    def _ensure_metadata_fence_lv(self, vg_uuid):
+        fence_path = self._metadata_fence_path(vg_uuid)
+        if self._lvm.lv_exists(fence_path):
+            return fence_path
+
+        try:
+            self._lvm.create_lv_from_absolute_path(
+                fence_path,
+                INITIAL_LV_SIZE,
+                tag=SBLK_METADATA_FENCE_LV_TAG,
+                lock=True,
+                exact_size=True,
+            )
+        except Exception:
+            if not self._lvm.lv_exists(fence_path):
+                raise
+        return fence_path
+
+    def _read_metadata_generation(self, fence_path):
+        lv_size = int(float(self._lvm.get_lv_size(fence_path)))
+        result = read_metadata(fence_path, lv_size)
+        if not result.is_usable():
+            raise MetadataIOError(
+                "cannot read metadata generation from fence LV %s: status=%s, error=%s" %
+                (fence_path, result.status, result.error))
+        try:
+            data = json.loads(result.payload)
+            if not data:
+                return 0
+            generation = int(data['generation'])
+        except (TypeError, ValueError, KeyError):
+            raise ValueError("invalid metadata generation in fence LV %s" % fence_path)
+        if generation < 0:
+            raise ValueError("metadata generation must be non-negative in fence LV %s" % fence_path)
+        return generation
+
+    def _write_metadata_generation(self, fence_path, generation):
+        lvm = self._lvm
+
+        def _get_lv_size():
+            return int(float(lvm.get_lv_size(fence_path)))
+
+        def _extend_lv(new_size):
+            lvm.extend_lv(fence_path, new_size)
+
+        write_metadata(
+            lv_path=fence_path,
+            payload=json.dumps({'generation': generation}, separators=(',', ':')),
+            lv_size_getter=_get_lv_size,
+            lv_extend_func=_extend_lv,
+            schema_version='',
+            vm_uuid='',
+            vm_name='',
+            vm_category='',
+            architecture='',
+        )
 
     def _initialize_if_needed(self, metadata_path, lv_size):
         """Under exclusive lock, initialize only truly blank (all-zero header) LVs.
@@ -137,31 +220,47 @@ class SblkMetadataHandler(VmMetadataHandler):
             result.append((lv_name, lv_path, lv_size))
         return result
 
-    def _do_write(self, metadataPath, metadata, vmUuid, vmName, vmCategory, architecture, schemaVersion):
+    def _do_write(self, metadataPath, metadata, vmUuid, vmName, vmCategory,
+                  architecture, schemaVersion, metadataGeneration=0):
         _validate_metadata_lv_path(metadataPath)
-        self._ensure_metadata_lv(metadataPath)
-
         lvm = self._lvm
+        vg_uuid = os.path.basename(os.path.dirname(metadataPath))
+        fence_path = self._metadata_fence_path(vg_uuid)
 
-        def _get_lv_size():
-            return int(float(lvm.get_lv_size(metadataPath)))
+        with self._generation_lock(fence_path):
+            fence_path = self._ensure_metadata_fence_lv(vg_uuid)
 
-        def _extend_lv(new_size):
-            lvm.extend_lv(metadataPath, new_size)
+            def _get_lv_size():
+                return int(float(lvm.get_lv_size(metadataPath)))
 
-        with lvm.OperateLv(metadataPath, shared=False):
-            self._initialize_if_needed(metadataPath, _get_lv_size())
-            write_metadata(
-                lv_path=metadataPath,
-                payload=metadata,
-                lv_size_getter=_get_lv_size,
-                lv_extend_func=_extend_lv,
-                schema_version=schemaVersion or '',
-                vm_uuid=vmUuid,
-                vm_name=vmName,
-                vm_category=vmCategory or '',
-                architecture=architecture,
-            )
+            def _extend_lv(new_size):
+                lvm.extend_lv(metadataPath, new_size)
+
+            with lvm.OperateLv(fence_path, shared=False):
+                self._initialize_if_needed(
+                    fence_path, int(float(lvm.get_lv_size(fence_path))))
+                current_generation = self._read_metadata_generation(fence_path)
+                if metadataGeneration < current_generation:
+                    raise StaleMetadataGeneration(
+                        "metadata write generation %s is older than storage generation %s for %s" %
+                        (metadataGeneration, current_generation, metadataPath))
+                if metadataGeneration > current_generation:
+                    self._write_metadata_generation(fence_path, metadataGeneration)
+
+                self._ensure_metadata_lv(metadataPath)
+                with lvm.OperateLv(metadataPath, shared=False):
+                    self._initialize_if_needed(metadataPath, _get_lv_size())
+                    write_metadata(
+                        lv_path=metadataPath,
+                        payload=metadata,
+                        lv_size_getter=_get_lv_size,
+                        lv_extend_func=_extend_lv,
+                        schema_version=schemaVersion or '',
+                        vm_uuid=vmUuid,
+                        vm_name=vmName,
+                        vm_category=vmCategory or '',
+                        architecture=architecture,
+                    )
 
         logger.debug("successfully wrote vm metadata to %s", metadataPath)
         return {}
@@ -209,8 +308,7 @@ class SblkMetadataHandler(VmMetadataHandler):
 
         metadata_lvs = scan_metadata_lvs(vg_uuid, _lv_list)
 
-        entries = []
-        for item in metadata_lvs:
+        def _scan_one(item):
             vm_uuid = item['vm_uuid']
             lv_path = item['lv_path']
             lv_size = item['lv_size']
@@ -233,10 +331,58 @@ class SblkMetadataHandler(VmMetadataHandler):
             except Exception as e:
                 logger.warn("failed to read metadata status for %s: %s", lv_path, e)
 
-            entries.append(entry)
+            return entry
+
+        with _sblk_metadata_scan_lock:
+            if len(metadata_lvs) <= 1:
+                entries = [_scan_one(item) for item in metadata_lvs]
+            else:
+                entries = self._do_scan_metadata_lvs_concurrently(
+                    metadata_lvs, _scan_one)
 
         logger.debug("scan_vm_metadata on vg %s: found %d metadata LVs, returned %d entries",
                      vg_uuid, len(metadata_lvs), len(entries))
+        return entries
+
+    def _do_scan_metadata_lvs_concurrently(self, metadata_lvs, scan_one):
+        entries = [None] * len(metadata_lvs)
+        work_queue = queue.Queue()
+        for index, item in enumerate(metadata_lvs):
+            work_queue.put((index, item))
+
+        errors = []
+        errors_lock = threading.Lock()
+
+        def _worker():
+            while True:
+                try:
+                    index, item = work_queue.get_nowait()
+                except queue.Empty:
+                    return
+
+                try:
+                    entries[index] = scan_one(item)
+                except Exception as e:
+                    with errors_lock:
+                        errors.append(e)
+
+        workers = []
+        worker_count = min(SBLK_METADATA_SCAN_CONCURRENCY,
+                           len(metadata_lvs))
+        for index in range(worker_count):
+            worker = threading.Thread(
+                target=_worker,
+                name="sblk-metadata-scan-%d" % index)
+            worker.daemon = True
+            worker.start()
+            workers.append(worker)
+
+        for worker in workers:
+            worker.join()
+
+        if errors:
+            raise errors[0]
+
         return entries
 
     def _do_cleanup(self, metadataPath):
@@ -254,6 +400,62 @@ class SblkMetadataHandler(VmMetadataHandler):
 
         logger.debug("cleanup_vm_metadata: cleaned %s", metadataPath)
         return {}
+
+    def cleanup_all(self, cmd):
+        vg_uuid = getattr(cmd, 'vgUuid', None)
+        if not vg_uuid or not isinstance(vg_uuid, string_types):
+            return {'error': "vgUuid is required"}
+        if not self._SAFE_VG_RE.match(vg_uuid):
+            return {'error': "invalid vgUuid: %r" % vg_uuid}
+
+        lvm = self._lvm
+        bash = self._bash
+        metadata_generation = command_metadata_generation(cmd)
+
+        @bash.in_bash
+        def _lv_list(vg):
+            return self._lv_list_func(vg)
+
+        fence_path = self._metadata_fence_path(vg_uuid)
+        with self._generation_lock(fence_path):
+            fence_path = self._ensure_metadata_fence_lv(vg_uuid)
+            with lvm.OperateLv(fence_path, shared=False):
+                self._initialize_if_needed(
+                    fence_path, int(float(lvm.get_lv_size(fence_path))))
+                current_generation = self._read_metadata_generation(fence_path)
+                if metadata_generation < current_generation:
+                    logger.warn("skipping stale cleanup generation %s; storage generation is %s for vg %s",
+                                metadata_generation, current_generation, vg_uuid)
+                    return {
+                        'skipped': True,
+                        'currentGeneration': current_generation,
+                    }
+                if metadata_generation > current_generation:
+                    self._write_metadata_generation(fence_path, metadata_generation)
+
+                try:
+                    metadata_lvs = scan_metadata_lvs(vg_uuid, _lv_list)
+                except Exception as e:
+                    logger.warn("scan_metadata_lvs failed on vg %s: %s", vg_uuid, e)
+                    return {'error': "scan_metadata_lvs failed on vg %s: %s" % (vg_uuid, e)}
+
+                failures = []
+                for item in metadata_lvs:
+                    lv_path = item.get('lv_path')
+                    try:
+                        if lvm.lv_exists(lv_path):
+                            delete_metadata_lv(lv_path, lvm.delete_lv)
+                    except Exception as e:
+                        logger.warn("failed to delete metadata LV %s: %s", lv_path, e)
+                        failures.append("%s: %s" % (lv_path, e))
+
+                if failures:
+                    return {'error': "failed to delete %d metadata LV(s) on vg %s: %s" %
+                                     (len(failures), vg_uuid, "; ".join(failures))}
+                return {}
+
+    def _do_cleanup_all(self, metadataDir, metadataGeneration=0):
+        raise NotImplementedError("SblkMetadataHandler.cleanup_all uses cmd.vgUuid")
 
 
 # ###################################################################
@@ -476,23 +678,27 @@ def sblk_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix, normali
 # ###################################################################
 
 _libc = None
+_libc_lock = threading.Lock()
 
 
 def _get_libc():
     global _libc
     if _libc is None:
-        _libc = ctypes.CDLL('libc.so.6', use_errno=True)
-        _libc.pwrite.restype = ctypes.c_ssize_t
-        _libc.pwrite.argtypes = [ctypes.c_int, ctypes.c_void_p,
-                                 ctypes.c_size_t, ctypes.c_longlong]
-        _libc.pread.restype = ctypes.c_ssize_t
-        _libc.pread.argtypes = [ctypes.c_int, ctypes.c_void_p,
-                                ctypes.c_size_t, ctypes.c_longlong]
-        _libc.posix_memalign.restype = ctypes.c_int
-        _libc.posix_memalign.argtypes = [ctypes.POINTER(ctypes.c_void_p),
-                                         ctypes.c_size_t, ctypes.c_size_t]
-        _libc.free.restype = None
-        _libc.free.argtypes = [ctypes.c_void_p]
+        with _libc_lock:
+            if _libc is None:
+                libc = ctypes.CDLL('libc.so.6', use_errno=True)
+                libc.pwrite.restype = ctypes.c_ssize_t
+                libc.pwrite.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                        ctypes.c_size_t, ctypes.c_longlong]
+                libc.pread.restype = ctypes.c_ssize_t
+                libc.pread.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                       ctypes.c_size_t, ctypes.c_longlong]
+                libc.posix_memalign.restype = ctypes.c_int
+                libc.posix_memalign.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                                ctypes.c_size_t, ctypes.c_size_t]
+                libc.free.restype = None
+                libc.free.argtypes = [ctypes.c_void_p]
+                _libc = libc
     return _libc
 
 
