@@ -727,6 +727,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         # lvm.add_vg_tag(cmd.vgUuid, "%s::%s::%s::%s" % (HEARTBEAT_TAG, cmd.hostUuid, time.time(), linux.get_hostname()))
         self.clear_stalled_qmp_socket()
         lvm.check_missing_pv(cmd.vgUuid)
+        lvm.update_lockspace_io_timeout_if_need(cmd.vgUuid, cmd.ioTimeout)
 
         rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
         rsp.hostId = lvm.get_running_host_id(cmd.vgUuid)

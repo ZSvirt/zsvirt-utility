@@ -864,6 +864,12 @@ def start_lock_service(io_timeout=40):
         os.fsync(f.fileno())
     os.chmod(LVMLOCKD_LOG_LOGROTATE_PATH, 0o644)
 
+@bash.in_bash
+def update_lockspace_io_timeout_if_need(vgName, io_timeout):
+    lockspace = sanlock.SanlockClientStatusParser().get_lockspace_record(vgName)
+    if lockspace and lockspace.get_io_timeout() != int(io_timeout):
+        bash.bash_roe("sanlock client set_config -s lvm_%s -o %s" % (vgName, io_timeout))
+
 def write_lvmlockd_adopt_file():
     def _get_lockspace_name(line):
         return line.split()[1].split(":")[0]
