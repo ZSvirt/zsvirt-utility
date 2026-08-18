@@ -1936,6 +1936,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
 
             # Step 7: fix PV state
             lvm.check_missing_pv(cmd.vgUuid)
+            lvm.update_lockspace_io_timeout_if_need(cmd.vgUuid, cmd.ioTimeout)
             lvm.reset_pv_uuids(cmd.vgUuid)
             logger.info("takeover[7/8] PV state fixed for %s" % cmd.vgUuid)
 

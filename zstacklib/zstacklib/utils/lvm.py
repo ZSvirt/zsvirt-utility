@@ -38,6 +38,7 @@ SANLOCK_CONFIG_FILE_PATH = "/etc/sanlock/sanlock.conf"
 DEB_SANLOCK_CONFIG_FILE_PATH = "/etc/default/sanlock"
 LIVE_LIBVIRT_XML_DIR = "/var/run/libvirt/qemu"
 SANLOCK_IO_TIMEOUT = 40
+SANLOCK_CLIENT_SET_CONFIG_TIMEOUT = 10
 LVMLOCKD_LOG_FILE_PATH = "/var/log/lvmlockd/lvmlockd.log"
 LVMLOCKD_SOCKET = "/run/lvm/lvmlockd.socket"
 LVMLOCKD_LOG_RSYSLOG_PATH = "/etc/rsyslog.d/lvmlockd.conf"
@@ -866,9 +867,52 @@ def start_lock_service(io_timeout=40):
 
 @bash.in_bash
 def update_lockspace_io_timeout_if_need(vgName, io_timeout):
-    lockspace = sanlock.SanlockClientStatusParser().get_lockspace_record(vgName)
-    if lockspace and lockspace.get_io_timeout() != int(io_timeout):
-        bash.bash_roe("sanlock client set_config -s lvm_%s -o %s" % (vgName, io_timeout))
+    lockspace_name = "lvm_%s" % vgName
+    if io_timeout is None or str(io_timeout).strip() == "":
+        logger.warn("skip updating sanlock io timeout for lockspace %s: invalid io_timeout %s" %
+                    (lockspace_name, io_timeout))
+        return
+
+    try:
+        expected_io_timeout = int(io_timeout)
+    except (TypeError, ValueError):
+        logger.warn("skip updating sanlock io timeout for lockspace %s: invalid io_timeout %s" %
+                    (lockspace_name, io_timeout))
+        return
+
+    parser = sanlock.SanlockClientStatusParser()
+    lockspace = parser.get_lockspace_record(vgName)
+    if not lockspace:
+        if not parser.status:
+            logger.warn("skip updating sanlock io timeout for lockspace %s: failed to query sanlock status" %
+                        lockspace_name)
+            return
+        logger.warn("skip updating sanlock io timeout for lockspace %s: lockspace is not found in sanlock status" %
+                    lockspace_name)
+        return
+
+    try:
+        current_io_timeout = lockspace.get_io_timeout()
+    except Exception as e:
+        logger.warn("skip updating sanlock io timeout for lockspace %s: invalid sanlock status, %s" %
+                    (lockspace_name, str(e)))
+        return
+
+    if current_io_timeout == expected_io_timeout:
+        logger.debug("sanlock io timeout for lockspace %s is already %s" %
+                     (lockspace_name, expected_io_timeout))
+        return
+
+    r, o, e = bash.bash_roe("timeout -s SIGKILL %s sanlock client set_config -s %s -o %s" %
+                            (SANLOCK_CLIENT_SET_CONFIG_TIMEOUT, linux.shellquote(lockspace_name),
+                             expected_io_timeout))
+    if r != 0:
+        logger.warn("failed to update sanlock io timeout for lockspace %s from %s to %s, stdout: %s, stderr: %s" %
+                    (lockspace_name, current_io_timeout, expected_io_timeout, o, e))
+        return
+
+    logger.info("updated sanlock io timeout for lockspace %s from %s to %s" %
+                (lockspace_name, current_io_timeout, expected_io_timeout))
 
 def write_lvmlockd_adopt_file():
     def _get_lockspace_name(line):
