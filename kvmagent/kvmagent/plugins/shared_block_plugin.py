@@ -727,6 +727,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         # lvm.add_vg_tag(cmd.vgUuid, "%s::%s::%s::%s" % (HEARTBEAT_TAG, cmd.hostUuid, time.time(), linux.get_hostname()))
         self.clear_stalled_qmp_socket()
         lvm.check_missing_pv(cmd.vgUuid)
+        lvm.update_lockspace_io_timeout_if_need(cmd.vgUuid, cmd.ioTimeout)
 
         rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
         rsp.hostId = lvm.get_running_host_id(cmd.vgUuid)
@@ -948,20 +949,27 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         if cmd.folder:
             raise Exception("not support this operation")
 
-        self.do_delete_bits(cmd.path, discard=cmd.issueDiscards)
+        try:
+            deadline = get_deadline(cmd)
+        except Exception as e:
+            logger.warn("skip discard deadline for deleting bits because %s" % str(e))
+            deadline = 0
+
+        self.do_delete_bits(cmd.path, discard=cmd.issueDiscards, deadline=deadline)
 
         rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
         rsp.lunCapacities = lvm.get_lun_capacities_from_vg(cmd.vgUuid, self.vgs_path_and_wwid)
         return jsonobject.dumps(rsp)
 
-    def do_delete_bits(self, path, discard=lvm.LvDiscardStrategy.NEVER):
+    def do_delete_bits(self, path, discard=lvm.LvDiscardStrategy.NEVER, deadline=None):
         install_abs_path = translate_absolute_path_from_install_path(path)
         if lvm.has_lv_tag(install_abs_path, IMAGE_TAG):
             logger.info('deleting lv image: ' + install_abs_path)
             lvm.delete_image(install_abs_path, IMAGE_TAG)
         else:
             logger.info('deleting lv volume: ' + install_abs_path)
-            lvm.delete_lv(install_abs_path, discard=discard)
+            lvm.discard_lv(install_abs_path, discard, deadline=deadline)
+            lvm.delete_lv(install_abs_path)
 
     @staticmethod
     def get_total_required_size(abs_path):
@@ -1928,6 +1936,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
 
             # Step 7: fix PV state
             lvm.check_missing_pv(cmd.vgUuid)
+            lvm.update_lockspace_io_timeout_if_need(cmd.vgUuid, cmd.ioTimeout)
             lvm.reset_pv_uuids(cmd.vgUuid)
             logger.info("takeover[7/8] PV state fixed for %s" % cmd.vgUuid)
 

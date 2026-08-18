@@ -1097,6 +1097,32 @@ class UpdateConfigration(object):
 
 logger = log.get_logger(__name__)
 
+
+def _run_package_post_update_hooks():
+    try:
+        system_release = '/etc/system-release'
+        bls_entries_dir = '/boot/loader/entries'
+        if not os.path.exists(system_release):
+            return
+        release = linux.read_file(system_release)
+        if not release or 'helix' not in release.lower():
+            return
+        if not os.path.isdir(bls_entries_dir):
+            return
+
+        for name in os.listdir(bls_entries_dir):
+            path = os.path.join(bls_entries_dir, name)
+            if not os.path.isfile(path):
+                continue
+            content = linux.read_file(path)
+            if not content or 'Rocky Linux ' not in content:
+                continue
+            linux.write_file(path, content.replace('Rocky Linux ', 'Helix '))
+            logger.debug('rewrote BLS title Rocky Linux to Helix in %s' % path)
+    except Exception as e:
+        logger.warn('ignore BLS title rewrite failure %s' % e)
+
+
 def _get_memory(word):
     out = shell.call("grep '%s' /proc/meminfo" % word)
     (name, capacity) = out.split(':')
@@ -2499,6 +2525,7 @@ if __name__ == "__main__":
             shell_cmd(False)
             if shell_cmd.return_code == 0:
                 logger.debug("successfully run: %s" % yum_cmd)
+                _run_package_post_update_hooks()
             else:
                 rsp.success = False
                 rsp.error = "failed to update host os using zstack-mn,qemu-kvm-ev-mn repo, stdout: %s, stderr: %s" % (shell_cmd.stdout, shell_cmd.stderr)
@@ -2556,6 +2583,7 @@ if __name__ == "__main__":
                     rsp.error = "failed to update host dependency using zstack-experimental-mn repo"
                 else:
                     logger.debug("successfully run: %s" % yum_cmd)
+                    _run_package_post_update_hooks()
         elif self.IS_APT:
             apt_cmd = "apt-get clean && apt-get -y --allow-unauthenticated install `cat /var/lib/zstack/dependencies`"
             if shell.run(apt_cmd) != 0:

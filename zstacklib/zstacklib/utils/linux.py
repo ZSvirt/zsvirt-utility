@@ -1616,11 +1616,20 @@ qemu-io -c "discard $[i*2145386496] {2}" -f qcow2 -d unmap {1}
     logger.debug("qcow2 discard return code: %s, stderr: %s" % (cmd.return_code, cmd.stderr))
 
 def get_block_discard_max_bytes(path):
-    if not os.path.exists(path):
-        raise Exception("block device %s not exists" % path)
+    base_name = os.path.basename(path)
+    file_max_bytes = "/sys/class/block/%s/queue/discard_max_bytes" % base_name
+    if not os.path.exists(path) or not os.path.exists(file_max_bytes):
+        raise Exception("cannot get block %s discard max bytes" % path)
 
-    discard_max_bytes = read_file('/sys/class/block/%s/queue/discard_max_bytes' % os.path.basename(path))
-    return 0 if discard_max_bytes is None else long(discard_max_bytes)
+    return int(read_file(file_max_bytes))
+
+def get_block_discard_granularity(path):
+    base_name = os.path.basename(path)
+    file_granularity = "/sys/class/block/%s/queue/discard_granularity" % base_name
+    if not os.path.exists(path) or not os.path.exists(file_granularity):
+        raise Exception("cannot get block %s discard granularity" % path)
+
+    return int(read_file(file_granularity))
 
 def support_blkdiscard(path):
     return get_block_discard_max_bytes(path) > 0

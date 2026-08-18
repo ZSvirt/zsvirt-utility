@@ -38,6 +38,7 @@ SANLOCK_CONFIG_FILE_PATH = "/etc/sanlock/sanlock.conf"
 DEB_SANLOCK_CONFIG_FILE_PATH = "/etc/default/sanlock"
 LIVE_LIBVIRT_XML_DIR = "/var/run/libvirt/qemu"
 SANLOCK_IO_TIMEOUT = 40
+SANLOCK_CLIENT_SET_CONFIG_TIMEOUT = 10
 LVMLOCKD_LOG_FILE_PATH = "/var/log/lvmlockd/lvmlockd.log"
 LVMLOCKD_SOCKET = "/run/lvm/lvmlockd.socket"
 LVMLOCKD_LOG_RSYSLOG_PATH = "/etc/rsyslog.d/lvmlockd.conf"
@@ -54,6 +55,7 @@ ENABLE_DUP_GLOBAL_CHECK = False
 LVMLOCKD_VERSION = None
 thinProvisioningInitializeSize = "thinProvisioningInitializeSize"
 PV_DISCARD_MIN_SIZE_IN_BYTES = 1*1024**3
+PV_DISCARD_MAX_SIZE_IN_BYTES = 100*1024**3
 ONE_HOUR_IN_SEC = 60 * 60
 LV_UUID_REFRESH_INTERVAL_IN_SEC = 60 * 30
 LVM_CONFIG_CHANGED_FILE = "/var/run/zstack/lvmConfigChanged"
@@ -863,6 +865,55 @@ def start_lock_service(io_timeout=40):
         os.fsync(f.fileno())
     os.chmod(LVMLOCKD_LOG_LOGROTATE_PATH, 0o644)
 
+@bash.in_bash
+def update_lockspace_io_timeout_if_need(vgName, io_timeout):
+    lockspace_name = "lvm_%s" % vgName
+    if io_timeout is None or str(io_timeout).strip() == "":
+        logger.warn("skip updating sanlock io timeout for lockspace %s: invalid io_timeout %s" %
+                    (lockspace_name, io_timeout))
+        return
+
+    try:
+        expected_io_timeout = int(io_timeout)
+    except (TypeError, ValueError):
+        logger.warn("skip updating sanlock io timeout for lockspace %s: invalid io_timeout %s" %
+                    (lockspace_name, io_timeout))
+        return
+
+    parser = sanlock.SanlockClientStatusParser()
+    lockspace = parser.get_lockspace_record(vgName)
+    if not lockspace:
+        if not parser.status:
+            logger.warn("skip updating sanlock io timeout for lockspace %s: failed to query sanlock status" %
+                        lockspace_name)
+            return
+        logger.warn("skip updating sanlock io timeout for lockspace %s: lockspace is not found in sanlock status" %
+                    lockspace_name)
+        return
+
+    try:
+        current_io_timeout = lockspace.get_io_timeout()
+    except Exception as e:
+        logger.warn("skip updating sanlock io timeout for lockspace %s: invalid sanlock status, %s" %
+                    (lockspace_name, str(e)))
+        return
+
+    if current_io_timeout == expected_io_timeout:
+        logger.debug("sanlock io timeout for lockspace %s is already %s" %
+                     (lockspace_name, expected_io_timeout))
+        return
+
+    r, o, e = bash.bash_roe("timeout -s SIGKILL %s sanlock client set_config -s %s -o %s" %
+                            (SANLOCK_CLIENT_SET_CONFIG_TIMEOUT, linux.shellquote(lockspace_name),
+                             expected_io_timeout))
+    if r != 0:
+        logger.warn("failed to update sanlock io timeout for lockspace %s from %s to %s, stdout: %s, stderr: %s" %
+                    (lockspace_name, current_io_timeout, expected_io_timeout, o, e))
+        return
+
+    logger.info("updated sanlock io timeout for lockspace %s from %s to %s" %
+                (lockspace_name, current_io_timeout, expected_io_timeout))
+
 def write_lvmlockd_adopt_file():
     def _get_lockspace_name(line):
         return line.split()[1].split(":")[0]
@@ -1097,6 +1148,23 @@ def backup_super_block(disk_path):
 
 
 @bash.in_bash
+def is_running_vm_using_lun_passthrough():
+    return bash.bash_r('''grep -rlF "<disk type='block' device='lun'" %s/*''' % LIVE_LIBVIRT_XML_DIR) == 0
+
+
+@bash.in_bash
+def flush_mpath(disk):
+    wwid = get_dm_wwid(disk)
+    bash.bash_roe("multipath -f %s" % disk)
+    if is_running_vm_using_lun_passthrough() and wwid:
+        # re-create only this disk's map; a host-wide multipathd reload would
+        # suspend in-use maps and abort in-flight IO on LUN-passthrough guests
+        bash.bash_roe("multipath %s && sleep 1" % wwid)
+    else:
+        bash.bash_roe("systemctl reload multipathd.service && sleep 1")
+
+
+@bash.in_bash
 def wipe_fs(disks, expected_vg=None, with_lock=True):
     @bash.in_bash
     def clear_lvmlock(vg_name):
@@ -1135,7 +1203,7 @@ def wipe_fs(disks, expected_vg=None, with_lock=True):
             bash.bash_roe("dmsetup remove /dev/%s" % holder)
 
         if need_flush_mpath:
-            bash.bash_roe("multipath -f %s && systemctl reload multipathd.service && sleep 1" % disk)
+            flush_mpath(disk)
 
         if exists_vg is not None:
             bash.bash_r("grep -l %s /etc/drbd.d/* | xargs rm" % exists_vg)
@@ -1283,12 +1351,24 @@ def clean_vg_exists_host_tags(vgUuid, hostUuid, tag):
 def round_to(n, r):
     return (n + r - 1) / r * r
 
-def is_slow_discard_lv(path):
+
+
+def get_lv_discard_max_bytes(path):
     pvs = [os.path.realpath(pv) for pv in get_lv_location(path) if os.path.exists(pv)]
-    pv_discard_max_bytes = sorted([linux.get_block_discard_max_bytes(pv) for pv in pvs if linux.support_blkdiscard(pv)])
-    support_discard = len(pv_discard_max_bytes) != 0
-    disc_bytes_too_small = support_discard and pv_discard_max_bytes[0] < PV_DISCARD_MIN_SIZE_IN_BYTES
-    return support_discard and disc_bytes_too_small
+    if len(pvs) == 0:
+        raise Exception("cannot get pvs for lv %s" % path)
+
+    pv_discard_max_bytes = sorted([linux.get_block_discard_max_bytes(pv) for pv in pvs])
+    return pv_discard_max_bytes[0]
+
+
+def get_lv_discard_granularity(path):
+    pvs = [os.path.realpath(pv) for pv in get_lv_location(path) if os.path.exists(pv)]
+    if len(pvs) == 0:
+        raise Exception("cannot get pvs for lv %s" % path)
+
+    pv_discard_granularity = sorted([linux.get_block_discard_granularity(pv) for pv in pvs])
+    return pv_discard_granularity[0]
 
 @bash.in_bash
 @linux.retry(times=15, sleep_time=random.uniform(0.1, 3))
@@ -1601,12 +1681,57 @@ def _deactive_lv(path, raise_exception=True):
             logger.warn("find lv used by other process:\n%s" % str(o))
         raise
 
-def get_lv_discard_options(path, discard):
-    discard = discard == LvDiscardStrategy.ALWAYS or (discard == LvDiscardStrategy.AUTO and not is_slow_discard_lv(path))
-    return " --config 'devices {issue_discards=%s}' " % ("1" if discard else "0")
+@bash.in_bash
+def lv_in_use(path):
+    if not os.path.exists(path):
+        return False
+
+    o = bash.bash_errorout("%s --noheadings %s -olv_device_open" % (subcmd("lvs"), path))
+    return any(line.strip() == "open" for line in o.splitlines())
+
+
+def discard_lv(path, discard_strategy, deadline=None):
+    if discard_strategy == LvDiscardStrategy.NEVER:
+        return False
+    elif discard_strategy != LvDiscardStrategy.ALWAYS and discard_strategy != LvDiscardStrategy.AUTO:
+        logger.debug("unknown discard strategy %s" % discard_strategy)
+        return False
+
+    try:
+        if not lv_exists(path):
+            return False
+
+        discard_max_bytes = get_lv_discard_max_bytes(path)
+        if discard_max_bytes == 0:
+            # not support block discard
+            return False
+
+        slow_discard = discard_max_bytes < PV_DISCARD_MIN_SIZE_IN_BYTES
+        if discard_strategy == LvDiscardStrategy.AUTO and slow_discard:
+            return False
+
+        with OperateLv(path):
+            if lv_in_use(path):
+                logger.warn("cannot discard lv because lv[%s] in use" % path)
+                return False
+
+            step = min(max(get_lv_discard_max_bytes(path), PV_DISCARD_MIN_SIZE_IN_BYTES), PV_DISCARD_MAX_SIZE_IN_BYTES)
+            discard_granularity = get_lv_discard_granularity(path)
+            step = int(round_to(step, discard_granularity))
+            timeout = int(deadline - time.time()) if deadline is not None else None
+            if timeout is not None and timeout <= 120:
+                logger.debug("skip discard lv because timeout[%s] is too short" % timeout)
+                return False
+
+            shell.call("%s blkdiscard %s --step %s" % ("timeout -s SIGKILL %s" % (timeout-120) if timeout else "", path, step))
+    except Exception as e:
+        logger.warn("discard lv %s exception: %s" % (path, str(e)))
+        return False
+
+    return True
 
 @bash.in_bash
-def delete_lv(path, raise_exception=True, deactive=True, discard=LvDiscardStrategy.NEVER):
+def delete_lv(path, raise_exception=True, deactive=True):
     logger.debug("deleting lv %s" % path)
     if deactive:
         _deactive_lv(path, False)
@@ -1616,10 +1741,9 @@ def delete_lv(path, raise_exception=True, deactive=True, discard=LvDiscardStrate
     if not lv_exists(path):
         return
     if raise_exception:
-        o = bash.bash_errorout("%s -y %s %s" % (subcmd("lvremove"), path, get_lv_discard_options(path, discard)))
+        return bash.bash_errorout("%s -y %s" % (subcmd("lvremove"), path))
     else:
-        o = bash.bash_o("%s -y %s %s " % (subcmd("lvremove"), path, get_lv_discard_options(path, discard)))
-    return o
+        return bash.bash_o("%s -y %s" % (subcmd("lvremove"), path))
 
 
 @bash.in_bash
