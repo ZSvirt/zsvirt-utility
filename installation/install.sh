@@ -2505,6 +2505,22 @@ install_or_upgrade_zmigrate(){
     show_spinner is_install_zmigrate
 }
 
+install_fluentbit_server(){
+    fluentbit_installer_tools="/opt/zstack-dvd/$BASEARCH/$ZSTACK_RELEASE/fluent-bit.tar.gz"
+    if [ ! -f "$fluentbit_installer_tools" ]; then
+        echo "WARNING: fluent-bit.tar.gz not found in DVD, skipping fluent-bit installation. Log server will not be available." >> $ZSTACK_INSTALL_LOG
+        return
+    fi
+    if [ x"$UPGRADE" = x'y' ] && [ -x "/var/lib/zstack/fluent-bit/bin/fluent-bit" ]; then
+        echo "fluent-bit already installed, skipping reinstall during upgrade." >> $ZSTACK_INSTALL_LOG
+        return
+    fi
+    echo_title "Install or upgrade fluentbit server"
+    echo ""
+    trap 'traplogger $LINENO "$BASH_COMMAND" $?'  DEBUG
+    show_spinner is_install_fluentbit_server
+}
+
 setup_install_param(){
     echo_title "Setup Install Parameters"
     echo ""
@@ -3250,6 +3266,56 @@ is_install_vops(){
     [[ ! -f "$vops_installer_bin" ]] && fail2 "failed to find VOps installation file"
     bash $vops_installer_bin >>$ZSTACK_INSTALL_LOG 2>&1
     [ $? -ne 0 ] && fail2 "failed to install VOps"
+    pass
+}
+
+is_install_fluentbit_server(){
+    echo_subtitle "Install fluentbit server"
+    if [ "$IS_YUM" != "y" ]; then
+        echo "Skip fluent-bit dependency install on non-yum system." >> "$ZSTACK_INSTALL_LOG"
+    elif [ "$BASEARCH" = "x86_64" ]; then
+        if [ "$ZSTACK_RELEASE" = "h84r" ] || [ "$ZSTACK_RELEASE" = "uos20r" ]; then
+            echo "Installing libpq for fluent-bit..." >> "$ZSTACK_INSTALL_LOG"
+            if [ -n "$ZSTACK_YUM_REPOS" ]; then
+                yum install -y --disablerepo="*" --enablerepo="$ZSTACK_YUM_REPOS" libpq >> "$ZSTACK_INSTALL_LOG" 2>&1
+            else
+                yum install -y libpq >> "$ZSTACK_INSTALL_LOG" 2>&1
+            fi || fail "install libpq for fluent-bit failed."
+        else
+            echo "Installing postgresql-libs for fluent-bit..." >> "$ZSTACK_INSTALL_LOG"
+            if [ -n "$ZSTACK_YUM_REPOS" ]; then
+                yum install -y --disablerepo="*" --enablerepo="$ZSTACK_YUM_REPOS" postgresql-libs >> "$ZSTACK_INSTALL_LOG" 2>&1
+            else
+                yum install -y postgresql-libs >> "$ZSTACK_INSTALL_LOG" 2>&1
+            fi || fail "install postgresql-libs for fluent-bit failed."
+        fi
+    fi
+
+    if [ "$IS_YUM" = "y" ] && [ "$BASEARCH" = "aarch64" ]; then
+        echo "Installing compat-openssl10 for fluent-bit..." >> "$ZSTACK_INSTALL_LOG"
+        if [ -n "$ZSTACK_YUM_REPOS" ]; then
+            yum install -y --disablerepo="*" --enablerepo="$ZSTACK_YUM_REPOS" compat-openssl10 >> "$ZSTACK_INSTALL_LOG" 2>&1
+        else
+            yum install -y compat-openssl10 >> "$ZSTACK_INSTALL_LOG" 2>&1
+        fi || fail "install compat-openssl10 for fluent-bit failed."
+    fi
+
+    if [ ! -d "/var/lib/zstack" ]; then
+        mkdir -p /var/lib/zstack
+    fi
+
+    cp "/opt/zstack-dvd/$BASEARCH/$ZSTACK_RELEASE/fluent-bit.tar.gz" /var/lib/zstack/
+    tar -zxf /var/lib/zstack/fluent-bit.tar.gz -C /var/lib/zstack/ >> "$ZSTACK_INSTALL_LOG" 2>&1 \
+        || fail "Extracting the fluent-bit.tar.gz package failed."
+    rm -f /var/lib/zstack/fluent-bit.tar.gz
+    chown -R zstack:zstack /var/lib/zstack/fluent-bit
+    chmod -R 750 /var/lib/zstack/fluent-bit
+    if [ ! -x "/var/lib/zstack/fluent-bit/bin/fluent-bit" ]; then
+        fail "fluent-bit binary not found after extraction, tar package structure may have changed."
+    fi
+    if [ ! -f "/var/lib/zstack/fluent-bit/config/fluent-bit.conf.temp" ]; then
+        fail "fluent-bit config template not found after extraction, tar package structure may have changed."
+    fi
     pass
 }
 
@@ -4358,6 +4424,12 @@ download_zstack
 
 if [ x"$UPGRADE" = x'y' ]; then
 
+    # Fluent-bit must be prepared before upgrade_zstack because upgrade_zstack
+    # may start management node during the same phase.
+    if [ -z $ONLY_UPGRADE_CTL ]; then
+        install_fluentbit_server
+    fi
+
     #only upgrade zstack
     upgrade_zstack
 
@@ -4592,6 +4664,7 @@ fi
 install_zops
 install_or_upgrade_vops
 install_or_upgrade_zmigrate
+install_fluentbit_server
 
 echo ""
 echo_star_line
