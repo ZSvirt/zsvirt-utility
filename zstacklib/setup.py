@@ -40,7 +40,8 @@ Python support library for zstack""",
           "cachetools==3.1.1",
           "xxhash==2.0.2",
           "pillow==2.9.0",
-          "futures==3.4.0"
+          "futures==3.4.0",
+          "subprocess32==3.5.4"
       ],
       entry_points="""
       # -*- Entry points: -*-

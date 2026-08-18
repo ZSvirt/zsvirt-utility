@@ -51,3 +51,4 @@ setuptools==21.0.0
 Pillow==2.9.0
 grpcio==1.27.2
 protobuf==3.12.4
+subprocess32==3.5.4
