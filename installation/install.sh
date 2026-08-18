@@ -4424,6 +4424,12 @@ download_zstack
 
 if [ x"$UPGRADE" = x'y' ]; then
 
+    # Fluent-bit must be prepared before upgrade_zstack because upgrade_zstack
+    # may start management node during the same phase.
+    if [ -z $ONLY_UPGRADE_CTL ]; then
+        install_fluentbit_server
+    fi
+
     #only upgrade zstack
     upgrade_zstack
 
@@ -4432,7 +4438,6 @@ if [ x"$UPGRADE" = x'y' ]; then
         install_zops
         install_or_upgrade_vops
         install_or_upgrade_zmigrate
-        install_fluentbit_server
     fi
 
     #Setup audit.rules
