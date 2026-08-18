@@ -3307,13 +3307,22 @@ done
         check_virtfn_folder = '/sys/bus/pci/devices/%s/virtfn0/mdev_supported_types' % addr
         virt_function_dir_exits = os.path.isdir(check_virtfn_folder)
 
-        if not legacy_mdev_dir_exists and not virt_function_dir_exits:
-            return False
-
         # check if nvidia vgpu is supported by current device
         r, o, e = bash_roe("nvidia-smi vgpu -i %s -v -c" % addr)
         if r != 0:
-            return False
+            # SR-IOV backed vGPU cards (e.g. L20, RTX8000) report creatable types
+            # only after VFs are created. Fall back to supported-types query which
+            # works on the PF regardless of VF state. ZSTAC-67411 / ZSTAC-81403
+            r2, _, _ = bash_roe("nvidia-smi vgpu -i %s -s" % addr)
+            if r2 != 0:
+                return False
+            if legacy_mdev_dir_exists:
+                self._legacy_mdev(to)
+            elif virt_function_dir_exits:
+                self._virt_function(to)
+            else:
+                to.virtStatus = 'VFIO_MDEV_VIRTUALIZABLE'
+            return True
 
         for line in o.splitlines()[1:]:
             parts = line.split(':')
@@ -3327,9 +3336,15 @@ done
                 to.mdevSpecifications[-1][title] = content
 
         if legacy_mdev_dir_exists:
-            self._legacy_mdev(to)
+            rc, _, _ = bash_roe("nvidia-smi vgpu -i %s -c" % addr)
+            if rc != 0:
+                to.virtStatus = 'VFIO_MDEV_VIRTUALIZABLE'
+            else:
+                self._legacy_mdev(to)
         elif virt_function_dir_exits:
             self._virt_function(to)
+        else:
+            to.virtStatus = 'VFIO_MDEV_VIRTUALIZABLE'
 
         return True
 
