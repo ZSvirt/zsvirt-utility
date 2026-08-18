@@ -15,7 +15,7 @@ class TestFlushMpath(unittest.TestCase):
 
     def _capture(self):
         issued = []
-        bash.bash_roe = mock.Mock(side_effect=lambda cmd, *a, **k: issued.append(cmd))
+        bash.bash_roe = mock.Mock(side_effect=lambda cmd, *a, **k: issued.append(cmd) or (0, '', ''))
         return issued
 
     def test_lun_passthrough_vm_running_uses_targeted_recreate(self):
