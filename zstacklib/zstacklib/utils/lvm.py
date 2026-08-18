@@ -1653,36 +1653,36 @@ def discard_lv(path, discard_strategy, deadline=None):
         logger.debug("unknown discard strategy %s" % discard_strategy)
         return False
 
-    if not lv_exists(path):
-        return False
-
-    discard_max_bytes = get_lv_discard_max_bytes(path)
-    if discard_max_bytes == 0:
-        # not support block discard
-        return False
-
-    slow_discard = discard_max_bytes < PV_DISCARD_MIN_SIZE_IN_BYTES
-    if discard_strategy == LvDiscardStrategy.AUTO and slow_discard:
-        return False
-
-    with OperateLv(path):
-        if lv_in_use(path):
-            logger.warn("cannot discard lv because lv[%s] in use" % path)
+    try:
+        if not lv_exists(path):
             return False
 
-        try:
+        discard_max_bytes = get_lv_discard_max_bytes(path)
+        if discard_max_bytes == 0:
+            # not support block discard
+            return False
+
+        slow_discard = discard_max_bytes < PV_DISCARD_MIN_SIZE_IN_BYTES
+        if discard_strategy == LvDiscardStrategy.AUTO and slow_discard:
+            return False
+
+        with OperateLv(path):
+            if lv_in_use(path):
+                logger.warn("cannot discard lv because lv[%s] in use" % path)
+                return False
+
             step = min(max(get_lv_discard_max_bytes(path), PV_DISCARD_MIN_SIZE_IN_BYTES), PV_DISCARD_MAX_SIZE_IN_BYTES)
             discard_granularity = get_lv_discard_granularity(path)
             step = int(round_to(step, discard_granularity))
-            timeout = int(deadline - time.time()) if deadline else None
-            if timeout and timeout <= 120:
+            timeout = int(deadline - time.time()) if deadline is not None else None
+            if timeout is not None and timeout <= 120:
                 logger.debug("skip discard lv because timeout[%s] is too short" % timeout)
                 return False
 
             shell.call("%s blkdiscard %s --step %s" % ("timeout -s SIGKILL %s" % (timeout-120) if timeout else "", path, step))
-        except Exception as e:
-            logger.warn("discard lv %s exception: %s" % (path, str(e)))
-            return False
+    except Exception as e:
+        logger.warn("discard lv %s exception: %s" % (path, str(e)))
+        return False
 
     return True
 

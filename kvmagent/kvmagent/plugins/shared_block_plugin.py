@@ -949,7 +949,13 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         if cmd.folder:
             raise Exception("not support this operation")
 
-        self.do_delete_bits(cmd.path, discard=cmd.issueDiscards, deadline=get_deadline(cmd))
+        try:
+            deadline = get_deadline(cmd)
+        except Exception as e:
+            logger.warn("skip discard deadline for deleting bits because %s" % str(e))
+            deadline = 0
+
+        self.do_delete_bits(cmd.path, discard=cmd.issueDiscards, deadline=deadline)
 
         rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
         rsp.lunCapacities = lvm.get_lun_capacities_from_vg(cmd.vgUuid, self.vgs_path_and_wwid)
