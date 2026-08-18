@@ -19,7 +19,7 @@ from jinja2 import Template
 import os
 import traceback
 import netaddr
-import subprocess
+from zstacklib.utils.compat import subprocess
 import json
 
 CHECK_PHYSICAL_NETWORK_INTERFACE_PATH = '/network/checkphysicalnetworkinterface'

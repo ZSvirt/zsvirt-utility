@@ -46,11 +46,13 @@ from kvmagent import kvmagent
 from kvmagent.plugins.baremetal_v2_gateway_agent import \
     BaremetalV2GatewayAgentPlugin as BmV2GwAgent
 from kvmagent.plugins.bmv2_gateway_agent import utils as bm_utils
+from kvmagent.plugins import host_pushgateway
 from kvmagent.plugins.imagestore import ImageStoreClient
 from kvmagent.plugins.nvram import nvram
 from kvmagent.plugins.vms import vm_host_file, vm_host_file_monitor, tpm
 from zstacklib.utils import bash, plugin, iscsi, qemu_nbd
 from zstacklib.utils.bash import in_bash
+from zstacklib.utils import http
 from zstacklib.utils import lvm
 from zstacklib.utils import ft
 from zstacklib.utils import shell
@@ -8766,7 +8768,12 @@ class VmPlugin(kvmagent.KvmAgent):
                 if not result:
                     return
 
-                percent = min(99, 100.0 - result.__getitem__('remain') * 100.0 / result.__getitem__('total'))
+                total = result.__getitem__('total')
+                if total <= 0:
+                    logger.debug("skip blockCopy progress report because total is %s" % total)
+                    return
+
+                percent = min(99, 100.0 - result.__getitem__('remain') * 100.0 / total)
                 return get_exact_percent(percent, get_task_stage(task_spec))
 
             def _get_detail(self):
@@ -9488,10 +9495,15 @@ host side snapshot files chian:
     def unexport_nbd_volumes(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = kvmagent.AgentResponse()
+
+        @linux.retry(times=3, sleep_time=2)
+        def deactive_volume(path):
+            self.deactive_volume_if_need(path, False)
+
         for volume in cmd.volumes:
             real_path = self.get_cbt_volume_actual_install_path(volume.installPath)
             qemu_nbd.kill_nbd_process_by_flag(real_path)
-            self.deactive_volume_if_need(real_path, False)
+            deactive_volume(real_path)
 
         rsp.success = True
         return jsonobject.dumps(rsp)
@@ -9510,7 +9522,10 @@ host side snapshot files chian:
         volume_export_info = {}
         for volume in cmd.volumes:
             volume_export_info[volume.volumeUuid] = False
+            real_path = self.get_cbt_volume_actual_install_path(volume.installPath)
             if qemu_nbd.find_qemu_nbd_process(volume.installPath) == 0:
+                volume_export_info[volume.volumeUuid] = True
+            elif real_path != volume.installPath and qemu_nbd.find_qemu_nbd_process(real_path) == 0:
                 volume_export_info[volume.volumeUuid] = True
 
         rsp.volumeExportInfos = volume_export_info
@@ -10748,7 +10763,7 @@ host side snapshot files chian:
             if bind_addresses:
                 port = bind_addresses[0].split(':')[-1]
                 url = 'http://localhost:%s/metrics' % port
-                result = http.json_post(url, body=None, headers={'Content-Type':'text/plain'}, method='GET')
+                result = http.json_post(url, body=None, headers=host_pushgateway.make_get_metrics_headers(), method='GET')
                 lines = filter(lambda line:
                         line.startswith('push_time_seconds') and line.find(vm_uuid) >= 0,
                         result.split('\n'))
@@ -12616,7 +12631,7 @@ host side snapshot files chian:
                     break
             vm_uuid = dom.name()
             url = "http://localhost:%s/metrics/job/zwatch_vm_agent/vmUuid/%s" % (port, vm_uuid)
-            shell.run('curl -X DELETE ' + url)
+            http.json_post(url, body=None, headers=host_pushgateway.make_delete_metric_headers(), method='DELETE')
         except Exception as e:
             logger.warn("delete pushgateway metric when vm stoped failed: %s" % e.message)
 

@@ -12,6 +12,7 @@ from zstacklib.utils import log
 from zstacklib.utils import shell
 from zstacklib.utils import thread
 from zstacklib.utils.qga import VmQga
+from kvmagent.plugins import host_pushgateway
 from kvmagent.plugins import vm_plugin
 
 log.configure_log('/var/log/zstack/zstack-kvmagent.log')
@@ -319,9 +320,7 @@ def get_guest_tools_states(domains):
 def push_metrics_to_gateway(url, uuid, metrics):
     url = url + uuid
     metrics += "\n\n"
-    headers = {
-        "Content-Type": "application/json"
-    }
+    headers = host_pushgateway.make_push_metrics_headers()
     rsp = http.json_post(url, body=metrics, headers=headers)
     logger.debug('vm[%s] push metric with rsp[%s]' % (uuid, rsp))
 
@@ -370,4 +369,3 @@ def get_nic_info_for_windows_2008(uuid, qga):
     mac_to_ip_json = json.dumps(mac_to_ip, indent=4)
     logger.debug('vm[%s] get nic info all: [%s]' % (uuid, mac_to_ip_json))
     return mac_to_ip_json
-
