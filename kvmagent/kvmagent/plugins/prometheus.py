@@ -1327,6 +1327,16 @@ def _strip_partition_suffix(name):
         else re.sub(r'[0-9]$', '', name)
 
 
+def _nvme_controller_paths(head, sys_block_entries=None):
+    m = re.match(r'^(nvme\d+)(n\d+)$', head)
+    if m is None:
+        return []
+    pattern = re.compile(r'^%sc\d+%s$' % (re.escape(m.group(1)), re.escape(m.group(2))))
+    if sys_block_entries is None:
+        sys_block_entries = os.listdir("/sys/block")
+    return [d for d in sys_block_entries if pattern.match(d)]
+
+
 def _safe_get_device_from_path(ctx, devpath):
     try:
         return pyudev.Device.from_device_file(ctx, devpath)
@@ -1375,6 +1385,7 @@ def collect_node_disk_wwid():
 
     o = bash_o("pvs --nolocking -t --noheading -o pv_name,vg_name").strip().splitlines()
     context = pyudev.Context()
+    sys_block_entries = os.listdir("/sys/block")
 
     sblk_pv_vg = {}
     sblk_pv_identities = {}
@@ -1398,6 +1409,8 @@ def collect_node_disk_wwid():
                 wwid_label = ";".join(sorted(w.strip() for w in wwids))
                 metrics['node_disk_wwid'].add_metric([disk_name, wwid_label], 1)
                 sblk_pv_identities[disk_name] = wwid_label
+                for cpath in _nvme_controller_paths(disk_name, sys_block_entries):
+                    metrics['node_disk_wwid'].add_metric([cpath, wwid_label], 1)
 
             sblk_pv_vg[disk_name] = vg
 
@@ -1748,14 +1761,38 @@ def collect_disk_stat():
             if not self.mpath_generated:
                 self._generate_block_mpath_basic_info()
                 self.mpath_generated = True
+            dev = linux.read_file_strip("/sys/block/%s/dev" % dev_name)
+            if not dev:
+                return None
             block = BlockInfo()
             block.dev_name = dev_name
-            dev = linux.read_file("/sys/block/%s/dev" % block.dev_name).strip()
             block.status = self.dev_multipath_stat[dev].status if dev in self.dev_multipath_stat else "active"
-            block.state = self.dev_multipath_stat[dev].state if dev in self.dev_multipath_stat else \
-                linux.read_file("/sys/block/%s/device/state" % block.dev_name).strip()
+            block.state = self.dev_multipath_stat[dev].state if dev in self.dev_multipath_stat \
+                else self._read_block_state(dev_name)
             report_disk_state_abnormal_if_need(block)
             return block
+
+        def _read_block_state(self, dev_name):
+            state = linux.read_file_strip("/sys/block/%s/device/state" % dev_name)
+            if state:
+                return state
+            return self._read_nvme_controller_state(dev_name)
+
+        def _read_nvme_controller_state(self, dev_name):
+            device_dir = "/sys/block/%s/device" % dev_name
+            if not os.path.isdir(device_dir):
+                return None
+            states = []
+            for entry in os.listdir(device_dir):
+                if not re.match(r'^nvme\d+$', entry):
+                    continue
+                state = linux.read_file_strip("/sys/class/nvme/%s/state" % entry)
+                if state:
+                    states.append(state)
+            for healthy in ("live", "running"):
+                if healthy in states:
+                    return healthy
+            return states[0] if states else None
 
 
     metrics = {
@@ -1773,21 +1810,24 @@ def collect_disk_stat():
 
             dev_name = dev_name[0]
             block = generator.generate(dev_name)
+            if block is None:
+                continue
             metrics['disk_device_status'].add_metric([block.dev_name], float(block.convert_status_to_int()))
             metrics['disk_device_state'].add_metric([block.dev_name], float(block.convert_state_to_int()))
 
     def collect_nvme_disk_stat():
         if not os.path.exists("/sys/class/nvme"):
             return
-        for controller in filter(lambda c: os.path.isdir(os.path.join("/sys/class/nvme", c)), os.listdir("/sys/class/nvme")):
-            for device in filter(lambda d: d.startswith("nvme"), os.listdir("/sys/class/nvme/%s" % controller)):
-                wwid_path = os.path.join("/sys/class/nvme", controller, device, "wwid")
-                if not os.path.exists(wwid_path):
-                    continue
-
-                block = generator.generate(device)
-                metrics['disk_device_status'].add_metric([block.dev_name], float(block.convert_status_to_int()))
-                metrics['disk_device_state'].add_metric([block.dev_name], float(block.convert_state_to_int()))
+        blocks = os.listdir("/sys/block")
+        heads = [d for d in blocks if re.match(r'^nvme\d+n\d+$', d)]
+        if not heads:
+            return
+        for device in heads:
+            block = generator.generate(device)
+            if block is None:
+                continue
+            metrics['disk_device_status'].add_metric([block.dev_name], float(block.convert_status_to_int()))
+            metrics['disk_device_state'].add_metric([block.dev_name], float(block.convert_state_to_int()))
 
     generator = BlockInfoGenerator()
     collect_scsi_disk_stat()
@@ -2085,7 +2125,8 @@ LoadPlugin virt
   Disk "/^sd[a-z]{1,2}$/"
   Disk "/^hd[a-z]{1,2}$/"
   Disk "/^vd[a-z]{1,2}$/"
-  Disk "/^nvme[0-9][a-z][0-9]$/"
+  Disk "/^nvme[0-9]+n[0-9]+$/"
+  Disk "/^nvme[0-9]+c[0-9]+n[0-9]+$/"
   IgnoreSelected false
 </Plugin>
 
