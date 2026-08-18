@@ -948,20 +948,21 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         if cmd.folder:
             raise Exception("not support this operation")
 
-        self.do_delete_bits(cmd.path, discard=cmd.issueDiscards)
+        self.do_delete_bits(cmd.path, discard=cmd.issueDiscards, deadline=get_deadline(cmd))
 
         rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
         rsp.lunCapacities = lvm.get_lun_capacities_from_vg(cmd.vgUuid, self.vgs_path_and_wwid)
         return jsonobject.dumps(rsp)
 
-    def do_delete_bits(self, path, discard=lvm.LvDiscardStrategy.NEVER):
+    def do_delete_bits(self, path, discard=lvm.LvDiscardStrategy.NEVER, deadline=None):
         install_abs_path = translate_absolute_path_from_install_path(path)
         if lvm.has_lv_tag(install_abs_path, IMAGE_TAG):
             logger.info('deleting lv image: ' + install_abs_path)
             lvm.delete_image(install_abs_path, IMAGE_TAG)
         else:
             logger.info('deleting lv volume: ' + install_abs_path)
-            lvm.delete_lv(install_abs_path, discard=discard)
+            lvm.discard_lv(install_abs_path, discard, deadline=deadline)
+            lvm.delete_lv(install_abs_path)
 
     @staticmethod
     def get_total_required_size(abs_path):
