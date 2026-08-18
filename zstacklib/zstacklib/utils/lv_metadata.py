@@ -5,7 +5,13 @@ import logging
 import os
 import re
 import struct
+import threading
 import time
+
+try:
+    import Queue as queue
+except ImportError:
+    import queue
 
 try:
     string_types = basestring
@@ -30,6 +36,9 @@ from .lv_protocol import (
 from .vm_metadata_handler import VmMetadataHandler, VmMetadataScanEntry
 
 logger = logging.getLogger(__name__)
+
+SBLK_METADATA_SCAN_CONCURRENCY = 10
+_sblk_metadata_scan_lock = threading.Lock()
 
 
 # ###################################################################
@@ -209,8 +218,7 @@ class SblkMetadataHandler(VmMetadataHandler):
 
         metadata_lvs = scan_metadata_lvs(vg_uuid, _lv_list)
 
-        entries = []
-        for item in metadata_lvs:
+        def _scan_one(item):
             vm_uuid = item['vm_uuid']
             lv_path = item['lv_path']
             lv_size = item['lv_size']
@@ -233,10 +241,58 @@ class SblkMetadataHandler(VmMetadataHandler):
             except Exception as e:
                 logger.warn("failed to read metadata status for %s: %s", lv_path, e)
 
-            entries.append(entry)
+            return entry
+
+        with _sblk_metadata_scan_lock:
+            if len(metadata_lvs) <= 1:
+                entries = [_scan_one(item) for item in metadata_lvs]
+            else:
+                entries = self._do_scan_metadata_lvs_concurrently(
+                    metadata_lvs, _scan_one)
 
         logger.debug("scan_vm_metadata on vg %s: found %d metadata LVs, returned %d entries",
                      vg_uuid, len(metadata_lvs), len(entries))
+        return entries
+
+    def _do_scan_metadata_lvs_concurrently(self, metadata_lvs, scan_one):
+        entries = [None] * len(metadata_lvs)
+        work_queue = queue.Queue()
+        for index, item in enumerate(metadata_lvs):
+            work_queue.put((index, item))
+
+        errors = []
+        errors_lock = threading.Lock()
+
+        def _worker():
+            while True:
+                try:
+                    index, item = work_queue.get_nowait()
+                except queue.Empty:
+                    return
+
+                try:
+                    entries[index] = scan_one(item)
+                except Exception as e:
+                    with errors_lock:
+                        errors.append(e)
+
+        workers = []
+        worker_count = min(SBLK_METADATA_SCAN_CONCURRENCY,
+                           len(metadata_lvs))
+        for index in range(worker_count):
+            worker = threading.Thread(
+                target=_worker,
+                name="sblk-metadata-scan-%d" % index)
+            worker.daemon = True
+            worker.start()
+            workers.append(worker)
+
+        for worker in workers:
+            worker.join()
+
+        if errors:
+            raise errors[0]
+
         return entries
 
     def _do_cleanup(self, metadataPath):
@@ -476,23 +532,27 @@ def sblk_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix, normali
 # ###################################################################
 
 _libc = None
+_libc_lock = threading.Lock()
 
 
 def _get_libc():
     global _libc
     if _libc is None:
-        _libc = ctypes.CDLL('libc.so.6', use_errno=True)
-        _libc.pwrite.restype = ctypes.c_ssize_t
-        _libc.pwrite.argtypes = [ctypes.c_int, ctypes.c_void_p,
-                                 ctypes.c_size_t, ctypes.c_longlong]
-        _libc.pread.restype = ctypes.c_ssize_t
-        _libc.pread.argtypes = [ctypes.c_int, ctypes.c_void_p,
-                                ctypes.c_size_t, ctypes.c_longlong]
-        _libc.posix_memalign.restype = ctypes.c_int
-        _libc.posix_memalign.argtypes = [ctypes.POINTER(ctypes.c_void_p),
-                                         ctypes.c_size_t, ctypes.c_size_t]
-        _libc.free.restype = None
-        _libc.free.argtypes = [ctypes.c_void_p]
+        with _libc_lock:
+            if _libc is None:
+                libc = ctypes.CDLL('libc.so.6', use_errno=True)
+                libc.pwrite.restype = ctypes.c_ssize_t
+                libc.pwrite.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                        ctypes.c_size_t, ctypes.c_longlong]
+                libc.pread.restype = ctypes.c_ssize_t
+                libc.pread.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                       ctypes.c_size_t, ctypes.c_longlong]
+                libc.posix_memalign.restype = ctypes.c_int
+                libc.posix_memalign.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                                ctypes.c_size_t, ctypes.c_size_t]
+                libc.free.restype = None
+                libc.free.argtypes = [ctypes.c_void_p]
+                _libc = libc
     return _libc
 
 
