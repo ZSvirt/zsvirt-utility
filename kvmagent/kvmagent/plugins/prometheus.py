@@ -1319,6 +1319,20 @@ sblk_pv_identities = {}
 sblk_pv_state_fail_last_report_time = {}
 
 
+def _strip_partition_suffix(name):
+    return re.sub(r'p\d+$', '', name) if name.startswith("nvme") \
+        else re.sub(r'[0-9]$', '', name)
+
+
+def _safe_get_device_from_path(ctx, devpath):
+    try:
+        return pyudev.Device.from_device_file(ctx, devpath)
+    except Exception as e:
+        logger.warn("_safe_get_device_from_path: skip device %s due to udev error: %s"
+                    % (devpath, e))
+        return None
+
+
 def collect_node_disk_wwid():
 
     def get_physical_devices(pvpath, is_mpath):
@@ -1328,10 +1342,7 @@ def collect_node_disk_wwid():
         else:
             disks = [ os.path.basename(pvpath) ]
 
-        return ["/dev/%s" % re.sub('[0-9]$', '', s) for s in disks]
-
-    def get_device_from_path(ctx, devpath):
-        return pyudev.Device.from_device_file(ctx, devpath)
+        return ["/dev/%s" % _strip_partition_suffix(s) for s in disks]
 
     def get_disk_wwids(b):
         links = b.get('DEVLINKS')
@@ -1366,12 +1377,18 @@ def collect_node_disk_wwid():
     sblk_pv_identities = {}
     for line in o:
         pv, vg = line.strip().split()
-        dm_uuid = get_device_from_path(context, pv).get("DM_UUID", "")
+        pv_dev = _safe_get_device_from_path(context, pv)
+        if pv_dev is None:
+            continue
+        dm_uuid = pv_dev.get("DM_UUID", "")
         multipath_wwid = dm_uuid[6:] if dm_uuid.startswith("mpath-") else None
 
         for disk in get_physical_devices(pv, multipath_wwid):
             disk_name = os.path.basename(disk)
-            wwids = get_disk_wwids(get_device_from_path(context, disk))
+            disk_dev = _safe_get_device_from_path(context, disk)
+            if disk_dev is None:
+                continue
+            wwids = get_disk_wwids(disk_dev)
             if multipath_wwid is not None:
                 wwids.append(multipath_wwid)
             if len(wwids) > 0:
