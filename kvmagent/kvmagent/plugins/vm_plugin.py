@@ -4522,8 +4522,7 @@ class Vm(object):
             return
 
         try:
-            qmp.execute_qmp_command(vm_uuid,
-                                    '{ "execute": "blockdev-open-tray", "arguments":{"id": "%s"}}' % alias_name)
+            qmp.execute_qmp_command(vm_uuid, "blockdev-open-tray", id=alias_name)
         except Exception as err:
             logger.warning("failed to open tray for cdrom %s, error: %s" % (alias_name, err))
             return
