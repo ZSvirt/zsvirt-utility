@@ -147,5 +147,26 @@ class TestDiscardLv(unittest.TestCase):
             shell_call.assert_not_called()
 
 
+class TestCreateLv(unittest.TestCase):
+    def test_failed_concurrent_creator_does_not_zero_existing_lv(self):
+        lv_exists_results = iter([False, True])
+        dd_zero = CallRecorder()
+        deactive_lv = CallRecorder()
+
+        with MultiPatch(
+                AttributePatch(lvm, 'lv_exists', lambda path: next(lv_exists_results)),
+                AttributePatch(lvm, 'get_allocated_pvs', CallRecorder(return_value=[])),
+                AttributePatch(lvm, 'subcmd', CallRecorder(return_value='lvcreate')),
+                AttributePatch(lvm.bash, 'bash_roe',
+                               CallRecorder(return_value=(5, '', 'already exists'))),
+                AttributePatch(lvm, 'dd_zero', dd_zero),
+                AttributePatch(lvm, 'deactive_lv', deactive_lv)):
+            self.assertFalse(lvm.create_lv_from_absolute_path(
+                '/dev/test-vg/test-lv', 4096, lock=True, exact_size=True))
+
+        dd_zero.assert_not_called()
+        deactive_lv.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

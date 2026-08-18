@@ -13,6 +13,23 @@ class VmMetadataScanEntry(object):
         self.incomplete = incomplete
 
 
+class StaleMetadataGeneration(Exception):
+    pass
+
+
+def command_metadata_generation(cmd):
+    value = getattr(cmd, 'metadataGeneration', 0)
+    if value is None:
+        return 0
+    try:
+        generation = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("metadataGeneration must be a non-negative integer: %r" % value)
+    if generation < 0:
+        raise ValueError("metadataGeneration must be non-negative: %s" % generation)
+    return generation
+
+
 class VmMetadataHandler(object):
     def write(self, cmd):
         vmCategory = getattr(cmd, 'vmCategory', None)
@@ -25,6 +42,7 @@ class VmMetadataHandler(object):
             vmCategory=vmCategory if vmCategory is not None else '',
             architecture=getattr(cmd, 'architecture', None) or '',
             schemaVersion=schemaVersion if schemaVersion is not None else '',
+            metadataGeneration=command_metadata_generation(cmd),
         )
 
     def get(self, cmd):
@@ -38,7 +56,14 @@ class VmMetadataHandler(object):
         """Delete a VM's metadata.  Returns ``dict``."""
         return self._do_cleanup(cmd.metadataPath)
 
-    def _do_write(self, metadataPath, metadata, vmUuid, vmName, vmCategory, architecture, schemaVersion):
+    def cleanup_all(self, cmd):
+        """Delete all VM metadata under metadataDir.  Returns ``dict``."""
+        return self._do_cleanup_all(
+            cmd.metadataDir,
+            metadataGeneration=command_metadata_generation(cmd))
+
+    def _do_write(self, metadataPath, metadata, vmUuid, vmName, vmCategory,
+                  architecture, schemaVersion, metadataGeneration=0):
         raise NotImplementedError
 
     def _do_get(self, metadataPath):
@@ -50,4 +75,7 @@ class VmMetadataHandler(object):
         raise NotImplementedError
 
     def _do_cleanup(self, metadataPath):
+        raise NotImplementedError
+
+    def _do_cleanup_all(self, metadataDir, metadataGeneration=0):
         raise NotImplementedError

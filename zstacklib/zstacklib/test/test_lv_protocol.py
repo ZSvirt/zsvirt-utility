@@ -6,9 +6,11 @@ build/parse helpers and constants defined in lv_protocol.py.
 
 import hashlib
 import json
+import os
 import struct
+import threading
 from unittest import TestCase
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from zstacklib.utils.lv_protocol import (
     # constants
@@ -33,8 +35,9 @@ from zstacklib.utils.lv_metadata import (
     scan_metadata_lvs,
     _storage_topology_changed,
     get_metadata_status,
-    MetadataCapacityError,
+    MetadataCapacityError, MetadataIOError, SblkMetadataHandler,
 )
+from zstacklib.utils.vm_metadata_handler import StaleMetadataGeneration
 from zstacklib.utils.vm_metadata_handler import VmMetadataHandler
 
 
@@ -791,6 +794,207 @@ class TestScanMetadataLvs(TestCase):
         self.assertEqual(len(result), 0)
 
 
+class _FakeOperateLv(object):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
+class _FakeNamedLock(object):
+    _locks = {}
+    _locks_guard = threading.Lock()
+
+    def __init__(self, name):
+        with self._locks_guard:
+            self._lock = self._locks.setdefault(name, threading.RLock())
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._lock.release()
+        return False
+
+
+class _FakeLockModule(object):
+    NamedLock = _FakeNamedLock
+
+
+class _FakeGenerationLvm(object):
+    def __init__(self):
+        self.existing_lvs = set()
+
+    def lv_exists(self, path):
+        return path in self.existing_lvs
+
+    def create_lv_from_absolute_path(self, path, size, **kwargs):
+        self.existing_lvs.add(path)
+
+    def get_lv_size(self, path):
+        return INITIAL_LV_SIZE
+
+    def extend_lv(self, path, size):
+        return None
+
+    def delete_lv(self, path):
+        self.existing_lvs.remove(path)
+
+    def OperateLv(self, path, shared=False):
+        return _FakeOperateLv()
+
+
+class _FakeGenerationBash(object):
+    @staticmethod
+    def in_bash(func):
+        return func
+
+
+class _InMemoryGenerationSblkHandler(SblkMetadataHandler):
+    def __init__(self, lvm_module, bash_module):
+        super(_InMemoryGenerationSblkHandler, self).__init__(
+            lvm_module, bash_module, _FakeLockModule)
+        self.generation = 0
+
+    def _initialize_if_needed(self, metadata_path, lv_size):
+        return None
+
+    def _read_metadata_generation(self, fence_path):
+        return self.generation
+
+    def _write_metadata_generation(self, fence_path, generation):
+        self.generation = generation
+
+    def _lv_list_func(self, vg):
+        return [
+            (os.path.basename(path), path, INITIAL_LV_SIZE)
+            for path in self._lvm.existing_lvs
+        ]
+
+
+class TestSblkMetadataGeneration(TestCase):
+    def setUp(self):
+        self.lvm = _FakeGenerationLvm()
+        self.handler = _InMemoryGenerationSblkHandler(
+            self.lvm, _FakeGenerationBash())
+        self.vm_uuid = 'f8' * 16
+        self.metadata_path = '/dev/test-vg/%s_vmmeta' % self.vm_uuid
+
+    def _write(self, generation):
+        self.handler._do_write(
+            self.metadata_path,
+            '{"generation":%s}' % generation,
+            vmUuid=self.vm_uuid,
+            vmName='vm1',
+            vmCategory='',
+            architecture='x86_64',
+            schemaVersion='',
+            metadataGeneration=generation)
+
+    @patch('zstacklib.utils.lv_metadata.write_metadata')
+    def test_delayed_operations_are_fenced(self, _write_metadata):
+        self._write(1)
+
+        cleanup_cmd = type('CleanupCmd', (object,), {
+            'vgUuid': 'test-vg',
+            'metadataGeneration': 2,
+        })()
+        self.assertEqual({}, self.handler.cleanup_all(cleanup_cmd))
+        self.assertNotIn(self.metadata_path, self.lvm.existing_lvs)
+
+        self._write(3)
+        self.assertIn(self.metadata_path, self.lvm.existing_lvs)
+
+        self.assertEqual(
+            {'skipped': True, 'currentGeneration': 3},
+            self.handler.cleanup_all(cleanup_cmd))
+        self.assertIn(self.metadata_path, self.lvm.existing_lvs)
+
+        with self.assertRaises(StaleMetadataGeneration):
+            self._write(1)
+
+    @patch('zstacklib.utils.lv_metadata.write_metadata')
+    def test_cleanup_all_serializes_generation_with_write(self, _write_metadata):
+        self._write(1)
+        cleanup_cmd = type('CleanupCmd', (object,), {
+            'vgUuid': 'test-vg',
+            'metadataGeneration': 2,
+        })()
+        cleanup_entered = threading.Event()
+        release_cleanup = threading.Event()
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        errors = []
+        original_lv_list = self.handler._lv_list_func
+
+        def paused_lv_list(vg_uuid):
+            cleanup_entered.set()
+            if not release_cleanup.wait(5):
+                raise RuntimeError("timed out waiting to release cleanup")
+            return original_lv_list(vg_uuid)
+
+        def cleanup():
+            try:
+                self.handler.cleanup_all(cleanup_cmd)
+            except Exception as e:
+                errors.append(e)
+
+        def write():
+            writer_started.set()
+            try:
+                self._write(3)
+            except Exception as e:
+                errors.append(e)
+            finally:
+                writer_finished.set()
+
+        self.handler._lv_list_func = paused_lv_list
+        cleanup_thread = threading.Thread(target=cleanup)
+        writer_thread = threading.Thread(target=write)
+        try:
+            cleanup_thread.start()
+            self.assertTrue(cleanup_entered.wait(5))
+            writer_thread.start()
+            self.assertTrue(writer_started.wait(5))
+            self.assertFalse(
+                writer_finished.wait(0.2),
+                "metadata write entered while cleanup held the fence lock")
+        finally:
+            release_cleanup.set()
+            cleanup_thread.join(5)
+            writer_thread.join(5)
+            self.handler._lv_list_func = original_lv_list
+
+        self.assertFalse(cleanup_thread.is_alive())
+        self.assertFalse(writer_thread.is_alive())
+        self.assertEqual([], errors)
+        self.assertIn(self.metadata_path, self.lvm.existing_lvs)
+
+    @patch('zstacklib.utils.lv_metadata.read_metadata')
+    def test_uninitialized_fence_payload_starts_at_zero(self, read):
+        read.return_value = ReadResult(status=ReadStatus.OK, payload=b'{}')
+        self.lvm.existing_lvs.add('/dev/test-vg/zstack_vmmeta_generation')
+
+        self.assertEqual(
+            0,
+            SblkMetadataHandler(
+                self.lvm, _FakeGenerationBash())._read_metadata_generation(
+                    '/dev/test-vg/zstack_vmmeta_generation'))
+
+    @patch('zstacklib.utils.lv_metadata.read_metadata')
+    def test_corrupted_fence_payload_fails_closed(self, read):
+        read.return_value = ReadResult(
+            status=ReadStatus.CORRUPTED, error='corrupted')
+        self.lvm.existing_lvs.add('/dev/test-vg/zstack_vmmeta_generation')
+
+        with self.assertRaises(MetadataIOError):
+            SblkMetadataHandler(
+                self.lvm, _FakeGenerationBash())._read_metadata_generation(
+                    '/dev/test-vg/zstack_vmmeta_generation')
+
+
 # #############################################################################
 # TestVmMetadataHandlerWrite  (G1: vmCategory/schemaVersion None handling)
 # #############################################################################
@@ -812,12 +1016,14 @@ class TestVmMetadataHandlerWrite(TestCase):
         cmd.vmCategory = None
         cmd.architecture = 'x86_64'
         cmd.schemaVersion = None
+        cmd.metadataGeneration = 0
 
         captured = {}
 
         class _Stub(VmMetadataHandler):
             def _do_write(self, metadataPath, metadata, vmUuid, vmName,
-                          vmCategory, architecture, schemaVersion):
+                          vmCategory, architecture, schemaVersion,
+                          metadataGeneration=0):
                 captured['vmCategory'] = vmCategory
                 captured['schemaVersion'] = schemaVersion
 
@@ -840,12 +1046,14 @@ class TestVmMetadataHandlerWrite(TestCase):
         cmd = MagicMock(spec=[])
         cmd.metadataPath = '/tmp/' + 'a' * 32 + '.vmmeta'
         cmd.metadata = '{}'
+        cmd.metadataGeneration = 0
 
         captured = {}
 
         class _Stub(VmMetadataHandler):
             def _do_write(self, metadataPath, metadata, vmUuid, vmName,
-                          vmCategory, architecture, schemaVersion):
+                          vmCategory, architecture, schemaVersion,
+                          metadataGeneration=0):
                 captured['vmUuid'] = vmUuid
                 captured['vmName'] = vmName
                 captured['vmCategory'] = vmCategory
@@ -871,12 +1079,14 @@ class TestVmMetadataHandlerWrite(TestCase):
         cmd.vmCategory = 'AppCenter'
         cmd.architecture = 'x86_64'
         cmd.schemaVersion = '2'
+        cmd.metadataGeneration = 0
 
         captured = {}
 
         class _Stub(VmMetadataHandler):
             def _do_write(self, metadataPath, metadata, vmUuid, vmName,
-                          vmCategory, architecture, schemaVersion):
+                          vmCategory, architecture, schemaVersion,
+                          metadataGeneration=0):
                 captured['vmCategory'] = vmCategory
                 captured['schemaVersion'] = schemaVersion
 
@@ -896,12 +1106,14 @@ class TestVmMetadataHandlerWrite(TestCase):
         cmd.vmCategory = ''
         cmd.architecture = None
         cmd.schemaVersion = ''
+        cmd.metadataGeneration = 0
 
         captured = {}
 
         class _Stub(VmMetadataHandler):
             def _do_write(self, metadataPath, metadata, vmUuid, vmName,
-                          vmCategory, architecture, schemaVersion):
+                          vmCategory, architecture, schemaVersion,
+                          metadataGeneration=0):
                 captured['vmUuid'] = vmUuid
                 captured['vmName'] = vmName
                 captured['architecture'] = architecture

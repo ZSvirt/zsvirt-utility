@@ -5,7 +5,16 @@ import re
 import threading
 
 from zstacklib.utils import lock
-from zstacklib.utils.vm_metadata_handler import VmMetadataHandler, VmMetadataScanEntry
+from zstacklib.utils.vm_metadata_handler import (
+    StaleMetadataGeneration,
+    VmMetadataHandler,
+    VmMetadataScanEntry,
+)
+
+try:
+    string_types = basestring  # noqa
+except NameError:
+    string_types = str
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +22,8 @@ logger = logging.getLogger(__name__)
 # agent detects metadata files by this suffix; all paths are MN-issued
 _METADATA_SUFFIX = '.vmmeta'
 _UUID_HEX_RE = re.compile(r'^[0-9a-f]{32}$')
+_GENERATION_LOCK_FILE = '.vmmeta-generation.lock'
+_GENERATION_STATE_FILE = '.vmmeta-generation'
 
 
 def _fsync_directory(file_path):
@@ -29,6 +40,32 @@ def _ensure_bytes(data):
     if isinstance(data, bytes):
         return data
     return data.encode('utf-8')
+
+
+def _read_metadata_generation(path):
+    if not os.path.exists(path):
+        return 0
+    with open(path, 'r') as generation_file:
+        value = generation_file.read().strip()
+    try:
+        generation = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("invalid metadata generation state in %s: %r" % (path, value))
+    if generation < 0:
+        raise ValueError("metadata generation state must be non-negative in %s: %s" %
+                         (path, generation))
+    return generation
+
+
+def _write_metadata_generation(path, generation):
+    tmp_path = path + '.tmp'
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'wb') as generation_file:
+        generation_file.write(_ensure_bytes(str(generation)))
+        generation_file.flush()
+        os.fsync(generation_file.fileno())
+    os.rename(tmp_path, path)
+    _fsync_directory(path)
 
 
 class _RefCountedLock(object):
@@ -122,59 +159,78 @@ class FileBasedMetadataHandler(VmMetadataHandler):
             logger.debug("evicted %d idle path locks (remaining %d)",
                          len(to_remove), len(self._lock_map))
 
-    def _do_write(self, metadataPath, metadata, vmUuid, vmName, vmCategory, architecture, schemaVersion):
+    def _do_write(self, metadataPath, metadata, vmUuid, vmName, vmCategory,
+                  architecture, schemaVersion, metadataGeneration=0):
         _validate_metadata_path(metadataPath)
         path_vm_uuid = os.path.basename(metadataPath)[:-len(_METADATA_SUFFIX)]
         if vmUuid and vmUuid != path_vm_uuid:
             raise ValueError("vmUuid[%s] does not match metadataPath[%s]" % (vmUuid, metadataPath))
-        with self._get_path_lock(metadataPath):
-            dir_path = os.path.dirname(metadataPath)
-            created_dir = False
-            if not os.path.isdir(dir_path):
-                try:
-                    os.makedirs(dir_path, 0o700)
-                    os.chmod(dir_path, 0o700)
-                    created_dir = True
-                except OSError:
-                    if not os.path.isdir(dir_path):
-                        raise
-            if created_dir:
-                _fsync_directory(dir_path)
-
-            metadata_tmp = metadataPath + ".tmp"
-            fd = os.open(metadata_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        dir_path = os.path.dirname(metadataPath)
+        created_dir = False
+        if not os.path.isdir(dir_path):
             try:
-                with os.fdopen(fd, 'wb') as f:
-                    f.write(_ensure_bytes(metadata))
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception:
-                # fd is consumed by os.fdopen even on failure
-                raise
-            os.rename(metadata_tmp, metadataPath)
-            _fsync_directory(metadataPath)
+                os.makedirs(dir_path, 0o700)
+                os.chmod(dir_path, 0o700)
+                created_dir = True
+            except OSError:
+                if not os.path.isdir(dir_path):
+                    raise
+        if created_dir:
+            _fsync_directory(dir_path)
 
-            summary_path = metadataPath + ".summary"
-            summary_vm_uuid = vmUuid or path_vm_uuid
-            if summary_vm_uuid:
-                _write_summary_best_effort(
-                    summary_path, summary_vm_uuid,
-                    vm_name=vmName,
-                    vm_category=vmCategory,
-                    architecture=architecture,
-                    schema_version=schemaVersion,
-                )
-            else:
-                # No vmUuid: remove stale summary to avoid scan() returning outdated info
-                try:
-                    if os.path.exists(summary_path):
-                        os.remove(summary_path)
-                        _fsync_directory(summary_path)
-                except Exception as e:
-                    logger.warn("failed to remove stale summary %s: %s", summary_path, e)
+        generation_state_path = os.path.join(dir_path, _GENERATION_STATE_FILE)
+        generation_lock_path = os.path.realpath(
+            os.path.join(dir_path, _GENERATION_LOCK_FILE))
+        with lock.NamedLock(generation_lock_path):
+            with lock.FileLock(generation_lock_path):
+                current_generation = _read_metadata_generation(generation_state_path)
+                if metadataGeneration < current_generation:
+                    raise StaleMetadataGeneration(
+                        "metadata write generation %s is older than storage generation %s for %s" %
+                        (metadataGeneration, current_generation, metadataPath))
+                if metadataGeneration > current_generation:
+                    _write_metadata_generation(generation_state_path, metadataGeneration)
 
-            logger.debug("successfully wrote vm metadata to %s", metadataPath)
-            return {}
+                with self._get_path_lock(metadataPath):
+                    self._write_metadata_file(
+                        metadataPath, metadata, vmUuid, vmName, vmCategory,
+                        architecture, schemaVersion, path_vm_uuid)
+        return {}
+
+    def _write_metadata_file(self, metadataPath, metadata, vmUuid, vmName,
+                             vmCategory, architecture, schemaVersion, path_vm_uuid):
+        metadata_tmp = metadataPath + ".tmp"
+        fd = os.open(metadata_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(_ensure_bytes(metadata))
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            # fd is consumed by os.fdopen even on failure
+            raise
+        os.rename(metadata_tmp, metadataPath)
+        _fsync_directory(metadataPath)
+
+        summary_path = metadataPath + ".summary"
+        summary_vm_uuid = vmUuid or path_vm_uuid
+        if summary_vm_uuid:
+            _write_summary_best_effort(
+                summary_path, summary_vm_uuid,
+                vm_name=vmName,
+                vm_category=vmCategory,
+                architecture=architecture,
+                schema_version=schemaVersion,
+            )
+        else:
+            try:
+                if os.path.exists(summary_path):
+                    os.remove(summary_path)
+                    _fsync_directory(summary_path)
+            except Exception as e:
+                logger.warn("failed to remove stale summary %s: %s", summary_path, e)
+
+        logger.debug("successfully wrote vm metadata to %s", metadataPath)
 
     def _do_get(self, metadataPath):
         _validate_metadata_path(metadataPath)
@@ -273,6 +329,82 @@ class FileBasedMetadataHandler(VmMetadataHandler):
 
             logger.debug("cleanup_vm_metadata: cleaned %s", metadataPath)
 
+        return {}
+
+    def _do_cleanup_all(self, metadataDir, metadataGeneration=0):
+        if not metadataDir or not isinstance(metadataDir, string_types):
+            return {'error': "invalid metadataDir: %r" % metadataDir}
+        if not os.path.isabs(metadataDir):
+            return {'error': "metadataDir must be an absolute path: %s" % metadataDir}
+        if not os.path.isdir(metadataDir):
+            try:
+                os.makedirs(metadataDir, 0o700)
+                os.chmod(metadataDir, 0o700)
+                _fsync_directory(metadataDir)
+            except OSError:
+                if not os.path.isdir(metadataDir):
+                    raise
+
+        generation_state_path = os.path.join(metadataDir, _GENERATION_STATE_FILE)
+        generation_lock_path = os.path.realpath(
+            os.path.join(metadataDir, _GENERATION_LOCK_FILE))
+        with lock.NamedLock(generation_lock_path):
+            with lock.FileLock(generation_lock_path):
+                current_generation = _read_metadata_generation(generation_state_path)
+                if metadataGeneration < current_generation:
+                    logger.warn("skipping stale cleanup generation %s; storage generation is %s for %s",
+                                metadataGeneration, current_generation, metadataDir)
+                    return {
+                        'skipped': True,
+                        'currentGeneration': current_generation,
+                    }
+                if metadataGeneration > current_generation:
+                    _write_metadata_generation(generation_state_path, metadataGeneration)
+                return self._cleanup_all_metadata_files(metadataDir)
+
+    def _cleanup_all_metadata_files(self, metadataDir):
+        meta_name_re = re.compile(r'^[0-9a-f]{32}\.vmmeta(?:\.tmp|\.summary|\.summary\.tmp)?$')
+        try:
+            names = os.listdir(metadataDir)
+        except Exception as e:
+            logger.warn("listdir failed for %s: %s", metadataDir, e)
+            return {'error': "listdir failed for %s: %s" % (metadataDir, e)}
+
+        metadata_paths = set()
+        for fname in names:
+            if not meta_name_re.match(fname):
+                continue
+            base_name = fname
+            for suffix in ('.summary.tmp', '.summary', '.tmp'):
+                if base_name.endswith(suffix):
+                    base_name = base_name[:-len(suffix)]
+                    break
+            metadata_paths.add(os.path.join(metadataDir, base_name))
+
+        removed_any = False
+        failures = []
+        for metadataPath in sorted(metadata_paths):
+            with self._get_path_lock(metadataPath):
+                for path in [metadataPath, metadataPath + '.tmp',
+                             metadataPath + '.summary', metadataPath + '.summary.tmp']:
+                    try:
+                        if os.path.isfile(path):
+                            os.remove(path)
+                            removed_any = True
+                    except Exception as e:
+                        logger.warn("failed to remove metadata file %s: %s", path, e)
+                        failures.append("%s: %s" % (path, e))
+
+        if removed_any:
+            try:
+                _fsync_directory(os.path.join(metadataDir, '.cleanupall'))
+            except Exception as e:
+                logger.warn("fsync of %s failed: %s", metadataDir, e)
+                failures.append("fsync of %s: %s" % (metadataDir, e))
+
+        if failures:
+            return {'error': "failed to cleanup %d metadata file(s) under %s: %s" %
+                             (len(failures), metadataDir, "; ".join(failures))}
         return {}
 
 

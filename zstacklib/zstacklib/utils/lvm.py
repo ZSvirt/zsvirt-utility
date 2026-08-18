@@ -1394,6 +1394,11 @@ def create_lv_from_absolute_path(path, size, tag="zs::sharedblock::volume", lock
     r, o, e = bash.bash_roe("%s -ay --wipesignatures y -y --addtag %s --size %sb --name %s %s %s" %
                          (subcmd("lvcreate"), tag, size, lvName, vgName, pe_range))
 
+    if r != 0:
+        if lv_exists(path):
+            return False
+        raise Exception("failed to create lv %s, lvcreate return: %s, %s, %s" % (path, r, o, e))
+
     if not lv_exists(path):
         raise Exception("can not find lv %s after create, lvcreate return: %s, %s, %s" % (path, r, o, e))
 
