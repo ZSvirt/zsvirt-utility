@@ -108,8 +108,8 @@ class VmQga(object):
     VM_OS_LINUX_ALMALINUX = "almalinux"
     VM_OS_WINDOWS = "mswindows"
 
-    ZS_TOOLS_PATN_WIN = "C:\Program Files\GuestTools\zs-tools\zs-tools.exe"
-    ZS_TOOLS_VERSION_PATN_WIN = "C:\Program Files\Common Files\GuestTools\VERSION"
+    ZS_TOOLS_PATN_WIN = r"C:\Program Files\GuestTools\zs-tools\zs-tools.exe"
+    ZS_TOOLS_VERSION_PATN_WIN = r"C:\Program Files\Common Files\GuestTools\VERSION"
 
     def __init__(self, domain):
         self.domain = domain
@@ -189,6 +189,47 @@ class VmQga(object):
 
     def guest_exec(self, args):
         return self.call_qga_command("guest-exec", args=args)
+
+    def guest_exec_program(self, path, args=None, output=True, wait=qga_exec_wait_interval, retry=qga_exec_wait_retry):
+        if args is None:
+            args = []
+        ret = self.guest_exec(
+            {"path": path, "arg": args, "capture-output": output})
+        if ret and "pid" in ret:
+            pid = ret["pid"]
+        else:
+            raise Exception('qga exec program {} failed for vm {}'.format(path, self.vm_uuid))
+
+        if not output:
+            logger.warn("run qga program: {} failed, no output".format(path))
+            return 0, None
+
+        ret = None
+        for i in range(retry):
+            time.sleep(wait)
+            ret = self.guest_exec_status(pid)
+            if ret['exited']:
+                break
+
+        if not ret or not ret.get('exited'):
+            raise Exception('qga exec program {} timeout for vm {}'.format(path, self.vm_uuid))
+
+        exit_code = ret.get('exitcode')
+        ret_data = None
+        if 'out-data' in ret:
+            ret_data = decode_with_fallback(ret['out-data'])
+        elif 'err-data' in ret:
+            ret_data = decode_with_fallback(ret['err-data'])
+
+        return exit_code, ret_data
+
+    def guest_exec_program_no_exitcode(self, path, args=None, exception=True, output=True):
+        exitcode, ret_data = self.guest_exec_program(path, args, output)
+        if exitcode != 0:
+            if exception:
+                raise Exception('program {}, args {}, exitcode {}, ret {}'.format(path, args, exitcode, ret_data))
+            return None
+        return ret_data
 
     def guest_exec_bash_no_exitcode(self, cmd, exception=True, output=True):
         exitcode, ret_data = self.guest_exec_bash(cmd, output)
@@ -352,7 +393,7 @@ class VmQga(object):
         cmd = "& '{}'".format("' '".join([part for part in cmd_parts]))
 
         ret = self.guest_exec(
-            {"path": "powershell.exe", "arg": ["-ExecutionPolicy", "Bypass", "-Command", cmd], "capture-output": output})
+            {"path": "powershell.exe", "arg": ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd], "capture-output": output})
         if ret and "pid" in ret:
             pid = ret["pid"]
         else:

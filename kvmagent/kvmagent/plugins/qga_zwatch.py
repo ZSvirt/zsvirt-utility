@@ -18,6 +18,32 @@ from kvmagent.plugins import vm_plugin
 log.configure_log('/var/log/zstack/zstack-kvmagent.log')
 logger = log.get_logger(__name__)
 
+# zs-tools nic-info lock-busy sentinel (must not equal real empty map "{}")
+NIC_INFO_SKIP_KEY = '__zs_nic_info_skip__'
+NIC_INFO_SKIP_LOCK_BUSY = 'lock-busy'
+NIC_INFO_SKIP_LOCK_BUSY_JSON = '{"__zs_nic_info_skip__":"lock-busy"}'
+
+
+def is_nic_info_skip(nic_info):
+    """Return True if stdout is zs-tools lock-busy skip, not a real nic snapshot.
+
+    Must run before updating vm_nic_info / send_nic_info_to_mn / PowerShell fallback.
+    """
+    if nic_info is None:
+        return False
+    # Normalize Windows CRLF / incidental whitespace from guest_exec stdout.
+    text = str(nic_info).replace('\r\n', '\n').replace('\r', '\n').strip()
+    if not text or NIC_INFO_SKIP_KEY not in text:
+        return False
+    try:
+        obj = json.loads(text)
+    except Exception:
+        return text == NIC_INFO_SKIP_LOCK_BUSY_JSON
+    if not isinstance(obj, dict):
+        return False
+    # Only the dedicated skip marker; never treat a real empty map "{}" as skip.
+    return obj.get(NIC_INFO_SKIP_KEY) == NIC_INFO_SKIP_LOCK_BUSY and len(obj) == 1
+
 
 class AgentRsp(object):
     def __init__(self):
@@ -41,6 +67,7 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
     WIN_ZWATCH_VM_INFO_PATH = WIN_ZWATCH_BASE_PATH + "\\" + "vm.info"
     WIN_ZWATCH_VM_METRIC_PATH = WIN_ZWATCH_BASE_PATH + "\\" + "vm_metrics.prom"
     WIN_ZWATCH_GET_NIC_INFO_PATH = WIN_ZWATCH_BASE_PATH + "\\" + "zs-tools\\nic_info_win.ps1"
+    WIN_ZWATCH_GET_NIC_INFO_EXE_PATH = WIN_ZWATCH_BASE_PATH + "\\" + "zs-tools\\zs-tools.exe"
 
     PROMETHEUS_PUSHGATEWAY_URL = "http://127.0.0.1:9092/metrics/job/zwatch_vm_agent/vmUuid/"
 
@@ -57,6 +84,8 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
         self.tools_state = {}
         self.running_vm_lock = threading.Lock()
         self.zwatch_qga_lock = threading.Lock()
+        self.vm_nic_inflight = set()
+        self.vm_nic_inflight_lock = threading.Lock()
 
     def configure(self, config):
         self.config = config
@@ -117,19 +146,43 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
 
     @thread.AsyncThread
     def qga_get_vm_nic(self, uuid, qga):
+        with self.vm_nic_inflight_lock:
+            if uuid in self.vm_nic_inflight:
+                logger.debug('vm[%s] nic info collection still in flight, skip this round' % uuid)
+                return
+            self.vm_nic_inflight.add(uuid)
         try:
             if qga.os and 'mswindows' in qga.os:
                 zwatch_nic_info_path = self.WIN_ZWATCH_GET_NIC_INFO_PATH
             else:
                 zwatch_nic_info_path = self.ZWATCH_GET_NIC_INFO_PATH
             nicInfoStatus = qga.guest_file_is_exist(zwatch_nic_info_path)
+            if qga.os and 'mswindows' in qga.os:
+                nicInfoStatus = nicInfoStatus or qga.guest_file_is_exist(self.WIN_ZWATCH_GET_NIC_INFO_EXE_PATH)
             if not nicInfoStatus:
                 return
             if is_windows_2008(qga):
                 nicInfo = get_nic_info_for_windows_2008(uuid, qga)
+            elif qga.os and 'mswindows' in qga.os:
+                nicInfo = None
+                if qga.guest_file_is_exist(self.WIN_ZWATCH_GET_NIC_INFO_EXE_PATH):
+                    try:
+                        nicInfo = qga.guest_exec_program_no_exitcode(
+                            self.WIN_ZWATCH_GET_NIC_INFO_EXE_PATH, ['nic-info'])
+                    except Exception as e:
+                        logger.debug('vm[%s] read nic info by zs-tools.exe failed, fallback to powershell script due to [%s]' % (uuid, str(e)))
+                # Lock-busy skip must not fall back to PowerShell or clear MN cache.
+                if nicInfo is not None and is_nic_info_skip(nicInfo):
+                    logger.debug('vm[%s] nic info skipped: zs-tools lock busy' % uuid)
+                    return
+                if nicInfo is None:
+                    nicInfo = qga.guest_exec_cmd_no_exitcode(zwatch_nic_info_path)
             else:
                 nicInfo = qga.guest_exec_cmd_no_exitcode(zwatch_nic_info_path)
             nicInfo = str(nicInfo).strip()
+            if is_nic_info_skip(nicInfo):
+                logger.debug('vm[%s] nic info skipped: zs-tools lock busy' % uuid)
+                return
             need_update = False
             if not self.vm_nic_info.get(uuid):
                 need_update = True
@@ -141,6 +194,9 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
         except Exception as e:
             logger.debug('vm[%s] read nic info by qga failed due to [%s]' % (uuid, str(e)))
             return
+        finally:
+            with self.vm_nic_inflight_lock:
+                self.vm_nic_inflight.discard(uuid)
 
     @thread.AsyncThread
     def zwatch_qga_monitor_vm(self, uuid, qga):
