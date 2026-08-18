@@ -46,8 +46,10 @@ apply_resource_settings() {
 	fi
 	
 	# try to avoid 'hung_task_timeout_secs' issue
-	sysctl -w vm.dirty_ratio=10 > /dev/null
-	sysctl -w vm.dirty_background_ratio=5 > /dev/null
+	if lsblk -o NAME,ROTA,TYPE 2>/dev/null | awk '$3 == "disk" {print $2}' | grep -q "1"; then
+		sysctl -w vm.dirty_ratio=10 > /dev/null
+		sysctl -w vm.dirty_background_ratio=5 > /dev/null
+	fi
 
 	echo 0 > /sys/kernel/mm/ksm/merge_across_nodes || true
 
