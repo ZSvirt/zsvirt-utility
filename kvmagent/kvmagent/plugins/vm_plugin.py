@@ -7163,7 +7163,7 @@ def vm_block_job_cancel(vm):
                 return
             for job_id in job_ids:
                 qmp.block_job_cancel(vm, job_id)
-        except libvirt.libvirtError as e:
+        except Exception as e:
             logger.debug('failed to cancel vm[uuid:%s] block copy, details is %s' % (vm, e))
             return
         time.sleep(interval)
@@ -7181,7 +7181,7 @@ def vm_block_job_yank(vm):
             if not qmp.get_block_job_ids(vm):
                 logger.debug("Block job successfully cancelled.")
                 return
-        except libvirt.libvirtError as e:
+        except Exception as e:
             logger.debug('failed to force cancel vm[uuid:%s] block copy, details is %s' % (vm, e))
             return
         time.sleep(interval)
