@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="zstack-testagent builder" basedir="../">
+    <property name="testagent.bdir" location="${woodpecker.dir}/zstacktestagent-dist" />
+    <property name="testagent.tar.dir" location="${woodpecker.dir}/zstacktestagent/" />
+    <property name="testagent.tar.file" location="${woodpecker.dir}/zstacktestagent.tar.bz" />
+
+    <target name="build-testagent" depends="build-zstacklib">
+        <makeDir dir="${testagent.bdir}" />
+
+        <checkProperty property="testagent.source" />
+        <checkProperty property="testagent.serviceFile" />
+        <checkFile file="${testagent.source}" />
+        <checkFile file="${testagent.source}/setup.py" />
+        <checkFile file="${testagent.serviceFile}" />
+
+        <delete dir="${testagent.source}/dist" />
+
+        <exec executable="python" dir="${testagent.source}" failonerror="true">
+            <arg value="setup.py" />
+            <arg value="sdist" />
+        </exec>
+
+        <copy todir="${testagent.bdir}/">
+            <fileset dir="${testagent.source}/">
+                <exclude name="**/*~" />
+                <include name="ansible/**/*" />
+                <include name="dist/*.tar.gz" />
+            </fileset>
+        </copy>
+    </target>
+
+    <target name="assemble-testagent">
+        <checkProperty property="zstackCommons.source" />
+        <checkFile file="${zstackCommons.source}" />
+
+        <makeDir dir="${testagent.tar.dir}" />
+
+        <copy file="${testagent.serviceFile}" todir="${testagent.tar.dir}" />
+
+        <copy todir="${testagent.tar.dir}">
+            <fileset dir="${testagent.bdir}/ansible">
+                <include name="**/*" />
+            </fileset>
+            <fileset dir="${testagent.bdir}/dist">
+                <include name="**/*" />
+            </fileset>
+        </copy>
+
+        <copy todir="${testagent.tar.dir}" >
+            <fileset dir="${zstacklib.bdir}/ansible" >
+                <include name="**/*" />
+            </fileset>
+            <fileset dir="${zstacklib.bdir}/dist" >
+                <include name="**/*" />
+            </fileset>
+        </copy>
+
+        <!--
+        <tar destfile="${testagent.tar.file}" basedir="${testagent.tar.dir}" compression="gzip">
+            -->
+        <exec executable="cp" dir="${testagent.tar.dir}" failonerror="true">
+            <arg value="-a" />
+            <arg value="${pypi.source.folder}" />
+            <arg value="./" />
+        </exec>
+
+        <exec executable="tar" dir="${woodpecker.dir}" failonerror="true">
+            <arg value="jcf" />
+            <arg value="${testagent.tar.file}" />
+            <arg value="zstacktestagent" />
+        </exec>
+
+        <echo message="successfully build zstack-testagent package at ${testagent.tar.file}" />
+    </target>
+
+    <target name="package-testagent" depends="build-testagent, assemble-testagent" />
+</project>

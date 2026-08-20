@@ -1,0 +1,468 @@
+= 如何贡献文档
+:imagesdir: ../../images/
+
+本节将介绍：
+
+ * `zstack-utility` 的文档架构
+ * 通过 `PyCharm` 编写文档的技巧
+ * 通过 `Visual Studio Code` 编写文档的技巧
+ * 通过 `PyCharm` 编写文档的技巧
+
+本节不会介绍：
+
+ * AsciiDoc 的语法
+ * PlantUML、Graphviz、Ditaa 等图形语言的语法
+
+//[frame=none]
+//[grid=none]
+//[%noheader]
+//[cols="10,~a"]
+//|===
+//|✅| `zstack-utility` 的文档架构
+//|✅| 通过 `PyCharm` 编写文档的技巧
+//|✅| 通过 `Visual Studio Code` 编写文档的技巧
+//|❎| 通过 `PyCharm` 编写文档的技巧
+//|===
+//
+//本节不会介绍：
+//
+//[frame=none]
+//[grid=none]
+//[%noheader]
+//[cols="10,~a"]
+//|===
+//|❎| AsciiDoc 的语法
+//|❎| PlantUML、Graphviz、Ditaa 等图形语言的语法
+//|===
+
+
+_关于 asciidoc 和 antora 的更多内容，可以参考 asciidoc 和 antora 的官方文档，以及 ZStack 开发者手册，_
+
+== 文档结构
+
+zstack-utility 当前的文档结构为：
+
+[source#zstack_utility_tree, bash]
+.zstack-utlity 的文档目录结构
+----
+📒 zstack-utility/
+└──📂 docs/  <1>
+    ├──📄 antora.yml  <2>
+    └──📂 modules/  <3>
+        ├──📂 ROOT/  <4>
+        │   ├──📄 nav.adoc  <5>
+        │   ├──📂 pages/  <6>
+        │   │   ├──📄 index.adoc  <7>
+        │   │   └──📄 contribute.adoc  <8>
+        │   └─📂 images  <9>
+        │       └──📄 image1.jpg  <10>
+        ├──📂 module1/  <11>
+        │   ├──📄 nav.adoc  <12>
+        │   ├──📂 pages/  <13>
+        │   │   ├──📄 index.adoc <14>
+        │   │   └──📄 contribute.adoc <15>
+        │   │   └──📄 function1.adoc  <16>
+        │   │   └──📄 function2.adoc
+        │   │   └──📂 function3/  <17>
+        │   │       └──📄 subfunction1.adoc
+        │   │       └──📄 subfunction2.adoc
+        │   ├──📂 examples/  <18>
+        │   │   └──🔗 soft_link to code folder  <19>
+        │   │   └──📄 example1.ext
+        │   └──📂 images/
+        │       └──📄 image1.jpg
+        └──📂 module2
+----
+<1> 文档的顶级目录，专门创建目录将文档和代码做区分，结构更加清晰一些
+<2> `antora.yml` 用来定义整个文档的主要架构和属性
+<3> `modules` 为 antora 定义的目录名，不可更改
+<4> `ROOT` 为 antora 定义的特殊目录名，可以理解为整个文档库的最顶层只用来放与整个 zstack-utility 通用的内容
+<5> `ROOT/nav.adoc` 定义了 `ROOT` 目录下文件的层级关系，最终被应用到生成网站的外层目录结构上
+<6> `pages` 为 antora 一般约定俗成的目录名，放置具体的文档
+<7> `index.adoc` 为 antora 一般约定俗成的“介绍页”，在本项目中用来介绍 `zstack-utility` 的整体架构和通用内容
+<8> `contribute.adoc` 为 ZStack 一般约定俗成的“开发指南”，因为在 `ROOT` 目录下，因此这里只介绍对整个 zstack-utility 都通用的开发指南，因此不包含各个非常的具体的业务
+<9> `images` 为 antora 约定俗成的放置图片附件的目录，图片放在这里可以很方便的引用
+<10> `image1.jpg` 为存放的图片附件，可以在文档正文中引用
+<11> `module1` 代指正式的一些业务模块，例如 `doc/modules/zstackctl`、`doc/modules/zstackcli`、`doc/modules/kvmagent` 等
+<12> `module1/nav.adoc` 定义了 `module1` 目录下文件的层级关系，最终被应用到生成网站的外层目录结构上
+<13> `module1/pages` 放置和 `module1` 相关的具体文档
+<14> `module1/index.adoc` 应当描述 `module1` 整体的设计、功能和架构，例如 xref:zstackctl:index.adoc[]
+<15> `module1/contribute.adoc` 应当描述 `module1` 整体的开发指南，例如 xref:zstackctl:contribute.adoc[]
+<16> `function1.adoc` 放置一个功能的描述，或者一个代码文件的描述，例如 xref:zstackctl:set_deployment.adoc[]
+<17> 对于复杂的功能，例如 `kvmagent/ha_plugin.py` 可以再创建一个目录，将功能做拆分进行描述，因此有了 xref:kvmagent:ha_plugin/index.adoc[]、xref:kvmagent:ha_plugin/sharedblock.adoc[]、xref:kvmagent:ha_plugin/ceph.adoc[] 三篇文档共同描述 ha_plugin
+<18> `examples` 为 antora 约定俗成的放置例子的目录，一些代码片段或者可以完整运行的代码可以放在这里方便引用和读者直接下载运行。
+<19> 可以通过软链接将代码目录软链接过来，方便从真实代码中进行引用，例如 `docs/modules/zstackctl/examples/zstack-ctl` 指向了 `../../../../zstackctl`，见 <<examples_softlink>>
+
+[source#examples_softlink,bash]
+.examples 中的软链接指向到代码目录
+----
+(venv) ➜  examples git:(feature/introduce-asciidoc-antora) ✗ pwd
+/Users/weiwang/ZStack/zstack-utility/docs/modules/zstackctl/examples
+(venv) ➜  examples git:(feature/introduce-asciidoc-antora) ✗ ls -lh
+total 16
+-rw-r--r--  1 weiwang  staff   148B Feb  8 15:38 collect_log_host_test.yaml
+-rw-r--r--  1 weiwang  staff   162B Feb  8 15:40 collect_log_two_host.yaml
+lrwxr-xr-x  1 weiwang  staff    21B Feb  9 01:09 zstack-ctl -> ../../../../zstackctl
+(venv) ➜  examples git:(feature/introduce-asciidoc-antora) ✗
+----
+
+综上，整个 doc 目录的层级关系和依赖关系可以总结为 <<zstack-utility_doc>>
+
+[plantuml#zstack-utility_doc]
+.doc 的层级结构和依赖关系
+....
+skinparam monochrome true
+skinparam ranksep 20
+skinparam dpi 150
+skinparam arrowThickness 0.7
+skinparam packageTitleAlignment left
+skinparam usecaseBorderThickness 0.4
+skinparam defaultFontSize 12
+skinparam rectangleBorderThickness 1
+
+  folder zstack-utility/docs {
+    (antora.yml)
+      folder modules/ROOT {
+        (nav.adoc)
+        folder pages {
+          (index.adoc)
+          (contribute.adoc)
+        }
+      }
+      folder modules/module1 {
+        (nav1) as "nav.adoc"
+        folder pages1 as "pages" {
+          (index1) as "index.adoc"
+          (contri1) as "contribute.adoc"
+          (func1) as "func1.adoc"
+          folder func2 {
+            (subfunc1)
+            (subfunc2)
+          }
+        }
+    }
+  }
+
+rectangle "repo: doc_site" {
+  (antora-playbook.yml)
+}
+
+(antora-playbook.yml) --> (antora.yml)
+(antora.yml) --> (nav.adoc)
+(antora.yml) --> (nav1)
+
+(nav.adoc) ..> (index.adoc)
+(nav.adoc) ..> (contribute.adoc)
+
+(nav1) ..> (index1)
+(nav1) ..> (contri1)
+(nav1) ..> (func1)
+(nav1) ..> (subfunc1)
+(nav1) ..> (subfunc2)
+....
+
+== 在 PyCharm 下编写文档
+
+在 xref:contribute/editor_and_ide.adoc#use_pycharm[] 里推荐了两个 PyCharm 插件，分别是 `AsciiDoc` 和 `Diagrams.net Integration`。
+
+假设没有这些插件，你也一样可以编写文档，然而有了这两个插件之后，效率会更高，因此强烈推荐使用。
+
+=== AsciiDoc 插件
+
+PyCharm 下的 `AsciiDoc` 插件与 IDEA 的 `AsciiDoc` 是完全一致的（Thanks to Jetbrains），主要作用是：
+
+[#extension_function]
+.AsciiDoc Plugin 的主要功能
+ * 实时预览文档和检查语法错误、提供语法提示
+ * 方便粘贴图片
+ * 方便粘贴表格
+ * 强大的自动补全和提示
+
+为了方便预览通过 `include` 引用的内容，推荐将 `Safe mode` 设置为 `Unsafe` （这也是插件的默认行为）
+
+.PyCharm Asciidoc saffe mode 配置
+image::image-2022-02-11-16-32-16-692.png[]
+
+配置好之后，你应该可以看到类似这样的界面：
+
+.PyCharm 编辑 AsciiDoc 的界面
+image::image-2022-02-11-16-46-54-376.png[]
+
+除了 <<extension_function>> 提到的主要功能，这个插件还有很多特色功能：
+
+1. 编辑窗口和预览窗口可以实时相互定位
+2. 可以实时预览图片、表格、“渲染文本生成的图形”（例如 PlantUML、Graphviz、Ditaa 图形等）
+3. 可以在预览窗口实时跳转到引用的链接、include 的代码等
+4. 支持 antora 特定的链接方式（这个功能 VS Code 尚不支持，详见 <<在 Visual Studio Code）
+5. 可以将当前文档立刻用浏览器打开，或者输出为 HTML 文档或 PDF 文档
+
+另外，如果你的 PyCharm 环境可以方便的访问国外网站，可以打开 kroki 渲染，这样可以支持渲染更多的图形类型，例如下面的 <<network1>> 和 <<network2>> 如果不打开 kroki 渲染的话是无法在 PyCharm 预览的，但不影响最终在 https://zstack.dev 展示。
+
+.打开 Kroki 渲染
+image::image-2022-02-11-17-40-42-929.png[]
+
+更详细的介绍参考这个插件的项目文档（也是用 antora 构建的） https://intellij-asciidoc-plugin.ahus1.de/
+
+[TIP]
+.小技巧
+====
+1. 不妨试试直接在编辑器里贴图
+2. 编辑器具有创建表格和粘贴表格的功能，不放试一试
+====
+
+=== Diagrams.net Integration 插件
+
+得益于 Ascii 的强大语法支持，我们可以在文档里直接画出各种图形，zstack.dev 在构建网站时使用了 `asciidoctor-kroki` 插件，因此 kroki 的所有图形都可以支持，甚至包括感觉很复杂的图形（以下的 <<network1>> 和 <<network2>> 在 PyCharm 中预览均需要打开 kroki 渲染）：
+
+[nwdiag#network1]
+.网络拓扑图
+....
+nwdiag {
+  network dmz {
+    address = "210.x.x.x/24"
+
+    web01 [address = "210.x.x.1"];
+    web02 [address = "210.x.x.2"];
+  }
+  network internal {
+    address = "172.x.x.x/24";
+
+    web01 [address = "172.x.x.1"];
+    web02 [address = "172.x.x.2"];
+    db01;
+    db02;
+  }
+}
+....
+
+[bytefield#network2]
+.网络报文协议定义图
+....
+(defattrs :bg-green {:fill "#a0ffa0"})
+(defattrs :bg-yellow {:fill "#ffffa0"})
+(defattrs :bg-pink {:fill "#ffb0a0"})
+(defattrs :bg-cyan {:fill "#a0fafa"})
+(defattrs :bg-purple {:fill "#e4b5f7"})
+
+(defn draw-group-label-header
+  "Creates a small borderless box used to draw the textual label headers
+  used below the byte labels for remotedb message diagrams.
+  Arguments are the number of colums to span and the text of the
+  label."
+  [span label]
+  (draw-box (text label [:math {:font-size 12}]) {:span    span
+                                                  :borders #{}
+                                                  :height  14}))
+
+(defn draw-remotedb-header
+  "Generates the byte and field labels and standard header fields of a
+  request or response message for the remotedb database server with
+  the specified kind and args values."
+  [kind args]
+  (draw-column-headers)
+  (draw-group-label-header 5 "start")
+  (draw-group-label-header 5 "TxID")
+  (draw-group-label-header 3 "type")
+  (draw-group-label-header 2 "args")
+  (draw-group-label-header 1 "tags")
+  (next-row 18)
+
+  (draw-box 0x11 :bg-green)
+  (draw-box 0x872349ae [{:span 4} :bg-green])
+  (draw-box 0x11 :bg-yellow)
+  (draw-box (text "TxID" :math) [{:span 4} :bg-yellow])
+  (draw-box 0x10 :bg-pink)
+  (draw-box (hex-text kind 4 :bold) [{:span 2} :bg-pink])
+  (draw-box 0x0f :bg-cyan)
+  (draw-box (hex-text args 2 :bold) :bg-cyan)
+  (draw-box 0x14 :bg-purple)
+
+  (draw-box (text "0000000c" :hex [[:plain {:font-weight "light" :font-size 16}] " (12)"])
+            [{:span 4} :bg-purple])
+  (draw-box (hex-text 6 2 :bold) [:box-first :bg-purple])
+  (doseq [val [6 6 3 6 6 6 6 3]]
+    (draw-box (hex-text val 2 :bold) [:box-related :bg-purple]))
+  (doseq [val [0 0]]
+    (draw-box val [:box-related :bg-purple]))
+  (draw-box 0 [:box-last :bg-purple]))
+
+(draw-remotedb-header 0x4702 9)
+
+(draw-box 0x11)
+(draw-box 0x2104 {:span 4})
+(draw-box 0x11)
+(draw-box 0 {:span 4})
+(draw-box 0x11)
+(draw-box (text "length" [:math] [:sub 1]) {:span 4})
+(draw-box 0x14)
+
+(draw-box (text "length" [:math] [:sub 1]) {:span 4})
+(draw-gap "Cue and loop point bytes")
+
+(draw-box nil :box-below)
+(draw-box 0x11)
+(draw-box 0x36 {:span 4})
+(draw-box 0x11)
+(draw-box (text "num" [:math] [:sub "hot"]) {:span 4})
+(draw-box 0x11)
+(draw-box (text "num" [:math] [:sub "cue"]) {:span 4})
+
+(draw-box 0x11)
+(draw-box (text "length" [:math] [:sub 2]) {:span 4})
+(draw-box 0x14)
+(draw-box (text "length" [:math] [:sub 2]) {:span 4})
+(draw-gap "Unknown bytes" {:min-label-columns 6})
+(draw-bottom)
+....
+
+[plantuml]
+.脑图
+....
+@startmindmap
+skinparam monochrome true
++ OS
+++ Ubuntu
++++ Linux Mint
++++ Kubuntu
++++ Lubuntu
++++ KDE Neon
+++ LMDE
+++ SolydXK
+++ SteamOS
+++ Raspbian
+-- Windows 95
+-- Windows 98
+-- Windows NT
+--- Windows 8
+--- Windows 10
+@endmindmap
+....
+
+更多可以参考 https://kroki.io/examples.html
+
+但是对于比较复杂的图形，通过文本编写的方式固然好维护，但其定义的代码太长太复杂，可能也会反而丧失了可维护性，这种时候可以通过 `Diagrams.net Integration` 来画图和维护。
+
+[TIP]
+.提示
+====
+`Diagrams.net` 就是曾经的 `draw.io`！
+====
+
+[#add_svg]
+.添加 Diagrams.net 图形
+image::image-2022-02-11-17-58-05-689.png[]
+
+在弹出的窗口中输入文件名，最后以 `.drawio` 结尾，方便分辨出这个 SVG 文件是可编辑的（之所以用 drawio 结尾而不是 diagrams 结尾与 VS Code 的默认行为有关，见 <<_draw_io_integration_插件>>），类型选择 SVG 类型（默认选择）。
+
+.注意文件名和类型
+image::image-2022-02-11-18-01-40-518.png[]
+
+下面就会在 PyCharm 中弹出“内嵌”的 diagrams.net 的界面：
+
+image::image-2022-02-11-18-04-59-517.png[]
+
+然后就可以编辑图形了，编辑完成后可以在文档中直接引用，引用方法与普通图形一样，参考 <<#svg_image>>，渲染效果见 <<svg_render>>。Diagrams.net 可以画很丰富的图形，里面支持很多元素并支持多图层、可以引用外部图片等等
+
+[source#svg_image,asciidoc]
+.在代码中引用 svg 图形
+----
+images::test1.diagrams.svg[]
+----
+
+[#svg_render]
+.Diagrams.net 图形渲染的效果
+image::test1.drawio.svg[]
+
+[TIP]
+====
+diagrams.net 提供了很多模板，不知道怎么画好图，可以试一下这里的模板！
+
+image::image-2022-02-11-22-07-50-736.png[]
+
+此外对于 SQL 表格类型的图形，Diagrams.net 可以直接通过 SQL 语句自动生成图形
+
+image::image-2022-02-11-22-11-10-974.png[]
+====
+
+== 在 Visual Studio Code 下编写文档
+
+在 xref:contribute/editor_and_ide.adoc#use_vscode[] 里推荐了两个 VS Code 插件，分别是 `AsciiDoc` 和 `Draw.io Integration`。
+
+假设没有这些插件，你也一样可以编写文档，然而有了这两个插件之后，效率会更高，因此强烈推荐使用。
+
+=== AsciiDoc 插件
+
+VS Code 下的 `AsciiDoc` 插件与 PyCharm 的 `AsciiDoc` 类似，主要作用是：
+
+[#vscode_extension_function]
+.VS Code AsciiDoc Plugin 的主要功能
+ * 实时预览文档和检查语法错误、提供语法提示
+ * 基本的的自动补全和提示
+
+为了能够实时预览 PlantUML、Graphviz 等图形编程语言编写的图形，建议打开 kroki 渲染（需要能够访问外部网络）：
+
+.VS Code 插件配置
+image::image-2022-02-12-15-37-37-832.png[]
+
+[source,json]
+.settings.json
+----
+{
+    "asciidoc.use_kroki": true,
+    "asciidoc.preview.refreshInterval": 1000
+}
+----
+
+因为 VS Code 的 AsciiDoc 插件不能自动识别出 Antora 目录结构，因此需要在文档开头增加 `:imagesdir:` 的属性，类似于 <<images_dir>>，具体目录需要根据实际情况配置：
+
+[source#images_dir,asciidoc]
+.imagesdir 配置
+----
+= 文档标题
+:imagesdir: ../images
+----
+
+[CAUTION]
+.一定要记得 `:imagesdir:`
+====
+不要使用下面的方式引用图片：
+
+[sourcemasciidoc]
+----
+image::../images/xxx.png
+----
+
+这种方式固然可以正确的在编辑器里预览，但 antora 在构建网站时会报错！
+
+另外定义 `:imagesdir:` 还有一个好处，就是在 Gitlab 上也可以正确的预览了！
+====
+
+=== Draw.io Integration 插件
+
+和 PyCharm 下的 <<_diagrams_net_integration_插件>> 一样，VS Code 也提供了对应的插件，安装后即可在 VS Code 下绘图并在文档中引用：
+
+image::image-2022-02-12-15-48-37-853.png[]
+
+Draw.io Integration 除了 <<_diagrams_net_integration_插件>> 描述过的基础功能外，还有一些神奇的高级功能，例如：
+
+* 多人实时协作编辑
+* Code Link
+* 同步显示 XML
+
+Code Link 可以让图形和代码之间产生链接关系，支持点击跳转：
+
+image::https://github.com/hediet/vscode-drawio/raw/HEAD/docs/demo-code-link.gif[]
+
+另外，可以通过修改配置的方法将 `.svg` 关联到 `Draw.io Integration` 插件上，参考 <<vscode_setting_draw>> 和 https://marketplace.visualstudio.com/items?itemName=hediet.vscode-drawio
+
+[source#vscode_setting_draw,json]
+.VS Code .settings.json
+----
+"workbench.editorAssociations": {
+    "*.svg": "hediet.vscode-drawio-text",
+}
+----
+
+=== Ascii Tree Generator 插件
+
+如果想生成 Ascii Tree，类似于 <<zstack_utility_tree>> 的效果，在 Visual Studio Code 上可以使用这个插件，详见 https://marketplace.visualstudio.com/items?itemName=aprilandjan.ascii-tree-generator

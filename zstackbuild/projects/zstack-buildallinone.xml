@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="zstack all in one package builder" basedir="../">
+    <property name="target.license.file" location="${allinone.dir}/zstack-license" />
+    <property name="zstack.repo.version" location="${zstack.distro.source}/mkiso/.repo_version" />
+    <condition property="check.repo.version" value="True" else="False">
+        <and>
+            <isset property="build_war_flag"/>
+        </and>
+    </condition>
+
+    <target name="all-in-one-package" >
+        <copy file="${zstack.install}" todir="${build.dir}" />
+        <copy file="${war.file}" todir="${allinone.dir}" />
+        <copy file="${apachetomcat.pkg}" todir="${allinone.dir}" />
+        <tar destfile="${allinone.file}" basedir="${allinone.dir}" compression="gzip" />
+        <echo message="successfully build zstack all in one package at ${allinone.file}" />
+    </target>
+
+    <target name="copy-license-file" if="license.file">
+        <echo message="copy license file to ${allinone.dir}" />
+        <copy file="${license.file}" tofile="${target.license.file}" />
+    </target>
+
+    <target name="check-repo-version-exists">
+        <available file="${zstack.repo.version}"  property="repo.version.exists"/>
+    </target>
+
+    <target name="copy-repo-version" depends="check-repo-version-exists" if="repo.version.exists">
+        <echo message="copy .repo_version to ${allinone.bin.dir}" />
+        <copy file="${zstack.repo.version}" todir="${allinone.bin.dir}" />
+    </target>
+
+    <target name="build-centos-offline" depends="copy-license-file, check-repo-version-exists">
+        <copy file="${war.file}" todir="${allinone.dir}" />
+        <echo message="copy apache-tomcat to ${allinone.file}" />
+        <copy file="${apachetomcat.pkg}" todir="${allinone.dir}" />
+        <tar destfile="${allinone.file}" basedir="${allinone.dir}" compression="gzip" />
+
+        <makeDir dir="${allinone.bin.dir}" />
+        <move file="${allinone.file}" todir="${allinone.bin.dir}" />
+        <copy file="${zstack.install}" todir="${allinone.bin.dir}" />
+
+        <exec executable="bash" dir="${allinone.bin.dir}" failonerror="true">
+            <arg value="${offline.bin.gen.setup.script}" />
+            <arg value="${product.name}" />
+            <arg value="${product.version}" />
+            <arg value="${check.repo.version}" />
+            <arg value="${offline.bin.setup.script}" />
+            <arg value="${project.num}"/>
+        </exec>
+
+        <exec executable="bash" dir="${allinone.bin.dir}" failonerror="true">
+            <arg value="${gen.product.title.script}" />
+            <arg value="${product.name}" />
+            <arg value="${product.version}" />
+            <arg value="${allinone.bin.product.title}" />
+        </exec>
+
+        <fail message=".repo_version file does not exists.">
+            <condition>
+                <and>
+                    <isset property="build_war_flag" />
+                    <not>
+                        <isset property="repo.version.exists" />
+                    </not>
+                </and>
+            </condition>
+        </fail>
+        <antcall target="copy-repo-version" />
+
+        <tar destfile="${allinone.offline.file}" basedir="${allinone.bin.dir}" />
+        <exec executable="bash" dir="${build.dir}" failonerror="true">
+            <arg value="${build.installation.bin.script}" />
+            <arg value="${offline.bin.setup.script}" />
+            <arg value="${allinone.offline.file}" />
+            <arg value="${allinone.bin.file}" />
+        </exec>
+
+
+        <echo message="successfully build zstack all in one package at ${allinone.file}" />
+    </target>
+</project>

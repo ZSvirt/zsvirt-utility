@@ -1,0 +1,208 @@
+# Use network installation
+url --url={{ network_inst_uri }}
+
+# Text mode
+text
+
+# Hardware inspector
+%pre --interpreter /bin/bash
+if [ ! -f /usr/bin/python ];then
+   [ -f /usr/bin/python2 ] && ln -s /usr/bin/python2 /usr/bin/python
+   [ -f /usr/bin/python3 ] && ln -s /usr/bin/python3 /usr/bin/python
+fi
+%end
+
+%pre --interpreter /usr/bin/python
+import subprocess
+import json
+import multiprocessing
+import os
+import re
+import sys
+import time
+import traceback
+
+provision_mac = '{{provision_mac}}'
+GPT_SIZE_SECTORS = 33
+_PARTED_TYPE_RE = re.compile(r'^.*partition\s+table\s*:\s*(gpt|msdos)',
+                                   re.IGNORECASE | re.MULTILINE)
+
+def shell_cmd(cmd, exception=True, workdir=None):
+    process = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stdin=subprocess.PIPE,
+                                stderr=subprocess.PIPE, close_fds=True, executable='/bin/bash', cwd=workdir)
+
+    (stdout, stderr) = process.communicate()
+    return_code = process.returncode
+    if exception and return_code != 0:
+        raise Exception("Failed to exec: [{}]".format(cmd))
+
+    # the type of results is bytes in python3
+    if sys.version_info.major == 3:
+        stdout = stdout.decode()
+        stderr = stderr.decode()
+
+    return return_code, stdout.strip(), stderr.strip()
+
+def get_ipmi_info():
+    addr = '{{chassis_address}}'
+    port = '{{chassis_port}}'
+    return {
+        'ipmiAddress': addr,
+        'ipmiPort': port
+    }
+
+def get_dest_dev(dest_wwn):
+    cmd = 'lsblk --nodeps --byte --output name,size'
+    _, stdout, _ = shell_cmd(cmd)
+    for line in stdout.split('\n')[1:]:
+        if len(line.split()) != 2:
+            continue
+        name, size = line.split()
+        _, output, _ = shell_cmd("ls -l /dev/disk/by-id | grep %s |grep %s | awk 'NR==1 {print $11}'" % (dest_wwn, name))
+        if output != '':
+            return "/dev/%s" % name
+
+    raise Exception("Failed to find dest disk[%s]" % dest_wwn)
+
+def get_src_dev():
+    cmd = "mkdir -p /etc/iscsi && touch /etc/iscsi/initiatorname.iscsi && echo 'InitiatorName=iqn.2015-01.io.zstack:initiator.instance.{{instance_uuid}}' > /etc/iscsi/initiatorname.iscsi"
+    shell_cmd(cmd)
+    cmd = "systemctl restart iscsid"
+    shell_cmd(cmd)
+    time.sleep(1)
+    cmd = "iscsiadm -m discovery -t sendtargets -p {{gateway_ip}}:3260"
+    shell_cmd(cmd)
+    time.sleep(1)
+    cmd = "iscsiadm --mode node --targetname {{iqn_name}} -p {{gateway_ip}}:3260 --login -o new"
+    shell_cmd(cmd)
+    time.sleep(1)
+    cmd = "iscsiadm --mode node --targetname {{iqn_name}} -p {{gateway_ip}}:3260 --login"
+    shell_cmd(cmd)
+    time.sleep(3)
+    cmd = "systemctl daemon-reload && systemctl restart iscsid"
+    shell_cmd(cmd)
+    time.sleep(1)
+    _, stdout, _ = shell_cmd('iscsiadm -m session --sid 1 -P 3')
+    for line in stdout.split('\n'):
+        if 'Attached scsi disk' in line:
+            dev_name = line.split()[3]
+            return "/dev/%s" % dev_name
+
+
+def convert_data(src, dest):
+    clean_device_metadata(dest)
+    cmd = 'dd if=%s of=%s conv=sparse bs=1M status=progress 2>>/root/dd.txt &' % (src, dest)
+    _, stdout, _ = shell_cmd(cmd)
+
+def report_dd_progress(src_dev):
+    start_progress = 40.0
+    end_progress = 90
+    total_size = 0
+    cmd = 'lsblk %s --nodeps --byte --output SIZE,NAME' % src_dev
+    _, stdout, _ = shell_cmd(cmd)
+    for line in stdout.split('\n')[1:]:
+        if len(line.split()) != 2:
+            continue
+        total_size = line.split()[0]
+
+    while True:
+        time.sleep(5)
+        _, stdout, _ = shell_cmd("ps -ef | grep status=progress | grep -v grep | wc -l")
+        if int(stdout) == 0:
+            break
+
+        _, current_size, _ = shell_cmd("tail -1 /root/dd.txt | awk -v RS='\r' '/copied/ {print $1}' | awk 'END {print}'")
+        if current_size is not None:
+            current_progress = int(float(start_progress) + 50 * float(current_size) / float(total_size))
+            report_progress(str(current_progress))
+
+def clean_device_metadata(dev_name):
+    cmd = 'dd bs=512 if=/dev/zero of=%s count=%s' % (dev_name, GPT_SIZE_SECTORS)
+    shell_cmd(cmd)
+
+def get_partition_type(dev_name):
+    _, out, _ = shell_cmd('parted --script %s -- print' % dev_name)
+    m = _PARTED_TYPE_RE.search(out)
+    if m:
+        return m.group(1)
+
+    return 'invalid'
+
+def fix_gpt_reside_error(dev_name):
+    _, output, _ = shell_cmd('sgdisk -v %s' % dev_name)
+    search_str = "it doesn't reside\nat the end of the disk"
+    if search_str in output:
+        shell_cmd('sgdisk -e %s' % dev_name)
+
+def fix_gpt_partition(dev_name):
+    try:
+        disk_is_gpt_partitioned = (get_partition_type(dev_name) == 'gpt')
+        if disk_is_gpt_partitioned:
+            fix_gpt_reside_error(dev_name)
+    except Exception as e:
+        msg = 'Failed to fix GPT partition on disk %s. Error: %s' % (dev_name, str(e))
+        raise Exception(msg)
+
+def report_progress(percentage):
+    progress_struct = {}
+    progress_struct["threadContextMap"] = {"api":"{{api_id}}", "task-name":"{{task_name}}"}
+    progress_struct["progress"] = percentage
+    progress_struct["processType"] = "BM2ConvertToLocalDisk"
+
+    cmd = ('curl -X POST -H "Content-Type:application/json" -H "commandpath:/progress/report" -d \'{data}\' '
+           '--retry 5 {{ send_progress_info_uri }} ').format(
+               data=json.dumps(progress_struct))
+    shell_cmd(cmd)
+
+def send_info(result):
+    cmd = ('curl -X POST -H "Content-Type:application/json" -d \'{data}\' '
+           '--retry 5 {{ send_hardware_infos_uri }} ').format(
+               data=json.dumps({"params": result}))
+    shell_cmd(cmd)
+
+def main():
+    dest_wwn = '{{ dest_disk_wwn }}'
+    src_dev = get_src_dev()
+    dest_dev = get_dest_dev(dest_wwn)
+    result = {}
+    result.update(get_ipmi_info())
+
+    convert_info = {}
+    convert_info['status'] = 'Converting'
+    convert_info['progress'] = 0
+    result['convertInfo'] = json.dumps(convert_info)
+    result['hardwareInfo'] = ''
+
+    send_info(result)
+
+    convert_data(src_dev, dest_dev)
+    report_dd_progress(src_dev)
+    fix_gpt_partition(dest_dev)
+
+    convert_info['status'] = 'Converted'
+    result['convertInfo'] = json.dumps(convert_info)
+
+    send_info(result)
+
+    shell_cmd("poweroff")
+
+try:
+    main()
+except:
+    # pass back the ks err to tftp server on gateway
+    err_file_name = '/root/ks.{}'.format(provision_mac.replace(':', '-'))
+    traceback.print_exc(file=open(err_file_name,'w+'))
+    shell_cmd("curl -T {} tftp://{}/ks.errlogs/".format(err_file_name, "{{gateway_ip}}"))
+
+    # report fail and update ipmi info
+    convert_info = {}
+    convert_info['status'] = 'ConvertFailed'
+    convert_info['progress'] = 0
+    result = {}
+    result.update(get_ipmi_info())
+    result['convertInfo'] = json.dumps(convert_info)
+    result['hardwareInfo'] = ''
+
+    send_info(result)
+
+%end
