@@ -24,6 +24,7 @@ from zstacklib.utils.ip import get_host_physicl_nics
 from zstacklib.utils.ip import get_nic_supported_max_speed
 from zstacklib.utils.ipmitool import get_sensor_info_from_ipmi
 from zstacklib.utils.linux import is_virtual_machine, is_support_bmc
+from kvmagent.plugins import vm_performance_metrics
 
 logger = log.get_logger(__name__)
 collector_dict = {}  # type: Dict[str, threading.Thread]
@@ -58,6 +59,8 @@ hw_status_abnormal_list_record = {
 
 # collect domain max memory
 domain_max_memory = {}
+vm_performance_collector = vm_performance_metrics.VmHostPerformanceCollector()
+vm_performance_last_result = []
 
 def read_number(fname):
     res = linux.read_file(fname)
@@ -1284,6 +1287,23 @@ def collect_vm_statistics():
     return metrics.values()
 
 
+def collect_vm_host_performance_statistics():
+    """Collect interval VM/host metrics exposed by the KVM hypervisor.
+
+    The stateful collector establishes a counter baseline on its first run.
+    Keep the previous successful result when libvirt or procfs is temporarily
+    unavailable, matching the existing asynchronous collector behaviour.
+    Memory and co-stop metrics are intentionally not exported here.
+    """
+    global vm_performance_last_result
+    try:
+        result = list(vm_performance_collector.collect())
+        vm_performance_last_result = result
+    except Exception as ex:
+        logger.warn("failed to collect VM/host performance metrics: %s" % ex)
+    return vm_performance_last_result
+
+
 # since Cloud 4.5.0, Because GetVmGuestToolsAction calls are too frequent,
 # the information about whether pvpanic is configured for VM
 # will flow to the management node through the monitoring data.
@@ -2044,6 +2064,7 @@ def collect_kvmagent_memory_statistics():
 kvmagent.register_prometheus_collector(collect_host_network_statistics)
 kvmagent.register_prometheus_collector(collect_host_capacity_statistics)
 kvmagent.register_prometheus_collector(collect_vm_statistics)
+kvmagent.register_prometheus_collector(collect_vm_host_performance_statistics)
 kvmagent.register_prometheus_collector(collect_vm_pvpanic_enable_in_domain_xml)
 kvmagent.register_prometheus_collector(collect_node_disk_wwid)
 kvmagent.register_prometheus_collector(collect_host_conntrack_statistics)
