@@ -188,7 +188,8 @@ def collect_vm_snapshot(conn):
     snapshot = {}
     for domain, values in records:
         count, delays = _collect_vcpus(values)
-        snapshot[domain.UUIDString()] = {
+        # libvirt uses RFC-4122 UUIDs; ZStack resource/API labels use 32 hex digits.
+        snapshot[domain.UUIDString().replace("-", "").lower()] = {
             "vcpuCount": count,
             "delayNs": delays,
             "disks": _collect_vm_disks(values),
@@ -199,20 +200,15 @@ def collect_vm_snapshot(conn):
 
 def _calculate_cpu(previous, current, interval_ms):
     per_cpu = {}
-    total_ns = 0
     for cpu_id, current_delay in current["delayNs"].items():
         delta = _counter_delta(previous["delayNs"].get(cpu_id), current_delay)
         if delta is None:
             continue
         per_cpu[cpu_id] = delta / NANOSECONDS_PER_MILLISECOND
-        total_ns += delta
     expected = current["vcpuCount"]
     if not per_cpu or len(per_cpu) != expected or interval_ms <= 0:
         return None
-    ready_ms = total_ns / NANOSECONDS_PER_MILLISECOND
     return {
-        "readyTimeMs": ready_ms,
-        "readinessPercent": ready_ms / (interval_ms * len(per_cpu)) * 100.0,
         "intervalMs": interval_ms,
         "perCpu": per_cpu,
     }
@@ -229,6 +225,14 @@ def _calculate_disk(previous, current, time_scale):
         wr_reqs = _counter_delta(before["writeRequests"], now["writeRequests"])
         wr_time = _counter_delta(before["writeTime"], now["writeTime"])
         result[name] = {
+            # Interval gauges, NOT cumulative counters. Export each pair only
+            # when both deltas are valid so weighted aggregation stays aligned.
+            "readRequests": rd_reqs if rd_time is not None else None,
+            "readTimeMs": rd_time / time_scale
+            if rd_time is not None and rd_reqs is not None else None,
+            "writeRequests": wr_reqs if wr_time is not None else None,
+            "writeTimeMs": wr_time / time_scale
+            if wr_time is not None and wr_reqs is not None else None,
             "readLatencyMs": rd_time / float(rd_reqs) / time_scale
             if rd_reqs and rd_time is not None else None,
             "writeLatencyMs": wr_time / float(wr_reqs) / time_scale
@@ -288,6 +292,12 @@ def calculate_host_metrics(previous, current):
     cpu = None
     if current["cpu"]["version"] is not None and current["cpu"]["version"] >= 15:
         cpu = _calculate_cpu(cpu_before, cpu_now, interval_ms)
+    # Host keeps its existing independent aggregate contract. VM aggregates are
+    # intentionally calculated only by ZWatch PromQL from per-vCPU series.
+    if cpu is not None:
+        cpu["readyTimeMs"] = sum(cpu["perCpu"].values())
+        cpu["readinessPercent"] = (
+            cpu["readyTimeMs"] / (interval_ms * len(cpu["perCpu"])) * 100.0)
     disk_before = dict((name, {
         "readRequests": value["readRequests"], "readTime": value["readTimeMs"],
         "writeRequests": value["writeRequests"], "writeTime": value["writeTimeMs"],
@@ -306,12 +316,12 @@ def calculate_host_metrics(previous, current):
 
 def _metric_families():
     specs = (
-        ("zstack_vm_cpu_ready_time_milliseconds", ["vm_uuid"]),
-        ("zstack_vm_cpu_readiness_percent", ["vm_uuid"]),
         ("zstack_vm_vcpu_ready_time_milliseconds", ["vm_uuid", "vcpu_id"]),
         ("zstack_vm_vcpu_readiness_percent", ["vm_uuid", "vcpu_id"]),
-        ("zstack_vm_disk_read_latency_milliseconds", ["vm_uuid", "disk_name"]),
-        ("zstack_vm_disk_write_latency_milliseconds", ["vm_uuid", "disk_name"]),
+        ("zstack_vm_disk_read_time_milliseconds", ["vm_uuid", "disk_name"]),
+        ("zstack_vm_disk_read_requests", ["vm_uuid", "disk_name"]),
+        ("zstack_vm_disk_write_time_milliseconds", ["vm_uuid", "disk_name"]),
+        ("zstack_vm_disk_write_requests", ["vm_uuid", "disk_name"]),
         ("zstack_vm_network_receive_dropped_packets", ["vm_uuid", "nic_name"]),
         ("zstack_vm_network_transmit_dropped_packets", ["vm_uuid", "nic_name"]),
         ("zstack_host_cpu_ready_time_milliseconds", []),
@@ -322,7 +332,8 @@ def _metric_families():
         ("zstack_host_network_receive_dropped_packets", ["nic_name"]),
         ("zstack_host_network_transmit_dropped_packets", ["nic_name"]),
     )
-    return dict((name, GaugeMetricFamily(name, name.replace("_", " "),
+    return dict((name, GaugeMetricFamily(name, name.replace("_", " ") +
+                                          " (last valid scrape interval)",
                                           None, labels))
                 for name, labels in specs)
 
@@ -332,10 +343,6 @@ def build_prometheus_metrics(vm_metrics, host_metrics):
     for vm_uuid, values in vm_metrics.items():
         cpu = values["cpu"]
         if cpu is not None:
-            metrics["zstack_vm_cpu_ready_time_milliseconds"].add_metric(
-                [vm_uuid], cpu["readyTimeMs"])
-            metrics["zstack_vm_cpu_readiness_percent"].add_metric(
-                [vm_uuid], cpu["readinessPercent"])
             interval_ms = cpu["intervalMs"]
             for vcpu_id, ready_ms in cpu["perCpu"].items():
                 labels = [vm_uuid, str(vcpu_id)]
@@ -346,12 +353,14 @@ def build_prometheus_metrics(vm_metrics, host_metrics):
                         labels, ready_ms / interval_ms * 100.0)
         for name, disk in values["disks"].items():
             labels = [vm_uuid, name]
-            if disk["readLatencyMs"] is not None:
-                metrics["zstack_vm_disk_read_latency_milliseconds"].add_metric(
-                    labels, disk["readLatencyMs"])
-            if disk["writeLatencyMs"] is not None:
-                metrics["zstack_vm_disk_write_latency_milliseconds"].add_metric(
-                    labels, disk["writeLatencyMs"])
+            for direction in ("read", "write"):
+                requests = disk[direction + "Requests"]
+                duration_ms = disk[direction + "TimeMs"]
+                if requests is not None and duration_ms is not None:
+                    metrics["zstack_vm_disk_%s_requests" % direction].add_metric(
+                        labels, requests)
+                    metrics["zstack_vm_disk_%s_time_milliseconds" % direction].add_metric(
+                        labels, duration_ms)
         for name, nic in values["interfaces"].items():
             labels = [vm_uuid, name]
             if nic["rxDrop"] is not None:

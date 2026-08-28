@@ -63,8 +63,9 @@ class VmPerformanceMetricsTest(unittest.TestCase):
 
         result = metrics.calculate_vm_metrics(previous, current)["vm-1"]
 
-        self.assertEqual(6.0, result["cpu"]["readyTimeMs"])
-        self.assertEqual(0.03, result["cpu"]["readinessPercent"])
+        self.assertEqual({0: 2.0, 1: 4.0}, result["cpu"]["perCpu"])
+        self.assertNotIn("readyTimeMs", result["cpu"])
+        self.assertNotIn("readinessPercent", result["cpu"])
         self.assertEqual(3.0, result["disks"]["vda"]["readLatencyMs"])
         self.assertEqual(5.0, result["disks"]["vda"]["writeLatencyMs"])
         self.assertEqual(3, result["interfaces"]["vnet0"]["rxDrop"])
@@ -81,8 +82,12 @@ class VmPerformanceMetricsTest(unittest.TestCase):
         names = set(family.name for family in families)
         joined = " ".join(names).lower()
 
-        self.assertIn("zstack_vm_cpu_ready_time_milliseconds", names)
-        self.assertIn("zstack_vm_disk_read_latency_milliseconds", names)
+        self.assertNotIn("zstack_vm_cpu_ready_time_milliseconds", names)
+        self.assertNotIn("zstack_vm_cpu_readiness_percent", names)
+        self.assertNotIn("zstack_vm_disk_read_latency_milliseconds", names)
+        self.assertIn("zstack_vm_vcpu_ready_time_milliseconds", names)
+        self.assertIn("zstack_vm_disk_read_time_milliseconds", names)
+        self.assertIn("zstack_vm_disk_read_requests", names)
         self.assertIn("zstack_vm_network_receive_dropped_packets", names)
         self.assertNotIn("memory", joined)
         self.assertNotIn("balloon", joined)
@@ -115,6 +120,101 @@ class VmPerformanceMetricsTest(unittest.TestCase):
         self.assertEqual(4.0, result["disks"]["dm-0"]["writeLatencyMs"])
         self.assertEqual(2, result["interfaces"]["eth0"]["rxDrop"])
         self.assertEqual(3, result["interfaces"]["eth0"]["txDrop"])
+
+    @staticmethod
+    def samples(families, name):
+        family = next(f for f in families if f.name == name)
+        # Support both the real prometheus_client and the dependency-free stub.
+        return [(s.labels, s.value) if hasattr(s, "labels") else s
+                for s in family.samples]
+
+    def test_uuid_normalization_and_batch_collection(self):
+        class Domain(object):
+            def UUIDString(self):
+                return "7C193600-2180-4DED-A7AD-0AF850D84AC4"
+
+        class Connection(object):
+            calls = 0
+
+            def getAllDomainStats(self, stats, flags):
+                self.calls += 1
+                return [(Domain(), {"vcpu.current": 1, "vcpu.0.delay": 0})]
+
+        conn = Connection()
+        snapshot = metrics.collect_vm_snapshot(conn)
+        vm_uuid = "7c19360021804deda7ad0af850d84ac4"
+        self.assertEqual([vm_uuid], list(snapshot["vms"]))
+        self.assertEqual(1, conn.calls)
+        snapshot["capturedAt"] = 10.0
+        after = metrics.collect_vm_snapshot(conn)
+        after["capturedAt"] = 20.0
+        families = metrics.build_prometheus_metrics(
+            metrics.calculate_vm_metrics(snapshot, after),
+            {"cpu": None, "disks": {}, "interfaces": {}})
+        labels, value = self.samples(
+            families, "zstack_vm_vcpu_ready_time_milliseconds")[0]
+        self.assertEqual(vm_uuid, labels["vm_uuid"] if isinstance(labels, dict) else labels[0])
+        self.assertEqual(0, value)
+
+    def test_vcpu_only_and_actual_interval(self):
+        cpu = metrics._calculate_cpu(
+            {"vcpuCount": 2, "delayNs": {0: 0, 1: 0}},
+            {"vcpuCount": 2, "delayNs": {0: 550000000, 1: 1100000000}},
+            55000.0)
+        families = metrics.build_prometheus_metrics(
+            {"vm": {"cpu": cpu, "disks": {}, "interfaces": {}}},
+            {"cpu": None, "disks": {}, "interfaces": {}})
+        self.assertEqual([1.0, 2.0], sorted(v for _, v in self.samples(
+            families, "zstack_vm_vcpu_readiness_percent")))
+        self.assertNotIn("zstack_vm_cpu_ready_time_milliseconds",
+                         [f.name for f in families])
+
+    def test_missing_vcpu_or_nonpositive_interval_suppresses_partial_average(self):
+        previous = {"vcpuCount": 2, "delayNs": {0: 0, 1: 0}}
+        self.assertIsNone(metrics._calculate_cpu(
+            previous, {"vcpuCount": 2, "delayNs": {0: 1}}, 1000))
+        for interval in (0, -1000):
+            self.assertIsNone(metrics._calculate_cpu(previous, previous, interval))
+
+    def test_disk_weight_components_and_no_aggregate_series(self):
+        before = dict((name, {"readRequests": 0, "readTime": 0,
+                              "writeRequests": 0, "writeTime": 0})
+                      for name in ("vda", "vdb"))
+        now = {
+            "vda": {"readRequests": 1, "readTime": 100000000,
+                    "writeRequests": 2, "writeTime": 4000000},
+            "vdb": {"readRequests": 100, "readTime": 100000000,
+                    "writeRequests": 8, "writeTime": 16000000},
+        }
+        disks = metrics._calculate_disk(before, now, 1000000.0)
+        families = metrics.build_prometheus_metrics(
+            {"vm": {"cpu": None, "disks": disks, "interfaces": {}}},
+            {"cpu": None, "disks": {}, "interfaces": {}})
+        durations = self.samples(families, "zstack_vm_disk_read_time_milliseconds")
+        requests = self.samples(families, "zstack_vm_disk_read_requests")
+        self.assertEqual(2, len(durations))
+        self.assertEqual(2, len(requests))
+        self.assertAlmostEqual(200.0 / 101, sum(v for _, v in durations) /
+                               sum(v for _, v in requests))
+
+    def test_disk_reset_and_missing_field_suppress_both_components(self):
+        previous = {"vda": {"readRequests": 10, "readTime": 100,
+                            "writeRequests": 10, "writeTime": 100}}
+        for key in ("readRequests", "readTime"):
+            for invalid in (None, 0):
+                now = {"vda": dict(previous["vda"])}
+                now["vda"][key] = invalid
+                disk = metrics._calculate_disk(previous, now, 1.0)["vda"]
+                self.assertIsNone(disk["readRequests"])
+                self.assertIsNone(disk["readTimeMs"])
+
+    def test_disk_idle_exports_zero_components_not_zero_latency(self):
+        snapshot = {"vda": {"readRequests": 10, "readTime": 100,
+                             "writeRequests": 10, "writeTime": 100}}
+        disk = metrics._calculate_disk(snapshot, snapshot, 1.0)["vda"]
+        self.assertEqual(0, disk["readRequests"])
+        self.assertEqual(0, disk["readTimeMs"])
+        self.assertIsNone(disk["readLatencyMs"])
 
 
 if __name__ == "__main__":
