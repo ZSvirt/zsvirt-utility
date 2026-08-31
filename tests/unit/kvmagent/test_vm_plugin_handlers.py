@@ -3500,7 +3500,7 @@ class TestVmStartCmdXmlBuild:
             'domxml-to-native' not in call.args[0]
             for call in bash_roe.call_args_list
         )
-        assert 'vendor=AuthenticAMD' not in xml_str
+        assert 'vendor=' not in xml_str
 
     def _add_vm_artifact_view(self, cmd, tmp_path, monkeypatch):
         view_root = tmp_path / 'vm-views'
