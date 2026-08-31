@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project name="zstack external runtime builder" basedir="../">
+    <property name="external.runtime.dir" location="${basedir}/external" />
+
+    <target name="prepare-external-runtime">
+        <checkFile file="${external.runtime.dir}" />
+        <checkFile file="${external.runtime.dir}/zwatch-vm-agent/agent_version" />
+        <checkFile file="${external.runtime.dir}/guesttools" />
+        <checkFile file="${external.runtime.dir}/zstack-store/zstore" />
+        <checkFile file="${external.runtime.dir}/zsblk-agent" />
+        <copy todir="${build.dir}">
+            <fileset dir="${external.runtime.dir}">
+                <include name="**/*" />
+            </fileset>
+        </copy>
+    </target>
+</project>
+
