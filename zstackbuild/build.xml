@@ -463,8 +463,20 @@
         <echo message="successfully build zstack-vr.img in /root/build_zstack_vr_image/zstack-vr.img" />
         <echo message="--------------------------------------------------------------------" />
     </target>
+    <target name="package-external-archive">
+        <!-- Rebuild external-*.tar after ant (prepare wipes early build_external output). -->
+        <condition property="package.external.build.num" value="${build.num}" else="">
+            <isset property="build.num"/>
+        </condition>
+        <exec executable="bash" failonerror="true">
+            <arg value="${basedir}/scripts/build_external.sh" />
+            <arg value="--from-target" />
+            <env key="BUILD_NUM" value="${package.external.build.num}" />
+            <env key="ZSTACK_BUILD_ROOT" value="${zstack_build_root}" />
+        </exec>
+    </target>
+    <target name="all-in-one" depends="build-war, build-allinone, package-external-archive">
 
-    <target name="all-in-one" depends="build-war, build-allinone"> 
         <echo message="--------------------------------------------------------------------" />
         <echo message="successfully build ${product.bin.name} all in one package at ${allinone.bin.file} " />
         <echo message="--------------------------------------------------------------------" />
