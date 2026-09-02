@@ -196,7 +196,7 @@ run_remote_command("rm -rf {}/*; mkdir -p /usr/local/zstack/ || true".format(kvm
 
 def install_kvm_pkg():
     def rpm_based_install():
-        os_base_dep = "bridge-utils chrony conntrack-tools cyrus-sasl-md5 device-mapper-multipath expect ipmitool iproute ipset \
+        os_base_dep = "bridge-utils chrony conntrack-tools cryptsetup cyrus-sasl-md5 device-mapper-multipath expect ipmitool iproute ipset \
                         usbredir-server iputils libvirt libvirt-client libvirt-python lighttpd lsof net-tools nfs-utils nmap openssh-clients \
                         smartmontools sshpass usbutils wget audit collectd-virt storcli nvme-cli pv rsync sed pciutils tar"
 
@@ -528,6 +528,12 @@ def copy_kvm_files():
         _src = os.path.join(file_root, file)
         _dst = os.path.join(workplace, file)
         copy_to_remote(_src, _dst, None, host_post_info)
+
+    # Ensure cert dir exists before qemu.conf references it and libvirtd restarts.
+    command = 'test -d /etc/pki/qemu || mkdir -p /etc/pki/qemu'
+    host_post_info.post_label = "ansible.shell.mkdir"
+    host_post_info.post_label_param = "/etc/pki/qemu"
+    run_remote_command(command, host_post_info)
 
     # copy qemu configration file
     qemu_conf_src = os.path.join(file_root, "qemu.conf")

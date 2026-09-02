@@ -117,6 +117,9 @@
         - restart redhat libvirtd
         - restart debian libvirtd
 
+    - name: create /etc/pki/qemu dir
+      shell: test -d /etc/pki/qemu || mkdir -p /etc/pki/qemu
+
     - name: copy qemu conf
       copy: src="{{file_root}}/qemu.conf" dest=/etc/libvirt/qemu.conf
       notify:
@@ -194,4 +197,3 @@
         http_proxy: "{{proxy}}"
         https_proxy: "{{sproxy}}"
       pip: name="{{kvm_root}}/{{pkg_kvmagent}}" extra_args="--ignore-installed --trusted-host {{trusted_host}} -i {{pip_url}}" virtualenv="{{virtenv_path}}" virtualenv_site_packages=yes
-
