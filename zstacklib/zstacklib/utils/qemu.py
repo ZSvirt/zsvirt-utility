@@ -41,6 +41,27 @@ def get_bin_dir():
             'Could not find qemu/qemu-kvm bin directory in /usr/share/qemu-kvm/ or /usr/share/qemu/')
 
 
+# QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
+# QEMU emulator version 4.2.0 (qemu-kvm-4.2.0-640.g70d8f25.el7)
+# return 2.12.0
+def _parse_version2(version_output):
+    return version_output.splitlines()[0].strip().split(" ")[3]
+
+# QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
+# return 2.12.0
+def get_version_from_exe_file2(path, error_out=False):
+    r, o, e = bash.bash_roe("%s --version" % path)
+    if r == 0:
+        return _parse_version2(o.strip())
+
+    if error_out:
+        raise Exception("cannot get version from %s: %s" % (path, e))
+    else:
+        logger.debug("cannot get version from %s: %s" % (path, e))
+
+    return ""
+
+
 def get_version():
     version = shell.call("virsh version | awk '/hypervisor.*QEMU/{print $4}'", False).strip()
 
@@ -98,20 +119,6 @@ def get_version_from_exe_file(path, error_out=False):
     return ""
 
 # QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
-# return 2.12.0
-def get_version_from_exe_file2(path, error_out=False):
-    r, o, e = bash.bash_roe("%s --version" % path)
-    if r == 0:
-        return _parse_version2(o.strip())
-
-    if error_out:
-        raise Exception("cannot get version from %s: %s" % (path, e))
-    else:
-        logger.debug("cannot get version from %s: %s" % (path, e))
-
-    return ""
-
-# QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
 # return qemu-kvm-ev-2.12.0-44.1.el7_9.1
 def _parse_version(version_output):
     lines = version_output.splitlines()
@@ -128,12 +135,6 @@ def _parse_version(version_output):
         full_ver = ver_line
 
     return "-".join(filter(lambda s: s[0].isdigit(), full_ver.split("-")))
-
-# QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
-# QEMU emulator version 4.2.0 (qemu-kvm-4.2.0-640.g70d8f25.el7)
-# return 2.12.0
-def _parse_version2(version_output):
-    return version_output.splitlines()[0].strip().split(" ")[3]
 
 
 def get_device_map(path, option=""):

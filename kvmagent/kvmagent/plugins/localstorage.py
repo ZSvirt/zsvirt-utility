@@ -3,9 +3,12 @@ __author__ = 'frank'
 import os
 import os.path
 import traceback
+import base64
+from xml.sax.saxutils import escape as xml_escape
 
 import zstacklib.utils.uuidhelper as uuidhelper
 from kvmagent import kvmagent
+from kvmagent.plugins import volume_secret
 from kvmagent.plugins.imagestore import ImageStoreClient
 from kvmagent.plugins.nvram import nvram
 from zstacklib.utils import jsonobject
@@ -290,6 +293,8 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
     CLEANUP_VM_METADATA_PATH = "/localstorage/vm/metadata/cleanup"
     CLEANUP_ALL_VM_METADATA_PATH = "/localstorage/vm/metadata/cleanupall"
     PREFIX_REBASE_BACKING_FILES_PATH = "/localstorage/snapshot/prefixrebasebackingfiles"
+    ENCRYPT_VOLUME_BITS_PATH = "/localstorage/volume/encryptinplace"
+    CONVERT_VOLUME_ENCRYPTION_PATH = "/localstorage/volume/convertencryption"
 
     _metadata_handler = FileBasedMetadataHandler()
 
@@ -348,6 +353,8 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.CLEANUP_VM_METADATA_PATH, self.cleanup_vm_metadata)
         http_server.register_async_uri(self.CLEANUP_ALL_VM_METADATA_PATH, self.cleanup_all_vm_metadata)
         http_server.register_async_uri(self.PREFIX_REBASE_BACKING_FILES_PATH, self.prefix_rebase_backing_files)
+        http_server.register_async_uri(self.ENCRYPT_VOLUME_BITS_PATH, self.encrypt_volume_bits)
+        http_server.register_async_uri(self.CONVERT_VOLUME_ENCRYPTION_PATH, self.convert_volume_encryption)
 
         self.imagestore_client = ImageStoreClient()
 
@@ -429,8 +436,13 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
 
         install_path = cmd.installPath
         rsp = ResizeVolumeRsp()
-        linux.qemu_img_resize(install_path, cmd.size, 'qcow2', cmd.force)
-        ret = linux.qcow2_virtualsize(install_path)
+        secret_material_file = getattr(cmd, 'encryptLuksSecretMaterialFilePath', None)
+        if secret_material_file:
+            linux.qemu_img_resize_with_secret(install_path, cmd.size, secret_material_file, cmd.force)
+            ret = linux.qcow2_get_virtual_size(install_path)
+        else:
+            linux.qemu_img_resize(install_path, cmd.size, 'qcow2', cmd.force)
+            ret = linux.qcow2_virtualsize(install_path)
         rsp.size = ret
         return jsonobject.dumps(rsp)
 
@@ -726,9 +738,14 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
     @kvmagent.replyerror
     def rebase_backing_files(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
         for sp in cmd.snapshots:
             if sp.parentPath:
-                linux.qcow2_rebase_no_check(sp.parentPath, sp.path)
+                if encrypted_dek:
+                    with volume_secret.luks_secret_channel(encrypted_dek) as secret_file:
+                        linux.qcow2_rebase_no_check_with_secret(sp.parentPath, sp.path, secret_file)
+                else:
+                    linux.qcow2_rebase_no_check(sp.parentPath, sp.path)
 
         return jsonobject.dumps(AgentResponse())
 
@@ -754,7 +771,13 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
         _0()
 
         t_shell = traceable_shell.get_shell(cmd)
-        linux.create_template(cmd.volumePath, cmd.installPath, shell=t_shell)
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
+        if encrypted_dek:
+            with volume_secret.luks_secret_channel(encrypted_dek) as secret_file:
+                linux.create_encrypted_template_with_secret(
+                    cmd.volumePath, cmd.installPath, secret_file, shell=t_shell)
+        else:
+            linux.create_template(cmd.volumePath, cmd.installPath, shell=t_shell)
 
         logger.debug('successfully created template[%s] from volume[%s]' % (cmd.installPath, cmd.volumePath))
 
@@ -808,7 +831,12 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
             os.makedirs(workspace_dir)
 
         t_shell = traceable_shell.get_shell(cmd)
-        linux.create_template(cmd.snapshotInstallPath, cmd.workspaceInstallPath, shell=t_shell)
+        if getattr(cmd, 'encryptLuksSecretMaterialFilePath', None):
+            linux.create_encrypted_template_with_secret(
+                cmd.snapshotInstallPath, cmd.workspaceInstallPath,
+                cmd.encryptLuksSecretMaterialFilePath, shell=t_shell)
+        else:
+            linux.create_template(cmd.snapshotInstallPath, cmd.workspaceInstallPath, shell=t_shell)
         rsp.size, rsp.actualSize = linux.qcow2_size_and_actual_size(cmd.workspaceInstallPath)
 
         rsp.totalCapacity, rsp.availableCapacity = self._get_disk_capacity(cmd.storagePath)
@@ -842,17 +870,27 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = OfflineMergeSnapshotRsp()
 
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
         src_path = cmd.srcPath if not cmd.fullRebase else ""
-        if linux.qcow2_get_backing_file(cmd.destPath) == src_path:
+        raw_backing = linux.qcow2_get_backing_file(cmd.destPath, normalize=False)
+        backing_needs_reset = encrypted_dek and raw_backing and raw_backing.startswith('json:')
+        if linux.qcow2_get_backing_file(cmd.destPath) == src_path and not backing_needs_reset:
             _, rsp.actualSize = linux.qcow2_size_and_actual_size(cmd.destPath)
             rsp.totalCapacity, rsp.availableCapacity = self._get_disk_capacity(cmd.storagePath)
             return jsonobject.dumps(rsp)
 
         if not cmd.fullRebase:
-            linux.qcow2_rebase(cmd.srcPath, cmd.destPath)
+            if encrypted_dek:
+                linux.qcow2_rebase_with_secret(cmd.srcPath, cmd.destPath,
+                                               lambda: volume_secret.luks_secret_channel(encrypted_dek))
+            else:
+                linux.qcow2_rebase(cmd.srcPath, cmd.destPath)
         else:
             tmp = os.path.join(os.path.dirname(cmd.destPath), '%s.qcow2' % uuidhelper.uuid())
-            qcow2.create_template_with_task_daemon(cmd.destPath, tmp, task_spec=cmd)
+            if encrypted_dek:
+                linux.create_encrypted_template_with_secret(cmd.destPath, tmp, volume_secret.make_luks_secret_file(encrypted_dek))
+            else:
+                qcow2.create_template_with_task_daemon(cmd.destPath, tmp, task_spec=cmd)
             shell.call("mv %s %s" % (tmp, cmd.destPath))
 
         self.imagestore_client.clean_meta(cmd.destPath)
@@ -866,13 +904,20 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = OfflineCommitSnapshotRsp()
 
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
         if linux.qcow2_get_backing_file(cmd.top) != linux.qcow2_get_backing_file(cmd.base):
-            linux.qcow2_commit(cmd.top, cmd.base)
+            if encrypted_dek:
+                linux.qcow2_commit_with_secret(cmd.top, cmd.base, volume_secret.make_luks_secret_file(encrypted_dek))
+            else:
+                linux.qcow2_commit(cmd.top, cmd.base)
 
         if cmd.topChildrenInstallPathInDb:
             for children in cmd.topChildrenInstallPathInDb:
                 if linux.qcow2_get_backing_file(children) != cmd.base:
-                    linux.qcow2_rebase_no_check(cmd.base, children)
+                    if encrypted_dek:
+                        linux.qcow2_rebase_no_check_with_secret(cmd.base, children, volume_secret.make_luks_secret_file(encrypted_dek))
+                    else:
+                        linux.qcow2_rebase_no_check(cmd.base, children)
 
         self.imagestore_client.clean_meta(cmd.base)
 
@@ -931,6 +976,7 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
     def create_empty_volume(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = CreateEmptyVolumeRsp()
+
         try:
             self.do_create_empty_volume(cmd)
         except Exception as e:
@@ -951,11 +997,85 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
 
         if cmd.volumeFormat == "raw":
             linux.raw_create(cmd.installUrl, cmd.size)
-        else:  # default: cmd.volumeFormat == "qcow2"
-            if cmd.backingFile:
+            return
+
+        # default: cmd.volumeFormat == "qcow2".
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
+        if cmd.backingFile:
+            if encrypted_dek:
+                opt = ""
+                if getattr(cmd, 'kvmHostAddons', None) is not None and cmd.kvmHostAddons.qcow2Options is not None:
+                    opt = cmd.kvmHostAddons.qcow2Options
+                with volume_secret.luks_secret_channel(encrypted_dek) as secret_file:
+                    linux.qcow2_clone_encrypted(cmd.backingFile, cmd.installUrl, secret_file, size=cmd.size, opt=opt)
+            else:
                 linux.qcow2_create_with_backing_file_and_cmd(cmd.backingFile, cmd.installUrl, cmd, cmd.size)
+        else:
+            if encrypted_dek:
+                opt = None
+                if getattr(cmd, 'kvmHostAddons', None) is not None and cmd.kvmHostAddons.qcow2Options is not None:
+                    opt = cmd.kvmHostAddons.qcow2Options
+                with volume_secret.luks_secret_channel(encrypted_dek) as secret_file:
+                    if opt:
+                        linux.qcow2_create_encrypted(cmd.installUrl, cmd.size, secret_file, opt=opt)
+                    else:
+                        linux.qcow2_create_encrypted(cmd.installUrl, cmd.size, secret_file)
             else:
                 linux.qcow2_create_with_cmd(cmd.installUrl, cmd.size, cmd)
+
+    @kvmagent.replyerror
+    def encrypt_volume_bits(self, req):
+        """
+        In-place LUKS encryption of a plain volume file on local storage.
+        Used by the data-volume-from-template path: after the plain template bits
+        have been downloaded into the volume's install path, this handler converts
+        them into a self-contained LUKS-encrypted qcow2 at the same path.
+        """
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        rsp = AgentResponse()
+        try:
+            encrypted_dek = getattr(cmd, 'encryptedDek', None)
+            secret_material_file = volume_secret.make_luks_secret_file(encrypted_dek)
+            linux.encrypt_plain_volume_in_place(cmd.installPath, secret_material_file)
+            logger.debug('successfully LUKS-encrypted volume bits at %s' % cmd.installPath)
+        except Exception as e:
+            logger.warn(linux.get_exception_stacktrace())
+            rsp.success = False
+            rsp.error = 'failed to LUKS-encrypt volume bits at %s: %s' % (cmd.installPath, str(e))
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    def convert_volume_encryption(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        rsp = AgentResponse()
+        actual_sizes = {}
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
+        converted_items = []
+
+        try:
+            if cmd.targetEncrypted and not encrypted_dek:
+                raise Exception("target encrypted conversion requires encryptedDek")
+
+            for index, item in enumerate(cmd.items):
+                if not os.path.exists(item.sourceInstallPath):
+                    raise Exception("source file %s does not exist" % item.sourceInstallPath)
+                if os.path.exists(item.targetInstallPath):
+                    raise Exception("target file %s already exists" % item.targetInstallPath)
+                target_backing_path = getattr(item, 'targetBackingInstallPath', None)
+                secret_file_provider = (lambda: volume_secret.luks_secret_channel(encrypted_dek)) if encrypted_dek else None
+                converted_items.append(item)
+                actual_size = linux.convert_qcow2_volume_encryption(
+                    item.sourceInstallPath, item.targetInstallPath, cmd.targetEncrypted,
+                    secret_file_provider, target_backing_path)
+                actual_sizes[item.resourceUuid] = long(actual_size)
+            rsp.actualSizes = actual_sizes
+        except Exception as e:
+            logger.warn(linux.get_exception_stacktrace())
+            for item in converted_items:
+                linux.rm_file_force(item.targetInstallPath)
+            rsp.success = False
+            rsp.error = 'failed to convert volume[%s] encryption: %s' % (cmd.volumeUuid, str(e))
+        return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
     def create_volume_with_backing(self, req):
@@ -989,6 +1109,15 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
         dirname = os.path.dirname(vol_path)
         if not os.path.exists(dirname):
             os.makedirs(dirname, 0775)
+
+        encrypted_dek = getattr(cmd, 'encryptedDek', None)
+        if encrypted_dek:
+            with volume_secret.luks_secret_channel(encrypted_dek) as secret_file:
+                linux.qcow2_clone_with_secret(
+                    backing_path, vol_path, secret_file,
+                    size=getattr(cmd, 'virtualSize', 0) or "",
+                    kvm_host_addons=getattr(cmd, 'kvmHostAddons', None))
+            return
 
         linux.qcow2_clone_with_cmd(backing_path, vol_path, cmd)
 

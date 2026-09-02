@@ -195,8 +195,15 @@ def mask_sensitive_field(cmd, cmd_str):
     obj = simplejson.loads(cmd_str)
 
     def set_nested(o, keys):
-        if not keys or not isinstance(o, dict):
+        if not keys:
             return
+        if isinstance(o, list):
+            for item in o:
+                set_nested(item, keys)
+            return
+        if not isinstance(o, dict):
+            return
+
         key = keys[0]
         if key in o:
             if len(keys) == 1:
