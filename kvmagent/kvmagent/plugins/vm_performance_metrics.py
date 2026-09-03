@@ -47,6 +47,7 @@ def _read_int(path):
 def _collect_host_cpu(path="/proc/schedstat"):
     version = None
     delays = {}
+    valid = False
     try:
         with open(path) as stream:
             for line in stream:
@@ -59,9 +60,10 @@ def _collect_host_cpu(path="/proc/schedstat"):
                     # Supported schedstat CPU records end in:
                     # running_ns, run_delay_ns, timeslices.
                     delays[fields[0]] = int(fields[-2])
+        valid = version is not None and bool(delays)
     except (IOError, OSError, ValueError):
         pass
-    return {"version": version, "runDelayNs": delays}
+    return {"version": version, "runDelayNs": delays, "valid": valid}
 
 
 def _is_partition(name, sys_block="/sys/class/block"):
@@ -88,17 +90,54 @@ def _collect_host_disks(path="/proc/diskstats",
                     "writeTimeMs": int(fields[10]),
                 }
     except (IOError, OSError, ValueError):
-        pass
-    # Avoid double counting device-mapper IO and its backing devices.
-    mapped = dict((k, v) for k, v in disks.items() if k.startswith("dm-"))
-    return mapped if mapped else disks
+        return None
+    return _select_top_level_disks(disks, sys_block)
+
+
+def _block_relations(name, relation, sys_block):
+    path = os.path.join(sys_block, name, relation)
+    try:
+        return set(os.listdir(path))
+    except (IOError, OSError):
+        return set()
+
+
+def _whole_disk_for_partition(name, sys_block):
+    if not _is_partition(name, sys_block):
+        return None
+    real_path = os.path.realpath(os.path.join(sys_block, name))
+    parent = os.path.basename(os.path.dirname(real_path))
+    return parent if parent and parent != name else None
+
+
+def _select_top_level_disks(disks, sys_block="/sys/class/block"):
+    """Keep top-level dm devices and raw disks outside their backing graphs."""
+    dm_names = set(name for name in disks if name.startswith("dm-"))
+    top_dm = set(name for name in dm_names
+                 if not (_block_relations(name, "holders", sys_block) & dm_names))
+    backing = set()
+
+    def add_slaves(name):
+        for slave in _block_relations(name, "slaves", sys_block):
+            if slave in backing:
+                continue
+            backing.add(slave)
+            parent = _whole_disk_for_partition(slave, sys_block)
+            if parent:
+                backing.add(parent)
+            add_slaves(slave)
+
+    for name in top_dm:
+        add_slaves(name)
+    selected = top_dm | (set(disks) - dm_names - backing)
+    return dict((name, disks[name]) for name in selected)
 
 
 def _host_nic_names(sys_net="/sys/class/net"):
     try:
         names = os.listdir(sys_net)
     except (IOError, OSError):
-        return []
+        return None
     ignored = ("vnet", "vnic", "tap", "tun", "virbr", "br", "docker",
                "veth", "vxlan", "genev", "outer", "ud_")
     result = []
@@ -116,22 +155,31 @@ def _host_nic_names(sys_net="/sys/class/net"):
 
 def _collect_host_network(sys_net="/sys/class/net"):
     interfaces = {}
-    for name in _host_nic_names(sys_net):
+    names = _host_nic_names(sys_net)
+    if names is None:
+        return None
+    for name in names:
         stats = os.path.join(sys_net, name, "statistics")
-        interfaces[name] = {
-            "rxDrop": _read_int(os.path.join(stats, "rx_dropped")),
-            "txDrop": _read_int(os.path.join(stats, "tx_dropped")),
-        }
+        rx_drop = _read_int(os.path.join(stats, "rx_dropped"))
+        tx_drop = _read_int(os.path.join(stats, "tx_dropped"))
+        if rx_drop is None or tx_drop is None:
+            return None
+        interfaces[name] = {"rxDrop": rx_drop, "txDrop": tx_drop}
     return interfaces
 
 
 def collect_host_snapshot():
+    cpu = _collect_host_cpu()
+    disks = _collect_host_disks()
+    interfaces = _collect_host_network()
     return {
         "hostname": socket.gethostname(),
         "capturedAt": time.time(),
-        "cpu": _collect_host_cpu(),
-        "disks": _collect_host_disks(),
-        "interfaces": _collect_host_network(),
+        "cpu": cpu,
+        "disks": disks or {},
+        "interfaces": interfaces or {},
+        "valid": {"cpu": cpu["valid"], "disks": disks is not None,
+                  "interfaces": interfaces is not None},
     }
 
 
@@ -403,6 +451,35 @@ class VmHostPerformanceCollector(object):
         self.lock = threading.RLock()
         self.previous_vm = None
         self.previous_host = None
+        self.last_host_metrics = {"cpu": None, "disks": {}, "interfaces": {}}
+
+    @staticmethod
+    def _component_valid(snapshot, component):
+        return snapshot.get("valid", {}).get(component, True)
+
+    def _update_host_metrics(self, current):
+        components = ("cpu", "disks", "interfaces")
+        if self.previous_host is None:
+            self.previous_host = {"componentCapturedAt": {}, "valid": {}}
+        for component in components:
+            if not self._component_valid(current, component):
+                continue
+            previous_time = self.previous_host["componentCapturedAt"].get(component)
+            if previous_time is not None:
+                before = {"capturedAt": previous_time,
+                          "cpu": self.previous_host.get("cpu", {"version": None, "runDelayNs": {}}),
+                          "disks": self.previous_host.get("disks", {}),
+                          "interfaces": self.previous_host.get("interfaces", {})}
+                now = {"capturedAt": current["capturedAt"],
+                       "cpu": current.get("cpu", before["cpu"]),
+                       "disks": current.get("disks", before["disks"]),
+                       "interfaces": current.get("interfaces", before["interfaces"])}
+                calculated = calculate_host_metrics(before, now)
+                self.last_host_metrics[component] = calculated[component]
+            self.previous_host[component] = current[component]
+            self.previous_host["componentCapturedAt"][component] = current["capturedAt"]
+            self.previous_host["valid"][component] = True
+        return self.last_host_metrics
 
     @staticmethod
     def _open_libvirt():
@@ -421,12 +498,11 @@ class VmHostPerformanceCollector(object):
             finally:
                 conn.close()
             current_host = collect_host_snapshot()
-            if self.previous_vm is None or self.previous_host is None:
+            if self.previous_vm is None:
                 self.previous_vm = current_vm
-                self.previous_host = current_host
+                self._update_host_metrics(current_host)
                 return list(_metric_families().values())
             vm_metrics = calculate_vm_metrics(self.previous_vm, current_vm)
-            host_metrics = calculate_host_metrics(self.previous_host, current_host)
+            host_metrics = self._update_host_metrics(current_host)
             self.previous_vm = current_vm
-            self.previous_host = current_host
             return build_prometheus_metrics(vm_metrics, host_metrics)

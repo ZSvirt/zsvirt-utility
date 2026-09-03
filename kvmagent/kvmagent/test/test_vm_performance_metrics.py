@@ -7,6 +7,8 @@ import os
 import sys
 import types
 import unittest
+import shutil
+import tempfile
 
 try:
     from prometheus_client.core import GaugeMetricFamily  # noqa: F401
@@ -37,6 +39,70 @@ import vm_performance_metrics as metrics
 
 
 class VmPerformanceMetricsTest(unittest.TestCase):
+    def test_host_component_last_good_survives_failure_and_recovers(self):
+        collector = metrics.VmHostPerformanceCollector()
+
+        def snapshot(at, delay, requests, duration, drops, valid=True):
+            return {"capturedAt": at,
+                    "cpu": {"version": 15, "runDelayNs": {"cpu0": delay},
+                            "valid": valid},
+                    "disks": {"sda": {"readRequests": requests,
+                                       "readTimeMs": duration,
+                                       "writeRequests": requests,
+                                       "writeTimeMs": duration}} if valid else {},
+                    "interfaces": {"eth0": {"rxDrop": drops,
+                                              "txDrop": drops}} if valid else {},
+                    "valid": dict((name, valid) for name in
+                                  ("cpu", "disks", "interfaces"))}
+
+        collector._update_host_metrics(snapshot(0, 0, 0, 0, 0))
+        good = collector._update_host_metrics(snapshot(10, 1000000, 2, 4, 3))
+        self.assertEqual(1.0, good["cpu"]["readyTimeMs"])
+        self.assertEqual(2.0, good["disks"]["sda"]["readLatencyMs"])
+        self.assertEqual(3, good["interfaces"]["eth0"]["rxDrop"])
+
+        failed = collector._update_host_metrics(snapshot(20, 0, 0, 0, 0, False))
+        self.assertIs(good, failed)
+        self.assertEqual(1.0, failed["cpu"]["readyTimeMs"])
+
+        recovered = collector._update_host_metrics(snapshot(30, 3000000, 6, 12, 8))
+        self.assertEqual(2.0, recovered["cpu"]["readyTimeMs"])
+        self.assertEqual(2.0, recovered["disks"]["sda"]["readLatencyMs"])
+        self.assertEqual(5, recovered["interfaces"]["eth0"]["rxDrop"])
+
+    def test_disk_topology_keeps_top_dm_and_unrelated_raw_disks(self):
+        root = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(root, "sda2"))
+            open(os.path.join(root, "sda2", "partition"), "w").close()
+            for name in ("dm-0", "dm-1", "sda", "sdb", "nvme0n1", "sda2"):
+                if name == "sda2":
+                    continue
+                os.makedirs(os.path.join(root, name, "holders"))
+                os.makedirs(os.path.join(root, name, "slaves"))
+            os.mkdir(os.path.join(root, "dm-0", "holders", "dm-1"))
+            os.mkdir(os.path.join(root, "dm-0", "slaves", "sda2"))
+            os.mkdir(os.path.join(root, "dm-1", "slaves", "dm-0"))
+            disks = dict((name, {"marker": name}) for name in
+                         ("dm-0", "dm-1", "sda", "sdb", "nvme0n1"))
+            original_realpath = metrics.os.path.realpath
+            metrics.os.path.realpath = lambda path: (
+                os.path.join(root, "devices", "sda", "sda2")
+                if path == os.path.join(root, "sda2") else original_realpath(path))
+            try:
+                selected = metrics._select_top_level_disks(disks, root)
+            finally:
+                metrics.os.path.realpath = original_realpath
+            self.assertEqual(set(["dm-1", "sdb", "nvme0n1"]), set(selected))
+        finally:
+            shutil.rmtree(root)
+
+    def test_host_read_failures_are_explicit(self):
+        missing = os.path.join(tempfile.gettempdir(), "does-not-exist-zstack")
+        self.assertFalse(metrics._collect_host_cpu(missing)["valid"])
+        self.assertIsNone(metrics._collect_host_disks(missing, missing))
+        self.assertIsNone(metrics._collect_host_network(missing))
+
     def test_calculates_vm_cpu_disk_and_network_metrics(self):
         previous = {
             "capturedAt": 10.0,
