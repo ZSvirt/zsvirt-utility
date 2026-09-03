@@ -6,10 +6,6 @@
         (no network / agent / distro / vyos)
     </description>
 
-    <property environment="env" />
-    <condition property="enterprise_edition" value="${env.enterprise_edition}" else="false">
-        <isset property="env.enterprise_edition" />
-    </condition>
     <property file="build.zsv.properties" />
     <property file="${zstack.source}/VERSION" />
     <property file="${zstack.source}/PJNUM"/>
