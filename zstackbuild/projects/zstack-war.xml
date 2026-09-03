@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
 <project name="zstack war builder" basedir="../">
-    <!-- Default to Community Edition. CI may override with -Denterprise_edition=true. -->
-    <property name="enterprise_edition" value="false" />
+    <!-- Default to Community Edition. CI may override with -Dzsv.edition=true. -->
+    <property name="zsv.edition" value="false" />
 
     <target name="build-zstack-war">
         <checkProperty property="zstack.source" />
@@ -17,7 +17,7 @@
         <exec executable="bash" dir="${zstack.source}" failonerror="true">
             <arg value="${war.build.script}" />
             <arg value="${zstack.source}" />
-            <arg value="${enterprise_edition}" />
+            <arg value="${zsv.edition}" />
         </exec>
 
         <copy file="${zstack.source}/build/target/zstack.war" todir="${build.dir}" overwrite="true" />

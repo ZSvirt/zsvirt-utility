@@ -2,14 +2,14 @@
 set -euo pipefail
 
 source_dir="${1:?missing source directory}"
-enterprise_edition="${2:-false}"
+zsv_edition="${2:-false}"
 
 cd "$source_dir"
 
-case "$enterprise_edition" in
+case "$zsv_edition" in
   true)
     if [ ! -f zsvirt-ee/pom.xml ]; then
-      echo "ERROR: enterprise_edition=true requires zsvirt-ee/pom.xml" >&2
+      echo "ERROR: zsv.edition=true requires zsvirt-ee/pom.xml" >&2
       exit 1
     fi
 
@@ -19,7 +19,7 @@ case "$enterprise_edition" in
     ./runMavenProfile premium
     ;;
   *)
-    echo "ERROR: enterprise_edition must be true or false, got: $enterprise_edition" >&2
+    echo "ERROR: zsv.edition must be true or false, got: $zsv_edition" >&2
     exit 1
     ;;
 esac
