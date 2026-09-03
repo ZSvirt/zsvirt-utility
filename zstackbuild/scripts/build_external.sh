@@ -9,7 +9,7 @@ BUILD_ROOT=${ZSTACK_BUILD_ROOT:-$(cd -- "${ZSTACKBUILD_DIR}/../.." && pwd)}
 ZWATCH_SOURCE=${ZSTACK_ZWATCH_SOURCE:-${BUILD_ROOT}/zstack-zwatch}
 STORE_SOURCE=${ZSTACK_STORE_SOURCE:-${BUILD_ROOT}/zstack-store}
 SHAREDBLOCK_SOURCE=${ZSTACK_SHAREDBLOCK_SOURCE:-${BUILD_ROOT}/zstack-sharedblock}
-ZSTACK_SOURCE=${ZSTACK_SOURCE:-${BUILD_ROOT}/zstack}
+ZSTACK_SOURCE=${ZSTACK_SOURCE:-${BUILD_ROOT}/zsvirt}
 
 GOROOT=${ZSV_GOROOT:-/usr/lib/golang1.18}
 ZWATCH_ARCH=${ZWATCH_ARCH:-amd64}
@@ -195,4 +195,3 @@ mkdir -p -- "${STAGING_DIR}/zsblk-agent"
 cp -a -- "${SHAREDBLOCK_SOURCE}/target/package/zsblk-agent/." "${STAGING_DIR}/zsblk-agent/"
 
 write_archive "${STAGING_DIR}"
-

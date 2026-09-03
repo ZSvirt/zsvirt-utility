@@ -226,7 +226,7 @@
 
     <target name="help">
         <echo message="usage: ant -propertyfile build.zsv.properties -buildfile build.zsv.xml [build-war|all-in-one] -Dzstack_build_root=YOUR_ZSTACK_PACKAGE_ROOT" />
-        <echo message="repos: zstack, premium, zstack-utility; external runtime: zstackbuild/external" />
+        <echo message="repos: zsvirt, zsvirt-ee, zsvirt-utility; external runtime: zstackbuild/external" />
     </target>
 
     <target name="do-build-zstack" depends="prepare, prepare-external-runtime, build-zstack-war" >
