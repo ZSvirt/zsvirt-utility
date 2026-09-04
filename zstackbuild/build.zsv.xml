@@ -77,6 +77,12 @@
     <import file="${basedir}/projects/zstack-console-proxy.xml" optional="false" />
     <import file="${basedir}/projects/zstack-setting.xml" optional="false" />
     <import file="${basedir}/projects/zstack-testagent.xml" optional="false" />
+    <!-- Must be set before importing zstack-buildallinone.xml (Ant properties are immutable).
+         zsv.edition=true: enable repo version check like build.xml.
+         zsv.edition=false: local bin without distro metadata. -->
+    <condition property="check.repo.version" value="True" else="False">
+        <equals arg1="${zsv.edition}" arg2="true"/>
+    </condition>
     <import file="${basedir}/projects/zstack-buildallinone.xml" optional="false" />
     <import file="${basedir}/projects/package.xml" optional="false" />
     <import file="${basedir}/projects/zstack-testconf.xml" optional="false" />
@@ -95,12 +101,28 @@
     <import file="${basedir}/projects/build-pypi-source.xml" optional="false" />
     <import file="${basedir}/projects/install-all-zstack-agents-to-local-virtualenv.xml" optional="false" />
 
-    <!-- Build premium bin without requiring distro repository metadata. -->
-    <property name="check.repo.version" value="False"/>
+    <!-- zsv.edition=true: copy .repo_version from distro (same as build.xml / zstack-buildallinone.xml).
+         zsv.edition=false: write local placeholder without requiring distro metadata. -->
+    <condition property="is.zsv.edition">
+        <equals arg1="${zsv.edition}" arg2="true"/>
+    </condition>
     <target name="check-repo-version-exists">
-        <property name="repo.version.exists" value="true"/>
+        <condition property="repo.version.exists" value="true">
+            <not>
+                <isset property="is.zsv.edition"/>
+            </not>
+        </condition>
+        <available file="${zstack.repo.version}" property="repo.version.exists"/>
     </target>
     <target name="copy-repo-version" depends="check-repo-version-exists">
+        <antcall target="-copy-repo-version-from-distro"/>
+        <antcall target="-copy-repo-version-local"/>
+    </target>
+    <target name="-copy-repo-version-from-distro" if="is.zsv.edition">
+        <echo message="copy .repo_version to ${allinone.bin.dir}" />
+        <copy file="${zstack.repo.version}" todir="${allinone.bin.dir}" />
+    </target>
+    <target name="-copy-repo-version-local" unless="is.zsv.edition">
         <echo message="write generated .repo_version to ${allinone.bin.dir}" />
         <echo file="${allinone.bin.dir}/.repo_version" append="false">zsv-local</echo>
     </target>
