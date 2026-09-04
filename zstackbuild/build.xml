@@ -473,6 +473,7 @@
             <arg value="--from-target" />
             <env key="BUILD_NUM" value="${package.external.build.num}" />
             <env key="ZSTACK_BUILD_ROOT" value="${zstack_build_root}" />
+            <env key="ZSTACK_DISTRO_SOURCE" value="${zstack.distro.source}" />
         </exec>
     </target>
     <target name="all-in-one" depends="build-war, build-allinone, package-external-archive">

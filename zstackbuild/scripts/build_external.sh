@@ -10,6 +10,7 @@ ZWATCH_SOURCE=${ZSTACK_ZWATCH_SOURCE:-${BUILD_ROOT}/zstack-zwatch}
 STORE_SOURCE=${ZSTACK_STORE_SOURCE:-${BUILD_ROOT}/zstack-store}
 SHAREDBLOCK_SOURCE=${ZSTACK_SHAREDBLOCK_SOURCE:-${BUILD_ROOT}/zstack-sharedblock}
 ZSTACK_SOURCE=${ZSTACK_SOURCE:-${BUILD_ROOT}/zsvirt}
+ZSTACK_DISTRO_SOURCE=${ZSTACK_DISTRO_SOURCE:-${BUILD_ROOT}/zstack-distro}
 
 GOROOT=${ZSV_GOROOT:-/usr/lib/golang1.18}
 ZWATCH_ARCH=${ZWATCH_ARCH:-amd64}
@@ -70,15 +71,27 @@ resolve_version() {
         return
     fi
 
+    # Same product version as zstack-ctl status / ISO: zstack-distro/mkiso/zsphere_config/version.
+    # Open-source vs commercial differs by distro branch content (e.g. 1.0.0 vs 5.2.0).
+    local distro_version_file="${ZSTACK_DISTRO_SOURCE}/mkiso/zsphere_config/version"
+    if [ -s "${distro_version_file}" ]; then
+        tr -d '[:space:]' < "${distro_version_file}"
+        printf '\n'
+        return
+    fi
+
     require_file "${ZSTACK_SOURCE}/VERSION"
-    local major minor update version
+    local major minor micro version
     major=$(read_version_value MAJOR)
     minor=$(read_version_value MINOR)
-    update=$(read_version_value UPDATE)
-    if [ -z "${major}" ] || [ -z "${minor}" ] || [ -z "${update}" ]; then
-        fail "invalid VERSION file: ${ZSTACK_SOURCE}/VERSION"
+    micro=$(read_version_value MICRO)
+    if [ -z "${micro}" ]; then
+        micro=$(read_version_value UPDATE)
     fi
-    version="${major}.${minor}.${update}"
+    if [ -z "${major}" ] || [ -z "${minor}" ] || [ -z "${micro}" ]; then
+        fail "invalid VERSION file: ${ZSTACK_SOURCE}/VERSION (need MAJOR/MINOR/MICRO)"
+    fi
+    version="${major}.${minor}.${micro}"
     if [ -n "${BUILD_NUM:-}" ]; then
         version="${version}.${BUILD_NUM}"
     fi
