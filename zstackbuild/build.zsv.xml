@@ -290,9 +290,6 @@
                 <antcall target="build-apibinding"/>
             </sequential>
             <sequential>
-                <antcall target="build-zstack-dashboard-on-condition"/>
-            </sequential>
-            <sequential>
                 <antcall target="build-iscsi"/>
             </sequential>
             <sequential>
@@ -340,9 +337,6 @@
             </sequential>
             <sequential>
                 <antcall target="assemble-ctl"/>
-            </sequential>
-            <sequential>
-                <antcall target="assemble-zstack-dashboard-on-condition"/>
             </sequential>
             <sequential>
                 <antcall target="assemble-zstack-ui-bin-on-condition"/>
