@@ -89,7 +89,8 @@
     <import file="${basedir}/projects/zstack-apibinding.xml" optional="false" />
     <import file="${basedir}/projects/zstack-cli.xml" optional="false" />
     <import file="${basedir}/projects/zstack-dashboard.xml" optional="false" />
-    <import file="${basedir}/projects/zstack-ui-war.xml" optional="false" />
+    <!-- Same as build.xml: UI targets come from zstack-ui-server/build/build.xml -->
+    <import file="${build.ui.entry}/build/build.xml" optional="true" />
     <import file="${basedir}/projects/zstack-pysdk.xml" optional="false" />
     <import file="${basedir}/projects/zstack-ctl.xml" optional="false" />
     <import file="${basedir}/projects/zstack-store.xml" optional="false" />
@@ -245,13 +246,13 @@
         <antcall target="assemble-zstack-dashboard" />
     </target>
 
-    <!-- For UI 2.0 -->
-    <target name="build-zstack-ui-war-on-condition" if="${build.zstack.ui.war}">
-        <antcall target="build-zstack-ui-war" />
+    <!-- For UI 2.0 (same as build.xml) -->
+    <target name="build-zstack-ui-on-condition" if="${build.zstack.ui}">
+        <antcall target="build-zstack-ui" />
     </target>
 
-    <target name="assemble-zstack-ui-war-on-condition" if="${build.zstack.ui.war}">
-        <antcall target="assemble-zstack-ui-war" />
+    <target name="assemble-zstack-ui-bin-on-condition" if="${build.zstack.ui}">
+        <antcall target="assemble-zstack-ui-bin" />
     </target>
 
     <target name="help">
@@ -289,6 +290,9 @@
                 <antcall target="build-apibinding"/>
             </sequential>
             <sequential>
+                <antcall target="build-zstack-dashboard-on-condition"/>
+            </sequential>
+            <sequential>
                 <antcall target="build-iscsi"/>
             </sequential>
             <sequential>
@@ -309,7 +313,7 @@
                 <antcall target="do-build-zstack"/>
             </sequential>
             <sequential>
-                <antcall target="build-zstack-ui-war-on-condition"/>
+                <antcall target="build-zstack-ui-on-condition"/>
             </sequential>
         </parallel>
     </target>
@@ -338,7 +342,10 @@
                 <antcall target="assemble-ctl"/>
             </sequential>
             <sequential>
-                <antcall target="assemble-zstack-ui-war-on-condition"/>
+                <antcall target="assemble-zstack-dashboard-on-condition"/>
+            </sequential>
+            <sequential>
+                <antcall target="assemble-zstack-ui-bin-on-condition"/>
             </sequential>
             <sequential>
                 <antcall target="assemble-zstack-pysdk"/>
