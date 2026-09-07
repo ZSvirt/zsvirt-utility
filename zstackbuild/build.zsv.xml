@@ -2,8 +2,9 @@
 
 <project name="zstack build system" default="help" basedir=".">
     <description>
-        ZSV bin build: zstack + premium + utility agents + prebuilt external runtime artifacts
-        (no network / agent / distro / vyos)
+        ZSV bin build: zsvirt + zsvirt-utility + commercial agents (same components as build.xml).
+        Open-source builds should use build.oss.xml / leave build_war_flag unset.
+        Commercial/premium: set build_war_flag (e.g. premium) so agent/store and related packages are included.
     </description>
 
     <property file="build.zsv.properties" />
@@ -65,7 +66,6 @@
     <import file="${basedir}/projects/zstack-war.xml" optional="false" />
     <import file="${basedir}/projects/zstacklib.xml" optional="false" />
     <import file="${basedir}/projects/zstack-kvmagent.xml" optional="false" />
-    <import file="${basedir}/projects/zstack-zwatch.xml" optional="false" />
     <import file="${basedir}/projects/zsvirt-external-runtime.xml" optional="false" />
     <import file="${basedir}/projects/zstack-virtualrouter.xml" optional="false" />
     <import file="${basedir}/projects/zstack-appliancevm.xml" optional="false" />
@@ -93,13 +93,22 @@
     <import file="${build.ui.entry}/build/build.xml" optional="true" />
     <import file="${basedir}/projects/zstack-pysdk.xml" optional="false" />
     <import file="${basedir}/projects/zstack-ctl.xml" optional="false" />
+    <!-- Commercial components (same as build.xml; agent/store gated by build_war_flag) -->
+    <import file="${basedir}/projects/zstack-agent.xml" optional="false" />
     <import file="${basedir}/projects/zstack-store.xml" optional="false" />
+    <import file="${basedir}/projects/zstack-vyos.xml" optional="false" />
+    <import file="${basedir}/projects/zstack-network.xml" optional="false" />
     <import file="${basedir}/projects/zstack-sharedblock.xml" optional="false" />
+    <import file="${basedir}/projects/zstack-distro.xml" optional="false" />
+    <import file="${basedir}/projects/zstack-zsha2.xml" optional="false" />
     <import file="${basedir}/projects/zstack-promtail.xml" optional="false" />
     <import file="${basedir}/projects/guest-tools.xml" optional="false" />
     <import file="${basedir}/projects/transmission.xml" optional="false" />
     <import file="${basedir}/projects/build-pypi-source.xml" optional="false" />
     <import file="${basedir}/projects/install-all-zstack-agents-to-local-virtualenv.xml" optional="false" />
+    <import file="${basedir}/projects/zstack-zwatch.xml" optional="false" />
+    <!-- zstack-baremetalpxeserver need zwatch generate agent_version file -->
+    <import file="${basedir}/projects/zstack-baremetalpxeserver.xml" optional="false" />
 
     <!-- Mirror projects/zstack-buildallinone.xml; local edition writes zsv-local. -->
     <condition property="is.zsv.edition">
@@ -130,14 +139,6 @@
     <!-- Product display version for zstack-ctl status; branch-specific via distro. -->
     <property name="zsphere.config.version" location="${zstack.distro.source}/mkiso/zsphere_config/version" />
 
-
-    <target name="assemble-zstack-zwatch">
-        <copy todir="${zsw.ansible.dir}">
-            <fileset dir="${zsw.bdir}">
-                <include name="**/*" />
-            </fileset>
-        </copy>
-    </target>
 
     <target name="prepare">
         <makeDir dir="${build.dir}" />
@@ -211,6 +212,20 @@
             <arg value="HEAD^..HEAD" />
         </exec>
 
+        <exec executable="git" failonerror="false" error="/dev/null" output="${war.dir}/agent-git-commit">
+            <arg value="--git-dir=${agent.source}/.git" />
+            <arg value="log" />
+            <arg value="--name-status" />
+            <arg value="HEAD^..HEAD" />
+        </exec>
+
+        <exec executable="git" failonerror="false" error="/dev/null" output="${war.dir}/imagestore-git-commit">
+            <arg value="--git-dir=${imagestore.source}/.git" />
+            <arg value="log" />
+            <arg value="--name-status" />
+            <arg value="HEAD^..HEAD" />
+        </exec>
+
         <exec executable="git" failonerror="false" error="/dev/null" output="${war.dir}/premium-git-commit">
             <arg value="--git-dir=${zstack.source}/premium/.git" />
             <arg value="log" />
@@ -225,6 +240,18 @@
         </exec>
         <exec executable="git" failonerror="false" error="/dev/null" output="${war.dir}/mevocoui-git-commit">
             <arg value="--git-dir=${mevocoui.source}/.git" />
+            <arg value="log" />
+            <arg value="--name-status" />
+            <arg value="HEAD^..HEAD" />
+        </exec>
+        <exec executable="git" failonerror="false" error="/dev/null" output="${war.dir}/zsn-git-commit">
+            <arg value="--git-dir=${zstacknetwork.source}/.git" />
+            <arg value="log" />
+            <arg value="--name-status" />
+            <arg value="HEAD^..HEAD" />
+        </exec>
+        <exec executable="git" failonerror="false" error="/dev/null" output="${war.dir}/zsblk-git-commit">
+            <arg value="--git-dir=${zstacksharedblock.source}/.git" />
             <arg value="log" />
             <arg value="--name-status" />
             <arg value="HEAD^..HEAD" />
@@ -260,6 +287,21 @@
         <echo message="repos: zsvirt, zsvirt-ee, zsvirt-utility; external runtime: zstackbuild/external" />
     </target>
 
+    <!-- Fail the build before packaging when a commercial runtime payload was not
+         assembled into the WAR. Repository names differ from their runtime paths:
+         zstack-network -> zsnagentansible, zstack-vyos -> zvr. -->
+    <target name="verify-commercial-components-on-condition" if="build_war_flag">
+        <checkFile file="${ansible.dir}/zstack-agent/server/zstack-agent.bin" />
+        <checkFile file="${ansible.dir}/zstack-agent/plugins/collectd/collectd.bin" />
+        <checkFile file="${ansible.dir}/zsnagentansible/zsn-agent.bin" />
+        <checkFile file="${ansible.dir}/zsnagentansible/zsnagentansible.py" />
+        <checkFile file="${ansible.dir}/zvr/zvr.bin" />
+        <checkFile file="${ansible.dir}/zvr/zvrboot.bin" />
+        <checkFile file="${ansible.dir}/imagestorebackupstorage/zstack-store.bin" />
+        <checkFile file="${ansible.dir}/zsblkagentansible/zsblk-agent.bin" />
+        <checkFile file="${ansible.dir}/kvm/zwatch-vm-agent" />
+    </target>
+
     <target name="do-build-zstack" depends="prepare, prepare-external-runtime, build-zstack-war" >
         <parallel failonany="true">
             <sequential>
@@ -290,6 +332,9 @@
                 <antcall target="build-apibinding"/>
             </sequential>
             <sequential>
+                <antcall target="build-zstack-dashboard-on-condition"/>
+            </sequential>
+            <sequential>
                 <antcall target="build-iscsi"/>
             </sequential>
             <sequential>
@@ -300,6 +345,26 @@
             </sequential>
             <sequential>
                 <antcall target="build-zbsp"/>
+            </sequential>
+            <sequential>
+                <antcall target="build-zstack-agent"/>
+            </sequential>
+            <!-- zstack-store, zstack-sharedblock and zstack-zwatch are already
+                 built by build_external.sh and copied by prepare-external-runtime. -->
+            <sequential>
+                <antcall target="build-baremetalpxeserver"/>
+            </sequential>
+            <sequential>
+                <antcall target="build-zstack-vyos"/>
+            </sequential>
+            <sequential>
+                <antcall target="build-zstack-network"/>
+            </sequential>
+            <sequential>
+                <antcall target="build-zstack-zsha2"/>
+            </sequential>
+            <sequential>
+                <antcall target="check-zstack-distro"/>
             </sequential>
         </parallel>
     </target>
@@ -339,6 +404,9 @@
                 <antcall target="assemble-ctl"/>
             </sequential>
             <sequential>
+                <antcall target="assemble-zstack-dashboard-on-condition"/>
+            </sequential>
+            <sequential>
                 <antcall target="assemble-zstack-ui-bin-on-condition"/>
             </sequential>
             <sequential>
@@ -363,13 +431,31 @@
                 <antcall target="assemble-zbsp"/>
             </sequential>
             <sequential>
+                <antcall target="assemble-agent-server"/>
+            </sequential>
+            <sequential>
+                <antcall target="assemble-agent-collectd"/>
+            </sequential>
+            <sequential>
                 <antcall target="assemble-zstack-store"/>
+            </sequential>
+            <sequential>
+                <antcall target="copy-pypi-source"/>
+            </sequential>
+            <sequential>
+                <antcall target="assemble-baremetalpxeserver"/>
+            </sequential>
+            <sequential>
+                <antcall target="assemble-zstack-vyos"/>
+            </sequential>
+            <sequential>
+                <antcall target="assemble-zstack-network"/>
             </sequential>
             <sequential>
                 <antcall target="assemble-zstack-sharedblock"/>
             </sequential>
             <sequential>
-                <antcall target="copy-pypi-source"/>
+                <antcall target="assemble-zstack-zsha2"/>
             </sequential>
             <sequential>
                 <antcall target="assemble-zstack-promtail"/>
@@ -381,6 +467,8 @@
                 <antcall target="assemble-transmission"/>
             </sequential>
         </parallel>
+
+        <antcall target="verify-commercial-components-on-condition"/>
 
         <makeDir dir="${libs.dir}" />
         <exec executable="cp" dir="${libs.dir}" failonerror="true">
