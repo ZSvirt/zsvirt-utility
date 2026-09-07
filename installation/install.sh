@@ -2429,10 +2429,13 @@ iz_upgrade_zsphere_tools(){
 
 inner_install_zsphere_tools(){
     ZSV_CONFIG_DIR=$ZSTACK_HOME/WEB-INF/classes/zsphere_config
-
-    /bin/rm -rf $ZSV_CONFIG_DIR
     mkdir -p $ZSV_CONFIG_DIR
-    /bin/cp -f $ZSV_SOURCE_FILE $ZSV_CONFIG_DIR/version
+
+    # Prefer ISO/DVD (commercial product version, e.g. 5.2.0).
+    # Otherwise keep the file baked into war by build.zsv.xml.
+    if [ -s "$ZSV_SOURCE_FILE" ]; then
+        /bin/cp -f $ZSV_SOURCE_FILE $ZSV_CONFIG_DIR/version
+    fi
 }
 
 install_zstack(){
