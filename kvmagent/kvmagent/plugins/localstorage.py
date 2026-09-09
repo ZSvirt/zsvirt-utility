@@ -296,12 +296,18 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
     ENCRYPT_VOLUME_BITS_PATH = "/localstorage/volume/encryptinplace"
     CONVERT_VOLUME_ENCRYPTION_PATH = "/localstorage/volume/convertencryption"
 
+    INITIALIZED_FILE_GUARD_EXEMPT_PATHS = set([
+        INIT_PATH,
+        CHECK_INITIALIZED_FILE,
+        CREATE_INITIALIZED_FILE,
+    ])
+
     _metadata_handler = FileBasedMetadataHandler()
 
     LOCAL_NOT_ROOT_USER_MIGRATE_TMP_PATH = "primary_storage_tmp_dir"
 
     def start(self):
-        http_server = kvmagent.get_http_server()
+        http_server = self._local_storage_guarded_http_server(kvmagent.get_http_server())
         http_server.register_async_uri(self.INIT_PATH, self.init)
         http_server.register_async_uri(self.GET_PHYSICAL_CAPACITY_PATH, self.get_physical_capacity)
         http_server.register_async_uri(self.CREATE_EMPTY_VOLUME_PATH, self.create_empty_volume)
@@ -360,6 +366,45 @@ class LocalStoragePlugin(kvmagent.KvmAgent):
 
     def stop(self):
         pass
+
+    def _local_storage_guarded_http_server(self, http_server):
+        plugin = self
+
+        class LocalStorageGuardedHttpServer(object):
+            def register_async_uri(self, path, handler, *args, **kwargs):
+                if path not in plugin.INITIALIZED_FILE_GUARD_EXEMPT_PATHS:
+                    handler = plugin._with_initialized_file_guard(path, handler)
+                return http_server.register_async_uri(path, handler, *args, **kwargs)
+
+        return LocalStorageGuardedHttpServer()
+
+    def _with_initialized_file_guard(self, path, handler):
+        def guarded(req):
+            cmd = jsonobject.loads(req[http.REQUEST_BODY])
+            self._check_initialized_file(path, cmd)
+            return handler(req)
+        guarded.__name__ = handler.__name__
+        return kvmagent.replyerror(guarded)
+
+    @staticmethod
+    def _check_initialized_file(path, cmd):
+        storage_uuid = getattr(cmd, 'primaryStorageUuid', None) or getattr(cmd, 'uuid', None)
+        storage_path = getattr(cmd, 'storagePath', None)
+        if not storage_uuid or not storage_path:
+            raise kvmagent.KvmError(
+                'local storage uri[%s] requires primaryStorageUuid/uuid and storagePath '
+                'for initialized-file guard' % path
+            )
+
+        initialized_file_path = os.path.join(storage_path, '%s-initialized-file' % storage_uuid)
+        if not os.path.exists(initialized_file_path):
+            raise kvmagent.KvmError(
+                'cannot access local storage through uri[%s] on primary storage[uuid:%s], '
+                'because initialized file[%s] is missing. The local storage path[%s] may not be mounted correctly; '
+                'refuse to continue to avoid operating on the system disk. '
+                'Check the mount and /etc/fstab with: lsblk -f; findmnt %s; cat /etc/fstab'
+                % (path, storage_uuid, initialized_file_path, storage_path, storage_path)
+            )
 
     @kvmagent.replyerror
     def cancel_download_from_kvmhost(self, req):
