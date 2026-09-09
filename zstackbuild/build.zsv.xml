@@ -8,7 +8,12 @@
     </description>
 
     <property file="build.zsv.properties" />
-    <property file="${zstack.source}/VERSION" />
+    <!-- Prefer zsvirt-ee/VERSION when present; open-source has no ee dir/file. -->
+    <available file="${zstack.source}/zsvirt-ee/VERSION" property="ee.version.exists"/>
+    <condition property="zstack.version.file" value="${zstack.source}/zsvirt-ee/VERSION" else="${zstack.source}/VERSION">
+        <isset property="ee.version.exists"/>
+    </condition>
+    <property file="${zstack.version.file}" />
     <property file="${zstack.source}/PJNUM"/>
     <property name="build.dir" location="${basedir}/target" />
     <property name="war.file" location="${build.dir}/zstack.war" />
@@ -189,6 +194,7 @@
         <antcall target="package-zsvirt-ee-schema-map-on-condition" />
 
         <property name="allinone.versionfile.in.war" location="${war.dir}/VERSION" />
+        <echo message="write war VERSION from ${zstack.version.file}: ${product.name} ${allinone.version}" />
         <echo file="${allinone.versionfile.in.war}" append="true">${product.name} ${allinone.version}</echo>
 
         <!-- Same source as build.xml + ISO: zstack-distro/mkiso/zsphere_config/version.
