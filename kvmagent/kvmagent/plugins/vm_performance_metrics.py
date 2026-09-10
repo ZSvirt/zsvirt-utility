@@ -186,13 +186,20 @@ def collect_host_snapshot():
 def _collect_vcpus(values):
     count = int(values.get("vcpu.current", 0))
     delays = {}
-    for vcpu_id in range(count):
-        delay_key = "vcpu.%d.delay" % vcpu_id
-        wait_key = "vcpu.%d.wait" % vcpu_id
-        if delay_key in values:
-            delays[vcpu_id] = int(values[delay_key])
-        elif wait_key in values:
-            delays[vcpu_id] = int(values[wait_key])
+    # vcpu.current is the number of online vCPUs, not an upper bound for
+    # their IDs. CPU hotplug can therefore produce sparse IDs (for example
+    # 0 and 2). Discover the IDs from libvirt's returned keys instead of
+    # assuming that online IDs are in range(vcpu.current).
+    for key, value in values.items():
+        match = re.match(r"^vcpu\.(\d+)\.(delay|wait)$", key)
+        if match is None:
+            continue
+        vcpu_id = int(match.group(1))
+        field = match.group(2)
+        # Prefer delay when both fields are exposed; wait is the fallback for
+        # libvirt versions which use that name for the scheduler wait counter.
+        if field == "delay" or vcpu_id not in delays:
+            delays[vcpu_id] = int(value)
     return count, delays
 
 

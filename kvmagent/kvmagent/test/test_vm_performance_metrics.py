@@ -235,6 +235,36 @@ class VmPerformanceMetricsTest(unittest.TestCase):
         self.assertNotIn("zstack_vm_cpu_ready_time_milliseconds",
                          [f.name for f in families])
 
+    def test_sparse_online_vcpu_ids_are_collected_across_two_samples(self):
+        before_count, before_delays = metrics._collect_vcpus({
+            "vcpu.current": 2,
+            "vcpu.maximum": 3,
+            "vcpu.0.delay": 1000000,
+            "vcpu.2.wait": 2000000,
+        })
+        after_count, after_delays = metrics._collect_vcpus({
+            "vcpu.current": 2,
+            "vcpu.maximum": 3,
+            "vcpu.0.delay": 3000000,
+            "vcpu.2.wait": 6000000,
+        })
+
+        cpu = metrics._calculate_cpu(
+            {"vcpuCount": before_count, "delayNs": before_delays},
+            {"vcpuCount": after_count, "delayNs": after_delays},
+            1000.0)
+        families = metrics.build_prometheus_metrics(
+            {"vm": {"cpu": cpu, "disks": {}, "interfaces": {}}},
+            {"cpu": None, "disks": {}, "interfaces": {}})
+
+        for metric_name in (
+                "zstack_vm_vcpu_ready_time_milliseconds",
+                "zstack_vm_vcpu_readiness_percent"):
+            samples = self.samples(families, metric_name)
+            ids = sorted(labels[1] if not isinstance(labels, dict)
+                         else labels["vcpu_id"] for labels, _ in samples)
+            self.assertEqual(["0", "2"], ids)
+
     def test_missing_vcpu_or_nonpositive_interval_suppresses_partial_average(self):
         previous = {"vcpuCount": 2, "delayNs": {0: 0, 1: 0}}
         self.assertIsNone(metrics._calculate_cpu(
