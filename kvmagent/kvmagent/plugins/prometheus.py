@@ -24,6 +24,8 @@ from zstacklib.utils.ip import get_host_physicl_nics
 from zstacklib.utils.ip import get_nic_supported_max_speed
 from zstacklib.utils.ipmitool import get_sensor_info_from_ipmi
 from zstacklib.utils.linux import is_virtual_machine, is_support_bmc
+from kvmagent.plugins import vm_performance_metrics
+from kvmagent.plugins import prometheus_registration
 
 logger = log.get_logger(__name__)
 collector_dict = {}  # type: Dict[str, threading.Thread]
@@ -58,6 +60,8 @@ hw_status_abnormal_list_record = {
 
 # collect domain max memory
 domain_max_memory = {}
+vm_performance_collector = vm_performance_metrics.VmHostPerformanceCollector()
+vm_performance_last_result = []
 
 def read_number(fname):
     res = linux.read_file(fname)
@@ -1284,6 +1288,23 @@ def collect_vm_statistics():
     return metrics.values()
 
 
+def collect_vm_host_performance_statistics():
+    """Collect interval VM/host metrics exposed by the KVM hypervisor.
+
+    The stateful collector establishes a counter baseline on its first run.
+    Keep the previous successful result when libvirt or procfs is temporarily
+    unavailable, matching the existing asynchronous collector behaviour.
+    Memory and co-stop metrics are intentionally not exported here.
+    """
+    global vm_performance_last_result
+    try:
+        result = list(vm_performance_collector.collect())
+        vm_performance_last_result = result
+    except Exception as ex:
+        logger.warn("failed to collect VM/host performance metrics: %s" % ex)
+    return vm_performance_last_result
+
+
 # since Cloud 4.5.0, Because GetVmGuestToolsAction calls are too frequent,
 # the information about whether pvpanic is configured for VM
 # will flow to the management node through the monitoring data.
@@ -2041,34 +2062,39 @@ def collect_kvmagent_memory_statistics():
     return metrics.values()
 
 
-kvmagent.register_prometheus_collector(collect_host_network_statistics)
-kvmagent.register_prometheus_collector(collect_host_capacity_statistics)
-kvmagent.register_prometheus_collector(collect_vm_statistics)
-kvmagent.register_prometheus_collector(collect_vm_pvpanic_enable_in_domain_xml)
-kvmagent.register_prometheus_collector(collect_node_disk_wwid)
-kvmagent.register_prometheus_collector(collect_host_conntrack_statistics)
-kvmagent.register_prometheus_collector(collect_physical_network_interface_state)
-kvmagent.register_prometheus_collector(collect_memory_overcommit_statistics)
-kvmagent.register_prometheus_collector(collect_kvmagent_memory_statistics)
+def _register_metric_collector(collector):
+    prometheus_registration.register_callback_once(kvmagent.register_prometheus_collector, collector)
+
+
+_register_metric_collector(collect_host_network_statistics)
+_register_metric_collector(collect_host_capacity_statistics)
+_register_metric_collector(collect_vm_statistics)
+_register_metric_collector(collect_vm_host_performance_statistics)
+_register_metric_collector(collect_vm_pvpanic_enable_in_domain_xml)
+_register_metric_collector(collect_node_disk_wwid)
+_register_metric_collector(collect_host_conntrack_statistics)
+_register_metric_collector(collect_physical_network_interface_state)
+_register_metric_collector(collect_memory_overcommit_statistics)
+_register_metric_collector(collect_kvmagent_memory_statistics)
 
 if misc.isMiniHost():
-    kvmagent.register_prometheus_collector(collect_lvm_capacity_statistics)
-    kvmagent.register_prometheus_collector(collect_mini_raid_state)
-    kvmagent.register_prometheus_collector(collect_equipment_state)
+    _register_metric_collector(collect_lvm_capacity_statistics)
+    _register_metric_collector(collect_mini_raid_state)
+    _register_metric_collector(collect_equipment_state)
 
 if misc.isHyperConvergedHost():
-    kvmagent.register_prometheus_collector(collect_ipmi_state)
+    _register_metric_collector(collect_ipmi_state)
 elif is_support_bmc():
-    kvmagent.register_prometheus_collector(collect_equipment_state_from_ipmi)
+    _register_metric_collector(collect_equipment_state_from_ipmi)
 
-kvmagent.register_prometheus_collector(collect_raid_state)
-kvmagent.register_prometheus_collector(collect_ssd_state)
-kvmagent.register_prometheus_collector(collect_nvidia_gpu_status)
-kvmagent.register_prometheus_collector(collect_amd_gpu_status)
-kvmagent.register_prometheus_collector(collect_hy_gpu_status)
-kvmagent.register_prometheus_collector(collect_block_device_status)
-kvmagent.register_prometheus_collector(collect_hba_port_device_state)
-kvmagent.register_prometheus_collector(collect_disk_stat)
+_register_metric_collector(collect_raid_state)
+_register_metric_collector(collect_ssd_state)
+_register_metric_collector(collect_nvidia_gpu_status)
+_register_metric_collector(collect_amd_gpu_status)
+_register_metric_collector(collect_hy_gpu_status)
+_register_metric_collector(collect_block_device_status)
+_register_metric_collector(collect_hba_port_device_state)
+_register_metric_collector(collect_disk_stat)
 
 class PrometheusPlugin(kvmagent.KvmAgent):
 
@@ -2415,7 +2441,9 @@ modules:
                 Collector.__store_cache__(collectStartTime, ret)
                 return ret
 
-        REGISTRY.register(Collector())
+        if not prometheus_registration.register_once(
+                REGISTRY, Collector(), "kvmagent-prometheus-exporter"):
+            logger.warn("prometheus collector has already been installed, skip duplicate registration")
 
 
     @thread.AsyncThread
