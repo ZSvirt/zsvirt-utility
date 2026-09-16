@@ -1216,6 +1216,16 @@ class StorageDevicePlugin(kvmagent.KvmAgent):
     @kvmagent.replyerror
     def disable_multipath(self, req):
         rsp = AgentRsp()
+        multipath_devices = bash.bash_errorout("dmsetup ls --target multipath").strip()
+        if multipath_devices:
+            shell.run("multipath -F")
+
+        multipath_devices = bash.bash_errorout("dmsetup ls --target multipath").strip()
+        if multipath_devices:
+            logger.warn("We cannot stop multipathd because multipath devices:\n%s still in use" % multipath_devices)
+            rsp.success = False
+            return jsonobject.dumps(rsp)
+
         lvm.disable_multipath()
         return jsonobject.dumps(rsp)
 
