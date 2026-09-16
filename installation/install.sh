@@ -248,12 +248,6 @@ do_config_deploy_mode(){
     fi
 }
 
-is_zsvirt_product(){
-    [ x"$PRODUCT_NAME" = x"ZStack-ZSvirt" ] && return 0
-
-    return 1
-}
-
 # version compare
 # eg. 1 = 1.0
 # eg. 4.08 < 4.08.01
@@ -1518,7 +1512,7 @@ cs_pre_check(){
     fi
     #change zstack.properties config
     if [ x"$UPGRADE" != x'n' ]; then
-        sharedblock_check_qcow2_volume
+        # sharedblock_check_qcow2_volume
         zstack_properties=`zstack-ctl status 2>/dev/null|grep zstack.properties|awk '{print $2}'`
     else
         zstack_properties=$ZSTACK_INSTALL_ROOT/$ZSTACK_PROPERTIES
@@ -1529,7 +1523,6 @@ cs_pre_check(){
 
 sharedblock_check_qcow2_volume(){
     trap 'traplogger $LINENO "$BASH_COMMAND" $?'  DEBUG
-    is_zsvirt_product && return
 
     vercomp '3.7.0' ${CURRENT_VERSION}; cmp=$?
     if [ ${cmp} -ne 1 ]; then

@@ -55,6 +55,7 @@
     </condition>
 
     <property name="war.classpath.dir" location="${build.dir}/zstack-assemble/WEB-INF/classes/" />
+    <property name="zsvirt.ee.schema.map.file" location="${war.classpath.dir}/db/zsvirt-ee-schema-map.tgz" />
     <property name="componentsHome.dir" location="${war.classpath.dir}/componentsHome" />
     <property name="commonModules.dir" location="${componentsHome.dir}/puppet/commonModules" />
     <property name="salt.dir" location="${war.classpath.dir}/salt"/>
@@ -185,6 +186,7 @@
         <unzip src="${war.file}" dest="${war.dir}" />
         <makeDir dir="${componentsHome.dir}" />
         <makeDir dir="${commonModules.dir}" />
+        <antcall target="package-zsvirt-ee-schema-map-on-condition" />
 
         <property name="allinone.versionfile.in.war" location="${war.dir}/VERSION" />
         <echo file="${allinone.versionfile.in.war}" append="true">${product.name} ${allinone.version}</echo>
@@ -255,6 +257,18 @@
             <arg value="log" />
             <arg value="--name-status" />
             <arg value="HEAD^..HEAD" />
+        </exec>
+    </target>
+
+    <target name="package-zsvirt-ee-schema-map-on-condition">
+        <!-- Transport only: WAR resources dereference symlinks, so this archive carries the original conf/db symlink map without adding another state file. -->
+        <mkdir dir="${war.classpath.dir}/db" />
+        <exec executable="tar" dir="${zstack.source}/conf/db" failonerror="true">
+            <arg value="-czf" />
+            <arg value="${zsvirt.ee.schema.map.file}" />
+            <arg value="V0.5.1__schema.sql" />
+            <arg value="upgrade" />
+            <arg value="ee" />
         </exec>
     </target>
 

@@ -50,6 +50,7 @@ from Crypto.Util.py3compat import *
 from hashlib import md5
 from string import Template
 from timeline import TaskTimeline, __doc__ as timeline_doc
+import zsvirt_ee_schema_history as ee_history
 
 mysql_db_config_script='''
 #!/bin/bash
@@ -8395,6 +8396,10 @@ class UpgradeDbCmd(Command):
         flyway_path = os.path.join(ctl.zstack_home, 'WEB-INF/classes/tools/flyway-3.2.1/flyway')
         if not os.path.exists(flyway_path):
             raise CtlError('cannot find %s. Have you run upgrade_management_node?' % flyway_path)
+        schema_dir = os.path.join(ctl.zstack_home, 'WEB-INF/classes/db')
+        schema_map_archive = os.path.join(ctl.zstack_home, 'WEB-INF/classes/db/zsvirt-ee-schema-map.tgz')
+        ee_history_dir = os.path.join(ctl.zstack_home, 'WEB-INF/classes/db/ee-history')
+        ee_config_dir = os.path.join(ctl.zstack_home, 'WEB-INF/classes/springConfigXml/ee')
 
         # Why not executing './runMavenProfile deploydb'?
         upgrading_schema_dirs = [
@@ -8465,6 +8470,89 @@ class UpgradeDbCmd(Command):
                 shell('''mysql -u %s --host %s --port %s -t zstack -e "%s"''' %
                             (db_user, db_hostname, db_port, sql))
 
+        def mysql_base_cmd(extra_options=None):
+            options = [
+                'mysql',
+                '--user=%s' % shell_quote(db_user),
+                '--host=%s' % shell_quote(db_hostname),
+                '--port=%s' % shell_quote(str(db_port)),
+            ]
+            if db_password:
+                options.append('--password=%s' % shell_quote(db_password))
+            if extra_options:
+                options.extend(extra_options)
+            options.append(shell_quote('zstack'))
+            return ' '.join(options)
+
+        def query_schema_version():
+            sql = (
+                "SELECT installed_rank, version, script, IFNULL(CAST(checksum AS CHAR), 'NULL'), type, success "
+                "FROM schema_version ORDER BY installed_rank"
+            )
+            output = shell(
+                mysql_base_cmd(['--batch', '--raw', '--skip-column-names', '--execute=%s' % shell_quote(sql)])
+            )
+            return ee_history.parse_applied_migrations(output)
+
+        def execute_sql_file(sql):
+            fd, sql_path = tempfile.mkstemp(suffix='.sql')
+            os.fdopen(fd, 'w').write(sql)
+            try:
+                shell('%s < %s' % (mysql_base_cmd(), shell_quote(sql_path)))
+            finally:
+                os.remove(sql_path)
+
+        def copy_schema_callbacks_to_upgrade_dirs():
+            for upgrading_schema_dir in upgrading_schema_dirs:
+                try:
+                    ee_history.copy_schema_callbacks_to_upgrade_dir(
+                        schema_dir,
+                        upgrading_schema_dir,
+                    )
+                except ee_history.SchemaHistoryBackfillError as e:
+                    raise CtlError(str(e))
+
+        def backfill_zsvirt_ee_schema_history():
+            for upgrading_schema_dir in upgrading_schema_dirs:
+                try:
+                    schema_checkpoint_map = ee_history.prepare_zsvirt_ee_schema_upgrade_dir(
+                        upgrading_schema_dir,
+                        ee_history_dir,
+                        schema_map_archive,
+                        ee_config_dir,
+                    )
+                except ee_history.SchemaHistoryBackfillError as e:
+                    raise CtlError(str(e))
+
+                if schema_checkpoint_map is None:
+                    resolved_migrations = ee_history.scan_open_source_migrations(schema_dir)
+                else:
+                    resolved_migrations = ee_history.scan_sql_migrations(upgrading_schema_dir)
+                applied_migrations = query_schema_version()
+
+                try:
+                    plan = ee_history.plan_zsvirt_ee_schema_history_backfill(
+                        applied_migrations,
+                        resolved_migrations,
+                        schema_checkpoint_map,
+                    )
+                except ee_history.SchemaHistoryBackfillError as e:
+                    raise CtlError(str(e))
+
+                info('Database upgrade path: %s' % plan.upgrade_path)
+                if plan.upgrade_path == ee_history.OPEN_SOURCE_UPGRADE:
+                    continue
+                if plan.upgrade_path == ee_history.COMMERCIAL_UPGRADE:
+                    continue
+
+                # Only the initial open-source-to-EE transition replaces history before Flyway migration.
+                sql = ee_history.build_schema_history_backfill_sql(plan, db_user)
+                execute_sql_file(sql)
+                info(
+                    'Inserted %d ZSvirt EE schema history records through %s and removed %d covered open-source records for current open-source migration %s.' %
+                    (len(plan.ee_history_to_backfill), plan.checkpoint.script, len(plan.opensource_history_to_delete), plan.current_source.script)
+                )
+
         def migrate():
             try:
                 for upgrading_schema_dir in upgrading_schema_dirs:
@@ -8493,6 +8581,10 @@ class UpgradeDbCmd(Command):
         # fix MINI-1498
         update_sql = "update schema_version set checksum = '-1450264399' where script = 'V3.6.0__schema.sql' and checksum = '-111240960'"
         execute_sql(update_sql)
+
+        copy_schema_callbacks_to_upgrade_dirs()
+
+        backfill_zsvirt_ee_schema_history()
 
         migrate()
 
