@@ -10,6 +10,11 @@ import json
 import os
 import sys
 import threading
+import traceback
+try:
+    from shlex import quote as shell_quote
+except ImportError:
+    from pipes import quote as shell_quote
 
 from ansible import constants as ansible_constants
 from ansible import context as ansible_context
@@ -1327,10 +1332,11 @@ def check_host_reachable(host_post_info, warning=False):
 
 @retry(times=3, sleep_time=3)
 def run_remote_command(command, host_post_info, return_status=False,
-                       return_output=False, stderr_match_regexp=''):
+                       return_output=False, stderr_match_regexp='',
+                       setup_yum0=True):
     '''return status all the time except return_status is False,
     return output is set to True'''
-    if 'yum' in command:
+    if setup_yum0 and 'yum' in command:
         set_yum0 = '''rpm -q zstack-release >/dev/null && releasever=`awk '{print $3}' /etc/zstack-release`;\
                     export YUM0=$releasever; grep $releasever /etc/yum/vars/YUM0 || echo $releasever > /etc/yum/vars/YUM0;'''
         command = set_yum0 + command
@@ -2243,10 +2249,417 @@ def install_release_on_host(is_rpm, host_info, host_post_info):
     run_remote_command(install_cmd, host_post_info)
 
 
+RPMDB_REPAIR_STALE_SECONDS = 60
+RPMDB_REPAIR_WAIT_SECONDS = 60
+RPMDB_REPAIR_LOCK_PATH = "/run/zstack-yum.lock"
+RPMDB_YUM_CHECK_CMD = (
+    "timeout -k 5s 30s yum --disablerepo=* list installed >/dev/null 2>&1"
+)
+RPMDB_CHECK_CMD = "timeout -k 5s 30s rpm -qa >/dev/null 2>&1"
+
+
+def _run_rpmdb_repair_command(command, host_post_info, return_status=False,
+                              return_output=False):
+    quoted_lock_path = shell_quote(RPMDB_REPAIR_LOCK_PATH)
+    quoted_command = shell_quote(command)
+    command = (
+        "if command -v flock >/dev/null 2>&1; then\n"
+        "mkdir -p /run 2>/dev/null || true\n"
+        "flock -x %s -c %s\n"
+        "else\n"
+        "%s\n"
+        "fi"
+    ) % (quoted_lock_path, quoted_command, command)
+    return run_remote_command(command, host_post_info,
+                              return_status=return_status,
+                              return_output=return_output,
+                              setup_yum0=False)
+
+
+def _check_rpmdb_repair_prerequisites(host_post_info):
+    cmd = ("command -v timeout >/dev/null 2>&1 && "
+           "ps -eo pid=,ppid=,pgid=,stat=,etimes=,comm=,args= >/dev/null 2>&1")
+    _run_rpmdb_repair_command(cmd, host_post_info)
+
+
+def _yum_rpmdb_check(host_post_info):
+    return _run_rpmdb_repair_command(RPMDB_YUM_CHECK_CMD, host_post_info,
+                                     return_status=True)
+
+
+def _rpmdb_check(host_post_info):
+    return _run_rpmdb_repair_command(RPMDB_CHECK_CMD, host_post_info,
+                                     return_status=True)
+
+
+def _remove_stale_yum_pid_files(host_post_info):
+    cmd = r"""
+for pid_file in /var/run/yum.pid /run/yum.pid; do
+    [ -f "$pid_file" ] || continue
+    pid="$(awk '{print $1}' "$pid_file" 2>/dev/null)"
+
+    case "$pid" in
+        ''|*[!0-9]*)
+            echo "remove malformed yum pid file: $pid_file"
+            rm -f "$pid_file" || exit 2
+            continue
+            ;;
+    esac
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "remove stale yum pid file: $pid_file"
+        rm -f "$pid_file" || exit 2
+        continue
+    fi
+
+    proc="$(ps -p "$pid" -o comm= -o args= 2>/dev/null)"
+    case "$proc" in
+        *yum*|*dnf*|*rpm*)
+            ;;
+        *)
+            echo "remove yum pid file owned by non-package process: $pid_file"
+            rm -f "$pid_file" || exit 2
+            ;;
+    esac
+done
+"""
+    _run_rpmdb_repair_command(cmd, host_post_info)
+
+
+def _parse_package_processes(output):
+    processes = []
+    for line in output.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) < 4:
+            continue
+
+        try:
+            pid = int(fields[0])
+            etimes = int(fields[2])
+        except ValueError:
+            continue
+
+        processes.append({
+            'pid': pid,
+            'stat': fields[1],
+            'etimes': etimes,
+            'comm': fields[3],
+            'args': fields[4] if len(fields) > 4 else ''
+        })
+    return processes
+
+
+def _list_package_processes(host_post_info):
+    cmd = r"""
+pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+ps -eo pid=,ppid=,pgid=,stat=,etimes=,comm=,args= 2>/dev/null | awk \
+    -v self="$$" -v parent="$PPID" -v pgid="$pgid" '
+    {
+        pid=$1
+        ppid=$2
+        proc_pgid=$3
+        stat=$4
+        etimes=$5
+        comm=$6
+        args=""
+        for (i = 7; i <= NF; i++) {
+            args = args " " $i
+        }
+
+        if (pid == self || pid == parent || proc_pgid == pgid) {
+            next
+        }
+
+        if (comm ~ /^(yum|dnf|rpm)$/) {
+            print pid, stat, etimes, comm, args
+            next
+        }
+
+        if (comm ~ /(^|-)python[0-9.]*$/ &&
+            args ~ /(\/usr\/bin\/yum|\/bin\/yum|\/usr\/bin\/dnf|\/bin\/dnf)/) {
+            print pid, stat, etimes, comm, args
+        }
+    }'
+"""
+    status, output = _run_rpmdb_repair_command(cmd, host_post_info,
+                                               return_output=True)
+    return _parse_package_processes(output)
+
+
+def _should_skip_for_d_state_process(processes):
+    d_state_processes = [p for p in processes if p['stat'].startswith('D')]
+    if d_state_processes:
+        warn("Package manager process is in D state; skip rpmdb recovery and "
+             "let host reconnect/deploy retry later. pids: %s" %
+             ','.join([str(p['pid']) for p in d_state_processes]))
+        return True
+    return False
+
+
+def _should_skip_for_young_package_process(processes):
+    young_processes = [p for p in processes
+                       if p['etimes'] < RPMDB_REPAIR_STALE_SECONDS]
+    if young_processes:
+        warn("Package manager process is still active and below stale "
+             "threshold; skip destructive rpmdb recovery. pids: %s" %
+             ','.join([str(p['pid']) for p in young_processes]))
+        return True
+    return False
+
+
+def _should_skip_for_healthy_rpmdb_without_processes(processes, host_post_info):
+    if not processes and _rpmdb_check(host_post_info):
+        warn("yum cannot list installed packages but rpmdb is healthy and no "
+             "package manager process is blocking it; skip rpmdb rebuild and "
+             "continue host reconnect/deploy")
+        return True
+    return False
+
+
+def _should_skip_for_healthy_rpmdb_with_processes(processes, host_post_info):
+    if processes and _rpmdb_check(host_post_info):
+        warn("yum cannot list installed packages because another package "
+             "manager process is running, but rpmdb is healthy; skip killing "
+             "the process and continue host reconnect/deploy. pids: %s" %
+             ','.join([str(p['pid']) for p in processes]))
+        return True
+    return False
+
+
+def _should_skip_for_core_rpmdb_users(processes, host_post_info):
+    if not processes:
+        return False
+
+    rpmdb_users = _list_rpmdb_users(host_post_info)
+    if rpmdb_users:
+        warn("package manager process is using rpmdb core files; skip killing "
+             "the process and continue host reconnect/deploy. pids: %s" %
+             ','.join(rpmdb_users))
+        return True
+    return False
+
+
+def _terminate_package_processes(processes, host_post_info):
+    if not processes:
+        return
+
+    pids = ' '.join([str(p['pid']) for p in processes])
+    cmd = """
+pids="%s"
+targets=""
+for pid in $pids; do
+    proc="$(ps -p "$pid" -o comm= -o args= 2>/dev/null)" || continue
+    case "$proc" in
+        *yum*|*dnf*|*rpm*)
+            targets="$targets $pid"
+            ;;
+        *)
+            echo "skip pid no longer owned by package manager: $pid"
+            ;;
+    esac
+done
+
+[ -n "$targets" ] || exit 0
+
+echo "terminate stale package manager processes:$targets"
+kill -TERM $targets 2>/dev/null || true
+sleep 5
+
+alive=""
+for pid in $targets; do
+    kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+done
+
+if [ -n "$alive" ]; then
+    echo "force kill stale package manager processes:$alive"
+    kill -KILL $alive 2>/dev/null || true
+    sleep 2
+fi
+
+still_alive=""
+for pid in $targets; do
+    kill -0 "$pid" 2>/dev/null || continue
+    stat="$(ps -o stat= -p "$pid" 2>/dev/null)"
+    case "$stat" in
+        Z*)
+            ;;
+        *)
+            still_alive="$still_alive $pid"
+            ;;
+    esac
+done
+
+if [ -n "$still_alive" ]; then
+    echo "package manager processes are still alive after SIGKILL:$still_alive"
+    exit 2
+fi
+""" % pids
+    _run_rpmdb_repair_command(cmd, host_post_info)
+
+
+def _list_rpmdb_users(host_post_info, include_lock_files=False):
+    cmd = r"""
+dbpath="$(rpm --eval '%{_dbpath}' 2>/dev/null)"
+[ -n "$dbpath" ] || exit 2
+rpmdb_python=""
+for candidate in python3 python2 python /usr/libexec/platform-python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        rpmdb_python="$candidate"
+        break
+    fi
+done
+if [ -z "$rpmdb_python" ]; then
+    echo "cannot find Python for rpmdb user scan" >&2
+    exit 2
+fi
+"$rpmdb_python" - "$dbpath" "__INCLUDE_LOCK_FILES__" "$$" "$PPID" <<'PY'
+import glob
+import os
+import sys
+
+dbpath, include_lock_files, shell_pid, parent_pid = sys.argv[1:]
+prefix = dbpath + '/'
+lock_prefix = prefix + '__db.'
+pgid = os.getpgrp()
+pids = []
+for proc in glob.glob('/proc/[0-9]*'):
+    pid = os.path.basename(proc)
+    if not pid.isdigit() or pid in (shell_pid, parent_pid):
+        continue
+    try:
+        fds = os.listdir(proc + '/fd')
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            target = os.readlink(proc + '/fd/' + fd)
+        except OSError:
+            continue
+        if not target.startswith(prefix):
+            continue
+        if include_lock_files != 'true' and target.startswith(lock_prefix):
+            continue
+        try:
+            if os.getpgid(int(pid)) == pgid:
+                break
+        except OSError:
+            pass
+        pids.append(pid)
+        break
+for pid in sorted(pids):
+    print(pid)
+PY
+""".replace("__INCLUDE_LOCK_FILES__",
+            "true" if include_lock_files else "false")
+    status, output = _run_rpmdb_repair_command(cmd, host_post_info,
+                                               return_output=True)
+    return [pid for pid in output.split() if pid.isdigit()]
+
+
+def _should_skip_for_remaining_package_processes(processes):
+    if processes:
+        warn("package manager processes are still running after stale process "
+             "cleanup; skip rpmdb rebuild and continue host reconnect/deploy. "
+             "pids: %s" %
+             ','.join([str(p['pid']) for p in processes]))
+        return True
+    return False
+
+
+def _backup_and_rebuild_rpmdb(host_post_info):
+    cmd = r"""
+dbpath="$(rpm --eval '%{_dbpath}' 2>/dev/null)"
+[ -n "$dbpath" ] || exit 2
+RPMDB_BACKUP_DIR="/var/lib/zstack/rpmdb-backups"
+mkdir -p "$RPMDB_BACKUP_DIR" || exit 2
+backup_file="$RPMDB_BACKUP_DIR/rpmdb-$(date +%Y%m%d%H%M%S).tar.gz"
+
+if [ -d "$dbpath" ]; then
+    timeout -k 10s 120s tar czf "$backup_file" -C "$(dirname "$dbpath")" "$(basename "$dbpath")" || exit 2
+fi
+ls -1t "$RPMDB_BACKUP_DIR"/rpmdb-*.tar.gz 2>/dev/null | awk 'NR > 5' | xargs -r rm -f
+
+rm -f "$dbpath"/__db.* || exit 2
+timeout -k 10s 180s rpm --rebuilddb || exit 2
+timeout -k 5s 30s rpm -qa >/dev/null || exit 2
+"""
+    _run_rpmdb_repair_command(cmd, host_post_info)
+
+
 def repair_rpmdb_if_damaged(host_post_info):
-    cmd = "yum --disablerepo=* --enablerepo=zstack-local list >/dev/null 2>&1 || " \
-          "(rm -f /var/lib/rpm/_db.*; rpm --rebuilddb)"
-    run_remote_command(cmd, host_post_info)
+    if _yum_rpmdb_check(host_post_info):
+        return
+
+    _check_rpmdb_repair_prerequisites(host_post_info)
+    _remove_stale_yum_pid_files(host_post_info)
+    if _yum_rpmdb_check(host_post_info):
+        return
+
+    processes = _list_package_processes(host_post_info)
+    if _should_skip_for_d_state_process(processes):
+        return
+    if _should_skip_for_healthy_rpmdb_without_processes(processes,
+                                                        host_post_info):
+        return
+    if _should_skip_for_healthy_rpmdb_with_processes(processes,
+                                                     host_post_info):
+        return
+    if _should_skip_for_core_rpmdb_users(processes, host_post_info):
+        return
+
+    young_processes = [p for p in processes
+                       if p['etimes'] < RPMDB_REPAIR_STALE_SECONDS]
+    if young_processes:
+        time.sleep(RPMDB_REPAIR_WAIT_SECONDS)
+        if _yum_rpmdb_check(host_post_info):
+            return
+        processes = _list_package_processes(host_post_info)
+        if _should_skip_for_d_state_process(processes):
+            return
+        if _should_skip_for_healthy_rpmdb_without_processes(processes,
+                                                            host_post_info):
+            return
+        if _should_skip_for_healthy_rpmdb_with_processes(processes,
+                                                         host_post_info):
+            return
+        if _should_skip_for_core_rpmdb_users(processes, host_post_info):
+            return
+        if _should_skip_for_young_package_process(processes):
+            return
+
+    _terminate_package_processes(processes, host_post_info)
+
+    processes = _list_package_processes(host_post_info)
+    if _should_skip_for_d_state_process(processes):
+        return
+    if _should_skip_for_healthy_rpmdb_with_processes(processes,
+                                                     host_post_info):
+        return
+    if _should_skip_for_core_rpmdb_users(processes, host_post_info):
+        return
+    if _should_skip_for_remaining_package_processes(processes):
+        return
+    _remove_stale_yum_pid_files(host_post_info)
+
+    if _yum_rpmdb_check(host_post_info):
+        return
+    if _rpmdb_check(host_post_info):
+        warn("yum cannot list installed packages but rpmdb is healthy after "
+             "clearing package manager processes; skip rpmdb rebuild and "
+             "continue host reconnect/deploy")
+        return
+
+    rpmdb_users = _list_rpmdb_users(host_post_info, include_lock_files=True)
+    if rpmdb_users:
+        warn("rpmdb is still opened by processes; skip rpmdb rebuild and "
+             "continue host reconnect/deploy. pids: %s" %
+             ','.join(rpmdb_users))
+        return
+
+    _backup_and_rebuild_rpmdb(host_post_info)
+    if not _yum_rpmdb_check(host_post_info):
+        warn("rpmdb repair finished but yum still cannot list installed "
+             "packages; continue host reconnect/deploy")
 
 
 class ZstackLib(object):
