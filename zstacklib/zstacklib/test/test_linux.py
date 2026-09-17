@@ -96,6 +96,24 @@ linux = _import_linux_with_stubs()
 
 
 class Test(unittest.TestCase):
+    def test_is_mounted_matches_historical_double_slash_source(self):
+        original_run = getattr(linux.shell, 'run', _MISSING)
+        mount_output = '172.21.7.112://system on /mnt/nfs type nfs (rw)'
+
+        def fake_run(command):
+            pattern = command.split("grep -E '", 1)[1].split("'", 1)[0]
+            self.assertEqual('172.21.7.112:/{1,2}system[ /]+on', pattern)
+            return 0 if linux.re.search(pattern, mount_output) else 1
+
+        try:
+            linux.shell.run = fake_run
+            self.assertTrue(linux.is_mounted(url='172.21.7.112:/system'))
+        finally:
+            if original_run is _MISSING:
+                del linux.shell.run
+            else:
+                linux.shell.run = original_run
+
     def test_get_process_start_time_returns_none_when_stat_disappears(self):
         original_exists = linux.os.path.exists
         original_open = getattr(linux, 'open', None)
