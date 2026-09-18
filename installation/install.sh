@@ -1512,43 +1512,12 @@ cs_pre_check(){
     fi
     #change zstack.properties config
     if [ x"$UPGRADE" != x'n' ]; then
-        # sharedblock_check_qcow2_volume
         zstack_properties=`zstack-ctl status 2>/dev/null|grep zstack.properties|awk '{print $2}'`
     else
         zstack_properties=$ZSTACK_INSTALL_ROOT/$ZSTACK_PROPERTIES
     fi
     [ -f $zstack_properties ] && sed -i 's/Ansible.var.yum_repo/Ansible.var.zstack_repo/' $zstack_properties >>$ZSTACK_INSTALL_LOG 2>&1
     pass
-}
-
-sharedblock_check_qcow2_volume(){
-    trap 'traplogger $LINENO "$BASH_COMMAND" $?'  DEBUG
-
-    vercomp '3.7.0' ${CURRENT_VERSION}; cmp=$?
-    if [ ${cmp} -ne 1 ]; then
-        return
-    fi
-
-    db_ip=`zstack-ctl getenv MYSQL_LATEST_IP | awk -F '=' '{print $2}'`
-    db_port=`zstack-ctl getenv MYSQL_LATEST_PORT | awk -F '=' '{print $2}'`
-    db_username=`zstack-ctl show_configuration | grep DB.user | awk -F '=' '{print $2}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'`
-    db_password=`zstack-ctl show_configuration | grep DB.password | awk -F '=' '{print $2}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'`
-    if [ x"$db_password" != "x" ]; then
-        mysql --vertical -h $db_ip -P $db_port -u $db_username -p$db_password zstack -e 'select count(vol.uuid) from VolumeVO vol, PrimaryStorageVO ps where ps.Type="sharedblock" and vol.primaryStorageUuid = ps.uuid and vol.isShareable <> 0 and vol.format ="qcow2"' >>$ZSTACK_INSTALL_LOG 2>&1
-        sql_running=$?
-        result=`mysql --vertical -h $db_ip -P $db_port -u $db_username -p$db_password zstack -e 'select count(vol.uuid) from VolumeVO vol, PrimaryStorageVO ps where ps.Type="sharedblock" and vol.primaryStorageUuid = ps.uuid and vol.isShareable <> 0 and vol.format ="qcow2"' | grep count | awk -F ':' '{print $2}' | tr -d '[:space:]'`
-    else
-        mysql --vertical -h $db_ip -P $db_port -u $db_username zstack -e 'select count(vol.uuid) from VolumeVO vol, PrimaryStorageVO ps where ps.Type="sharedblock" and vol.primaryStorageUuid = ps.uuid and vol.isShareable <> 0 and vol.format ="qcow2"' >>$ZSTACK_INSTALL_LOG 2>&1
-        sql_running=$?
-        result=`mysql --vertical -h $db_ip -P $db_port -u $db_username zstack -e 'select count(vol.uuid) from VolumeVO vol, PrimaryStorageVO ps where ps.Type="sharedblock" and vol.primaryStorageUuid = ps.uuid and vol.isShareable <> 0 and vol.format ="qcow2"' | grep count | awk -F ':' '{print $2}' | tr -d '[:space:]'`
-    fi
-    if [ x"$sql_running" != x'0' ]; then
-        echo "can not connect to mysql or execute sql, skip check qcow2 shared volume" >>$ZSTACK_INSTALL_LOG 2>&1
-        return
-    fi
-    if [ x"$result" != x'0' ]; then
-        fail "There are $result qcow2 format shared volume on sharedblock group primary storage, please contact technical support to convert volumes and then upgrade zstack"
-    fi
 }
 
 iz_install_unzip(){
