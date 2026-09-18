@@ -63,13 +63,7 @@ def get_version_from_exe_file2(path, error_out=False):
 
 
 def get_version():
-    version = shell.call("virsh version | awk '/hypervisor.*QEMU/{print $4}'", False).strip()
-
-    # failed to get qemu version, fallback to get its version from path
-    if version == "":
-        return get_version_from_exe_file2(get_path())
-
-    return version
+    return get_version_from_exe_file2(get_path())
 
 def get_install_date():
     r, o, _ = bash.bash_roe("rpm -q --queryformat '%{INSTALLTIME}' qemu-kvm")
