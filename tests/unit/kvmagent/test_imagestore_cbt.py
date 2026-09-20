@@ -1,8 +1,16 @@
-import importlib.util
+import os
 import sys
-from contextlib import nullcontext
-from pathlib import Path
-from unittest.mock import MagicMock
+from contextlib import contextmanager
+
+try:
+    from unittest.mock import MagicMock
+except ImportError:
+    from mock import MagicMock
+
+if sys.version_info[0] == 2:
+    import imp
+else:
+    import importlib.util
 
 import pytest
 
@@ -12,11 +20,14 @@ def _load_imagestore_module():
     if bash_module is not None and not hasattr(bash_module, 'bash_progress_1'):
         bash_module.bash_progress_1 = lambda *args, **kwargs: (0, '', None)
 
-    repo_root = Path(__file__).resolve().parents[3]
-    module_path = repo_root / 'kvmagent' / 'kvmagent' / 'plugins' / 'imagestore.py'
-    spec = importlib.util.spec_from_file_location('imagestore_under_test', str(module_path))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    module_path = os.path.join(repo_root, 'kvmagent', 'kvmagent', 'plugins', 'imagestore.py')
+    if sys.version_info[0] == 2:
+        module = imp.load_source('imagestore_under_test', module_path)
+    else:
+        spec = importlib.util.spec_from_file_location('imagestore_under_test', module_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
     if not hasattr(module, 'linux'):
         module.linux = sys.modules['zstacklib.utils.linux']
     return module
@@ -24,6 +35,11 @@ def _load_imagestore_module():
 
 imagestore = _load_imagestore_module()
 ImageStoreClient = imagestore.ImageStoreClient
+
+
+@contextmanager
+def no_libvirt_error():
+    yield
 
 
 TEST_CBD_PATH = 'cbd:pool_physical/pool/volume'
@@ -36,7 +52,7 @@ TEST_CONFIGURED_CBD_PATH = TEST_CBD_PATH + '_zbs_:/etc/zbs/client.conf'
      ('iscsi', '_get_target_disk', '_get_target_disk_by_path')],
 )
 def test_cbt_backup_passes_storage_target_unchanged(
-        monkeypatch, tmp_path, device_type, lookup_method, unused_lookup_method):
+        monkeypatch, tmpdir, device_type, lookup_method, unused_lookup_method):
     client = ImageStoreClient()
     disk = MagicMock(type_='file')
     disk.alias.name_ = 'virtio-disk0'
@@ -45,18 +61,18 @@ def test_cbt_backup_passes_storage_target_unchanged(
     vm._get_target_disk.return_value = (disk, None)
     volume_info = MagicMock(target=TEST_CBD_PATH)
     volume_info.volume = MagicMock(installPath=TEST_CBD_PATH, deviceType=device_type)
-    result_file = tmp_path / 'cbt-result.json'
+    result_file = tmpdir.join('cbt-result.json')
     commands = []
 
     monkeypatch.setattr(imagestore.linux, 'create_temp_file', lambda: str(result_file))
     monkeypatch.setattr(imagestore.linux, 'rm_file_force', lambda _path: None)
-    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: nullcontext())
+    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: no_libvirt_error())
 
     shell_cmd = MagicMock()
     shell_cmd.return_code = 0
 
     def call(_exception):
-        result_file.write_text(
+        result_file.write(
             '[{"device":"drive-virtio-disk0","mode":"full",'
             '"scratchNodeName":"scratch","nbdPort":"10888","bitmap":"bitmap"}]'
         )
@@ -75,10 +91,10 @@ def test_cbt_backup_passes_storage_target_unchanged(
     assert volume_info.target == TEST_CBD_PATH
     assert volume_info.volume.installPath == TEST_CBD_PATH
     assert getattr(vm, lookup_method).call_count == 2
-    getattr(vm, unused_lookup_method).assert_not_called()
+    assert getattr(vm, unused_lookup_method).call_count == 0
 
 
-def test_cbt_backup_preserves_partial_state_on_command_failure(monkeypatch, tmp_path):
+def test_cbt_backup_preserves_partial_state_on_command_failure(monkeypatch, tmpdir):
     client = ImageStoreClient()
     disk = MagicMock(type_='file')
     disk.alias.name_ = 'virtio-disk0'
@@ -86,19 +102,19 @@ def test_cbt_backup_preserves_partial_state_on_command_failure(monkeypatch, tmp_
     vm._get_target_disk_by_path.return_value = (disk, None)
     volume_info = MagicMock(target=TEST_CBD_PATH)
     volume_info.volume = MagicMock(installPath=TEST_CBD_PATH, deviceType='cbd')
-    result_file = tmp_path / 'cbt-failed-result.json'
+    result_file = tmpdir.join('cbt-failed-result.json')
     removed_files = []
 
     monkeypatch.setattr(imagestore.linux, 'create_temp_file', lambda: str(result_file))
     monkeypatch.setattr(imagestore.linux, 'rm_file_force', removed_files.append)
-    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: nullcontext())
+    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: no_libvirt_error())
 
     shell_cmd = MagicMock()
     shell_cmd.return_code = 1
     shell_cmd.raise_error.side_effect = RuntimeError('cbtbak failed')
 
     def fail(_exception):
-        result_file.write_text(
+        result_file.write(
             '[{"device":"drive-virtio-disk0","mode":"full",'
             '"scratchNodeName":"scratch","nbdPort":"10888","bitmap":"new-bitmap"}]'
         )
@@ -114,7 +130,7 @@ def test_cbt_backup_preserves_partial_state_on_command_failure(monkeypatch, tmp_
     assert removed_files == [str(result_file)]
 
 
-def test_cbt_backup_rejects_empty_success_output(monkeypatch, tmp_path):
+def test_cbt_backup_rejects_empty_success_output(monkeypatch, tmpdir):
     client = ImageStoreClient()
     disk = MagicMock(type_='file')
     disk.alias.name_ = 'virtio-disk0'
@@ -122,12 +138,12 @@ def test_cbt_backup_rejects_empty_success_output(monkeypatch, tmp_path):
     vm._get_target_disk_by_path.return_value = (disk, None)
     volume_info = MagicMock(target=TEST_CBD_PATH)
     volume_info.volume = MagicMock(installPath=TEST_CBD_PATH, deviceType='cbd')
-    result_file = tmp_path / 'cbt-empty-result.json'
-    result_file.touch()
+    result_file = tmpdir.join('cbt-empty-result.json')
+    result_file.ensure()
 
     monkeypatch.setattr(imagestore.linux, 'create_temp_file', lambda: str(result_file))
     monkeypatch.setattr(imagestore.linux, 'rm_file_force', lambda _path: None)
-    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: nullcontext())
+    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: no_libvirt_error())
 
     shell_cmd = MagicMock(return_code=0)
     monkeypatch.setattr(imagestore.shell, 'ShellCmd', lambda _command: shell_cmd)
@@ -144,7 +160,7 @@ def test_stop_cbt_backup_passes_storage_target_unchanged(monkeypatch):
     )
     commands = []
 
-    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: nullcontext())
+    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: no_libvirt_error())
     monkeypatch.setattr(imagestore.shell, 'call', lambda command: commands.append(command) or '')
 
     client.stop_vm_cbt_backup_jobs('vm-uuid', [record])
@@ -169,7 +185,7 @@ def test_rollback_cbt_backup_carries_previous_and_new_bitmap(monkeypatch):
     ]
     commands = []
 
-    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: nullcontext())
+    monkeypatch.setattr(imagestore.linux, 'ShowLibvirtErrorOnException', lambda _vm: no_libvirt_error())
     monkeypatch.setattr(imagestore.shell, 'call', lambda command: commands.append(command) or '')
 
     client.rollback_vm_cbt_backup_jobs('vm-uuid', records)

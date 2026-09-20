@@ -1,5 +1,8 @@
 import json
-import shlex
+try:
+    from shlex import quote as shell_quote
+except ImportError:
+    from pipes import quote as shell_quote
 
 import pytest
 
@@ -16,7 +19,7 @@ def test_query_allocated_extents_parses_existing_extents(monkeypatch):
             {'offset': 900000000, 'length': 65536, 'exists': 'false'},
         ],
     }
-    monkeypatch.setattr(zbs_storage_plugin.linux, 'shellquote', shlex.quote)
+    monkeypatch.setattr(zbs_storage_plugin.linux, 'shellquote', shell_quote)
     monkeypatch.setattr(
         zbs_storage_plugin.shell,
         'call',
@@ -30,7 +33,7 @@ def test_query_allocated_extents_parses_existing_extents(monkeypatch):
 
 
 def test_query_allocated_extents_rejects_business_error(monkeypatch):
-    monkeypatch.setattr(zbs_storage_plugin.linux, 'shellquote', shlex.quote)
+    monkeypatch.setattr(zbs_storage_plugin.linux, 'shellquote', shell_quote)
     monkeypatch.setattr(
         zbs_storage_plugin.shell,
         'call',
@@ -42,7 +45,7 @@ def test_query_allocated_extents_rejects_business_error(monkeypatch):
 
 
 def test_query_allocated_extents_rejects_invalid_result(monkeypatch):
-    monkeypatch.setattr(zbs_storage_plugin.linux, 'shellquote', shlex.quote)
+    monkeypatch.setattr(zbs_storage_plugin.linux, 'shellquote', shell_quote)
     monkeypatch.setattr(
         zbs_storage_plugin.shell,
         'call',

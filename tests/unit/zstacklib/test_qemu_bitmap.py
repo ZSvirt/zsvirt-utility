@@ -1,10 +1,21 @@
 import json
-import shlex
-import importlib.util
 import os
 import sys
-from pathlib import Path
-from unittest.mock import patch
+
+try:
+    from shlex import quote as shell_quote
+except ImportError:
+    from pipes import quote as shell_quote
+
+try:
+    from unittest.mock import patch
+except ImportError:
+    from mock import patch
+
+if sys.version_info[0] == 2:
+    import imp
+else:
+    import importlib.util
 
 import pytest
 
@@ -13,17 +24,20 @@ def _load_qemu_module():
     bash_module = sys.modules['zstacklib.utils.bash']
     shell_module = sys.modules['zstacklib.utils.shell']
 
-    repo_root = Path(__file__).resolve().parents[3]
-    module_path = repo_root / 'zstacklib' / 'zstacklib' / 'utils' / 'qemu.py'
-    spec = importlib.util.spec_from_file_location('zstacklib.utils.qemu_bitmap_under_test', str(module_path))
-    module = importlib.util.module_from_spec(spec)
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+    module_path = os.path.join(repo_root, 'zstacklib', 'zstacklib', 'utils', 'qemu.py')
     real_exists = os.path.exists
     with patch.object(bash_module, 'bash_roe', return_value=(
             0, 'QEMU emulator version 6.2.0 (qemu-kvm-6.2.0)', '')), \
             patch.object(shell_module, 'call', return_value='6.2.0'), \
             patch('os.path.exists', side_effect=lambda path: (
                     path == '/usr/bin/qemu-system-x86_64' or real_exists(path))):
-        spec.loader.exec_module(module)
+        if sys.version_info[0] == 2:
+            module = imp.load_source('zstacklib.utils.qemu_bitmap_under_test', module_path)
+        else:
+            spec = importlib.util.spec_from_file_location('zstacklib.utils.qemu_bitmap_under_test', module_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
     return module
 
 
@@ -31,7 +45,7 @@ qemu = _load_qemu_module()
 
 
 def test_get_rbd_data_bitmap_splits_offset_extents(monkeypatch):
-    monkeypatch.setattr(qemu.linux, 'shellquote', shlex.quote)
+    monkeypatch.setattr(qemu.linux, 'shellquote', shell_quote)
     monkeypatch.setattr(
         qemu.shell,
         'call',
