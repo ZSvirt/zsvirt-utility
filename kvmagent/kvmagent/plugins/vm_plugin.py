@@ -9815,10 +9815,7 @@ host side snapshot files chian:
 
         for volume in cmd.volumes:
             real_path = self.get_cbt_volume_actual_install_path(volume.installPath)
-            if qemu_nbd.find_qemu_nbd_process(real_path) == 0:
-                qemu_nbd.kill_nbd_process_by_flag(real_path)
-            if real_path != volume.installPath and qemu_nbd.find_qemu_nbd_process(volume.installPath) == 0:
-                qemu_nbd.kill_nbd_process_by_flag(volume.installPath)
+            qemu_nbd.kill_nbd_process_by_export_name(volume.volumeUuid)
             deactive_volume(real_path)
 
         rsp.success = True
@@ -9839,12 +9836,8 @@ host side snapshot files chian:
         rsp = ListExportedVolumesResponse()
         volume_export_info = {}
         for volume in cmd.volumes:
-            volume_export_info[volume.volumeUuid] = False
-            real_path = self.get_cbt_volume_actual_install_path(volume.installPath)
-            if qemu_nbd.find_qemu_nbd_process(volume.installPath) == 0:
-                volume_export_info[volume.volumeUuid] = True
-            elif real_path != volume.installPath and qemu_nbd.find_qemu_nbd_process(real_path) == 0:
-                volume_export_info[volume.volumeUuid] = True
+            volume_export_info[volume.volumeUuid] = bool(
+                qemu_nbd.find_qemu_nbd_processes_by_export_name(volume.volumeUuid))
 
         rsp.volumeExportInfos = volume_export_info
         rsp.success = True
@@ -9891,6 +9884,7 @@ host side snapshot files chian:
             logger.warn("take vm cbt backup failed: " + str(e) + '\n' + content)
             rsp.error = str(e)
             rsp.success = False
+            infos = [info for info in infos if getattr(info, 'scratchNodeName', None)]
         rsp.volumeInfos = infos
         return jsonobject.dumps(rsp)
 
@@ -9901,7 +9895,8 @@ host side snapshot files chian:
 
         vm = get_vm_by_uuid(cmd.vmUuid, exception_if_not_existing=False)
         if not vm:
-            raise kvmagent.KvmError("vm[uuid: %s] not found by libvirt" % cmd.vmUuid)
+            logger.info("skip stopping vm cbt task because vm[uuid: %s] is absent from libvirt" % cmd.vmUuid)
+            return jsonobject.dumps(rsp)
 
         try:
             isc = ImageStoreClient()
@@ -9921,7 +9916,8 @@ host side snapshot files chian:
 
         vm = get_vm_by_uuid(cmd.vmUuid, exception_if_not_existing=False)
         if not vm:
-            raise kvmagent.KvmError("vm[uuid: %s] not found by libvirt" % cmd.vmUuid)
+            logger.info("skip rolling back vm cbt task because vm[uuid: %s] is absent from libvirt" % cmd.vmUuid)
+            return jsonobject.dumps(rsp)
 
         try:
             ImageStoreClient().rollback_vm_cbt_backup_jobs(cmd.vmUuid, cmd.records)

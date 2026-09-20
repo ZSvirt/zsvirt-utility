@@ -218,11 +218,15 @@ class ImageStoreClient(object):
         previous_bitmap = ""
         new_bitmap = ""
         for record in records:
+            if not getattr(record, 'scratchNodeName', None):
+                continue
             infos += ",".join([record.scratchNodeName, record.target, record.mode]) + ";"
             if record.lastBitmapName:
                 previous_bitmap = record.lastBitmapName
             if record.bitmapName:
                 new_bitmap = record.bitmapName
+        if not infos:
+            return
         if not new_bitmap:
             raise ValueError("missing new bitmap for CBT rollback")
         with linux.ShowLibvirtErrorOnException(vm):

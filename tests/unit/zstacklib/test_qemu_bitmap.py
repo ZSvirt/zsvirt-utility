@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import types
 
 try:
     from shlex import quote as shell_quote
@@ -20,15 +21,59 @@ else:
 import pytest
 
 
+class _LoggerStub(object):
+    def debug(self, *_args, **_kwargs):
+        pass
+
+
 def _load_qemu_module():
-    bash_module = sys.modules['zstacklib.utils.bash']
-    shell_module = sys.modules['zstacklib.utils.shell']
+    package = types.ModuleType('zstacklib')
+    package.__path__ = []
+    utils = types.ModuleType('zstacklib.utils')
+    utils.__path__ = []
+    bash_module = types.ModuleType('zstacklib.utils.bash')
+    jsonobject_module = types.ModuleType('zstacklib.utils.jsonobject')
+    linux_module = types.ModuleType('zstacklib.utils.linux')
+    log_module = types.ModuleType('zstacklib.utils.log')
+    qemu_img_module = types.ModuleType('zstacklib.utils.qemu_img')
+    shell_module = types.ModuleType('zstacklib.utils.shell')
+
+    bash_module.bash_roe = lambda _command: (0, '', '')
+    jsonobject_module.loads = json.loads
+    linux_module.get_vm_pid = lambda _vm_uuid: None
+    linux_module.get_process_start_time = lambda _pid: None
+    linux_module.HOST_ARCH = 'x86_64'
+    linux_module.shellquote = shell_quote
+    log_module.get_logger = lambda _name: _LoggerStub()
+    shell_module.call = lambda _command, *_args, **_kwargs: ''
+    utils.qemu_img = qemu_img_module
 
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
     module_path = os.path.join(repo_root, 'zstacklib', 'zstacklib', 'utils', 'qemu.py')
     real_exists = os.path.exists
-    with patch.object(bash_module, 'bash_roe', return_value=(
-            0, 'QEMU emulator version 6.2.0 (qemu-kvm-6.2.0)', '')), \
+    modules = {
+        'zstacklib': package,
+        'zstacklib.utils': utils,
+        'zstacklib.utils.bash': bash_module,
+        'zstacklib.utils.jsonobject': jsonobject_module,
+        'zstacklib.utils.linux': linux_module,
+        'zstacklib.utils.log': log_module,
+        'zstacklib.utils.qemu_img': qemu_img_module,
+        'zstacklib.utils.shell': shell_module,
+        'bash': bash_module,
+        'jsonobject': jsonobject_module,
+        'linux': linux_module,
+        'log': log_module,
+        'shell': shell_module,
+    }
+
+    def bash_roe(command):
+        if command.startswith('rpm '):
+            return 1, '', ''
+        return 0, 'QEMU emulator version 6.2.0 (qemu-kvm-6.2.0)', ''
+
+    with patch.dict(sys.modules, modules), \
+            patch.object(bash_module, 'bash_roe', side_effect=bash_roe), \
             patch.object(shell_module, 'call', return_value='6.2.0'), \
             patch('os.path.exists', side_effect=lambda path: (
                     path == '/usr/bin/qemu-system-x86_64' or real_exists(path))):

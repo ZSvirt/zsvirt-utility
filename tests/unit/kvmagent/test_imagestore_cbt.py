@@ -182,6 +182,10 @@ def test_rollback_cbt_backup_carries_previous_and_new_bitmap(monkeypatch):
             scratchNodeName='scratch-2', target=TEST_CBD_PATH + '-2',
             lastBitmapName='previous-bitmap', bitmapName='new-bitmap', mode='full',
         ),
+        MagicMock(
+            scratchNodeName=None, target=TEST_CBD_PATH + '-unprocessed',
+            lastBitmapName='previous-bitmap', bitmapName=None, mode=None,
+        ),
     ]
     commands = []
 
@@ -197,6 +201,7 @@ def test_rollback_cbt_backup_carries_previous_and_new_bitmap(monkeypatch):
     assert TEST_CONFIGURED_CBD_PATH not in commands[0]
     assert 'scratch-1' in commands[0]
     assert 'scratch-2' in commands[0]
+    assert 'unprocessed' not in commands[0]
     assert ',incremental;' in commands[0]
     assert ',full;' in commands[0]
 
@@ -208,3 +213,16 @@ def test_rollback_cbt_backup_rejects_missing_new_bitmap():
     )]
     with pytest.raises(ValueError, match='missing new bitmap'):
         ImageStoreClient().rollback_vm_cbt_backup_jobs('vm-uuid', records)
+
+
+def test_rollback_cbt_backup_skips_unprocessed_volume(monkeypatch):
+    commands = []
+    monkeypatch.setattr(imagestore.shell, 'call', lambda command: commands.append(command) or '')
+    record = MagicMock(
+        scratchNodeName=None, target=TEST_CBD_PATH,
+        lastBitmapName='previous-bitmap', bitmapName=None, mode=None,
+    )
+
+    ImageStoreClient().rollback_vm_cbt_backup_jobs('vm-uuid', [record])
+
+    assert commands == []
