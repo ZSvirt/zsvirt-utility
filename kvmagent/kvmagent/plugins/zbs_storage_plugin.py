@@ -5,6 +5,7 @@ from zstacklib.utils import log
 from zstacklib.utils import bash
 from zstacklib.utils import linux
 from zstacklib.utils import rollback
+from zstacklib.utils import shell
 from kvmagent.plugins.imagestore import ImageStoreClient
 from kvmagent.plugins import volume_secret
 import contextlib
