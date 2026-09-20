@@ -9815,8 +9815,9 @@ host side snapshot files chian:
 
         for volume in cmd.volumes:
             real_path = self.get_cbt_volume_actual_install_path(volume.installPath)
-            found = qemu_nbd.kill_nbd_process_by_flag(real_path) == 0
-            if not found and real_path != volume.installPath:
+            if qemu_nbd.find_qemu_nbd_process(real_path) == 0:
+                qemu_nbd.kill_nbd_process_by_flag(real_path)
+            if real_path != volume.installPath and qemu_nbd.find_qemu_nbd_process(volume.installPath) == 0:
                 qemu_nbd.kill_nbd_process_by_flag(volume.installPath)
             deactive_volume(real_path)
 
