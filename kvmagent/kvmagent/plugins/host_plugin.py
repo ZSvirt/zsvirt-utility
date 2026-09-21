@@ -3576,6 +3576,13 @@ done
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = SetHostKernelInterfaceResponse()
 
+        try:
+            sds_vip = netconfig.get_sds_vip_from_conf()
+        except netconfig.NetConfigError as e:
+            rsp.success = False
+            rsp.error = str(e)
+            return jsonobject.dumps(rsp)
+
         for iface in cmd.interfaces:
             if not iface.interfaceName and not linux.is_physical_nic(iface.interfaceName) and not linux.is_bond(iface.interfaceName):
                 raise Exception('cannot find interface or bond[%s]' % iface.interfaceName)
@@ -3594,6 +3601,7 @@ done
                 ifcfg = netconfig.NetVlanConfig(physical_dev)
             else:
                 ifcfg = linux.get_device_ifcfg(physical_dev)
+            ifcfg.sds_vip = sds_vip
 
             exist_ips = linux.get_ip_list_by_nic_name(target_dev)
             exist_ip_set = {obj.ip for obj in exist_ips}
@@ -3618,11 +3626,11 @@ done
                     ifcfg.boot_proto = netconfig.NET_CONFIG_BOOTPROTO_NONE
                     for item in exist_ips:
                         if item.ip in exist_ip_set and item.ip not in added_ip_set:
-                            ifcfg.add_ip_config(item.ip, item.netmask, item.gateway, item.version, item.is_default)
+                            ifcfg.add_ip_config(item.ip, item.netmask, item.gateway, item.version, item.is_default, sds_vip)
 
                 for item in added_ips:
                     shell.call('ip addr add %s/%s dev %s' % (item.ip, item.netmask, target_dev))
-                    ifcfg.add_ip_config(item.ip, item.netmask, item.gateway, item.version, item.is_default)
+                    ifcfg.add_ip_config(item.ip, item.netmask, item.gateway, item.version, item.is_default, sds_vip)
 
             ifcfg.restore_config()
 
