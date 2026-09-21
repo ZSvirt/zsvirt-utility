@@ -663,6 +663,8 @@ class GetCpuXmlResponse(kvmagent.AgentResponse):
 class CompareCpuFunctionResponse(kvmagent.AgentResponse):
     def __init__(self):
         super(CompareCpuFunctionResponse, self).__init__()
+        self.match = True
+        self.compareError = None
 
 class TakeSnapshotResponse(kvmagent.AgentResponse):
     def __init__(self):
@@ -8801,9 +8803,9 @@ class VmPlugin(kvmagent.KvmAgent):
         compare_cmd(False)
         logger.info("compare cpu function result: " + compare_cmd.stdout)
         if compare_cmd.return_code != 0:
-            rsp.error = compare_cmd.stderr
+            rsp.compareError = compare_cmd.stderr
+            rsp.match = False
             logger.info("compare cpu function error: " + compare_cmd.stderr)
-            rsp.success = False
         linux.rm_file_force(fpath)
         return jsonobject.dumps(rsp)
 
