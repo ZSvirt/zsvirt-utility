@@ -3602,6 +3602,9 @@ done
             else:
                 ifcfg = linux.get_device_ifcfg(physical_dev)
             ifcfg.sds_vip = sds_vip
+            # drop SDS VIP already loaded from existing ifcfg; keep runtime address untouched
+            if sds_vip:
+                ifcfg.delete_ip_config(sds_vip)
 
             exist_ips = linux.get_ip_list_by_nic_name(target_dev)
             exist_ip_set = {obj.ip for obj in exist_ips}
