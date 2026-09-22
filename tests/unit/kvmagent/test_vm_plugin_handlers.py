@@ -1734,6 +1734,19 @@ class TestCancelVolumeCbtBackupHandler:
         assert rsp['success'] is True
         client.stop_vm_cbt_backup_jobs.assert_called_once_with('vm-uuid', [])
 
+    def test_cancel_volume_cbt_backup_is_idempotent_when_vm_is_absent(self):
+        plugin = _make_vm_plugin()
+        vm_plugin.get_vm_by_uuid = MagicMock(return_value=None)
+        client = MagicMock()
+        vm_plugin.ImageStoreClient = MagicMock(return_value=client)
+
+        req = _make_req({'vmUuid': 'deleted-vm', 'records': []})
+        result = plugin.cancel_volume_cbt_backup(req)
+        rsp = json.loads(result)
+
+        assert rsp['success'] is True
+        client.stop_vm_cbt_backup_jobs.assert_not_called()
+
     def test_rollback_volume_cbt_backup(self):
         plugin = _make_vm_plugin()
         vm_plugin.get_vm_by_uuid = MagicMock(return_value=MagicMock())
@@ -1754,6 +1767,19 @@ class TestCancelVolumeCbtBackupHandler:
         assert rollback_records[0].lastBitmapName == 'previous-bitmap'
         assert rollback_records[0].bitmapName == 'new-bitmap'
         client.stop_vm_cbt_backup_jobs.assert_not_called()
+
+    def test_rollback_volume_cbt_backup_is_idempotent_when_vm_is_absent(self):
+        plugin = _make_vm_plugin()
+        vm_plugin.get_vm_by_uuid = MagicMock(return_value=None)
+        client = MagicMock()
+        vm_plugin.ImageStoreClient = MagicMock(return_value=client)
+
+        req = _make_req({'vmUuid': 'deleted-vm', 'records': []})
+        result = plugin.rollback_volume_cbt_backup(req)
+        rsp = json.loads(result)
+
+        assert rsp['success'] is True
+        client.rollback_vm_cbt_backup_jobs.assert_not_called()
 
     def test_rollback_volume_cbt_backup_reports_cleanup_failure(self):
         plugin = _make_vm_plugin()
@@ -2165,7 +2191,8 @@ class TestListExportedVolumesHandler:
         volume_two = MagicMock(volumeUuid='vol-2', installPath='/path/vol2')
         cmd = MagicMock(volumes=[volume_one, volume_two])
         with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd):
-            with patch.object(vm_plugin.qemu_nbd, 'find_qemu_nbd_process', side_effect=[0, 1]) as find:
+            with patch.object(vm_plugin.qemu_nbd, 'find_qemu_nbd_processes_by_export_name',
+                              side_effect=[[101], []]) as find:
                 req = _make_req({})
                 result = plugin.list_exported_volumes(req)
                 rsp = json.loads(result)
@@ -2173,54 +2200,39 @@ class TestListExportedVolumesHandler:
         assert rsp['success'] is True
         assert rsp['volumeExportInfos']['vol-1'] is True
         assert rsp['volumeExportInfos']['vol-2'] is False
-        assert [call.args[0] for call in find.call_args_list] == ['/path/vol1', '/path/vol2']
+        assert [call.args[0] for call in find.call_args_list] == ['vol-1', 'vol-2']
 
-    def test_list_exported_volumes_checks_converted_real_path(self):
+    def test_list_exported_volumes_uses_uuid_for_shared_block(self):
         plugin = _make_vm_plugin()
         volume = MagicMock(volumeUuid='vol-1', installPath='sharedblock://vg/vol')
         cmd = MagicMock(volumes=[volume])
 
         with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd):
-            with patch.object(vm_plugin.qemu_nbd, 'find_qemu_nbd_process', return_value=0) as find:
+            with patch.object(vm_plugin.qemu_nbd, 'find_qemu_nbd_processes_by_export_name',
+                              return_value=[101]) as find:
                 req = _make_req({})
                 result = plugin.list_exported_volumes(req)
                 rsp = json.loads(result)
 
         assert rsp['success'] is True
         assert rsp['volumeExportInfos']['vol-1'] is True
-        find.assert_called_once_with('/dev/vg/vol')
+        find.assert_called_once_with('vol-1')
 
-    def test_list_exported_volumes_falls_back_to_install_path(self):
-        plugin = _make_vm_plugin()
-        volume = MagicMock(volumeUuid='vol-1', installPath='sharedblock://vg/vol')
-        cmd = MagicMock(volumes=[volume])
-
-        with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd):
-            with patch.object(vm_plugin.qemu_nbd, 'find_qemu_nbd_process', side_effect=[1, 0]) as find:
-                req = _make_req({})
-                result = plugin.list_exported_volumes(req)
-                rsp = json.loads(result)
-
-        assert rsp['success'] is True
-        assert rsp['volumeExportInfos']['vol-1'] is True
-        assert [call.args[0] for call in find.call_args_list] == ['/dev/vg/vol', 'sharedblock://vg/vol']
-
-    def test_list_exported_volumes_uses_configured_cbd_path(self):
+    def test_list_exported_volumes_uses_uuid_for_cbd(self):
         plugin = _make_vm_plugin()
         cbd_path = 'cbd:pool_physical/pool/volume'
-        configured_path = cbd_path + '_zbs_:/etc/zbs/client.conf'
         volume = MagicMock(volumeUuid='vol-1', installPath=cbd_path)
         cmd = MagicMock(volumes=[volume])
 
-        with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd), \
-                patch.object(vm_plugin, 'get_volume_actual_installpath', return_value=configured_path):
-            with patch.object(vm_plugin.qemu_nbd, 'find_qemu_nbd_process', return_value=0) as find:
+        with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd):
+            with patch.object(vm_plugin.qemu_nbd, 'find_qemu_nbd_processes_by_export_name',
+                              return_value=[101]) as find:
                 result = plugin.list_exported_volumes(_make_req({}))
                 rsp = json.loads(result)
 
         assert rsp['success'] is True
         assert rsp['volumeExportInfos']['vol-1'] is True
-        find.assert_called_once_with(configured_path)
+        find.assert_called_once_with('vol-1')
 
 
 @pytest.mark.kvmagent
@@ -2795,7 +2807,10 @@ class TestTakeVolumeCbtBackupHandler:
 
         req = _make_req({
             'vmUuid': 'vm-uuid',
-            'volumeInfos': [{'target': 'cbd:pool_physical/pool/volume'}],
+            'volumeInfos': [
+                {'target': 'cbd:pool_physical/pool/volume'},
+                {'target': 'cbd:pool_physical/pool/unprocessed'},
+            ],
             'bitmapTimestamp': 'previous-bitmap',
             'portRange': '6000-6001',
         })
@@ -2805,6 +2820,7 @@ class TestTakeVolumeCbtBackupHandler:
         assert rsp['success'] is False
         assert rsp['error'] == 'cbtbak failed'
         assert 'cleanupPending' not in rsp
+        assert len(rsp['volumeInfos']) == 1
         assert rsp['volumeInfos'][0]['scratchNodeName'] == 'scratch'
         assert rsp['volumeInfos'][0]['bitmapName'] == 'new-bitmap'
 
@@ -2948,16 +2964,16 @@ class TestUnexportNbdVolumesHandler:
         plugin.get_cbt_volume_actual_install_path = MagicMock(return_value='/path/vol')
         plugin.deactive_volume_if_need = MagicMock()
 
-        volume = MagicMock(installPath='/path/vol')
+        volume = MagicMock(installPath='/path/vol', volumeUuid='vol-uuid')
         cmd = MagicMock(volumes=[volume])
         with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd):
-            with patch.object(vm_plugin.qemu_nbd, 'kill_nbd_process_by_flag', return_value=0) as kill_nbd:
+            with patch.object(vm_plugin.qemu_nbd, 'kill_nbd_process_by_export_name', return_value=0) as kill_nbd:
                 req = _make_req({})
                 result = plugin.unexport_nbd_volumes(req)
                 rsp = json.loads(result)
 
         assert rsp['success'] is True
-        kill_nbd.assert_called_once_with('/path/vol')
+        kill_nbd.assert_called_once_with('vol-uuid')
         plugin.deactive_volume_if_need.assert_called_once_with('/path/vol', False)
 
     def test_unexport_nbd_volumes_does_not_deactivate_when_kill_times_out(self):
@@ -2965,18 +2981,18 @@ class TestUnexportNbdVolumesHandler:
         plugin.get_cbt_volume_actual_install_path = MagicMock(return_value='/path/vol')
         plugin.deactive_volume_if_need = MagicMock()
 
-        volume = MagicMock(installPath='/path/vol')
+        volume = MagicMock(installPath='/path/vol', volumeUuid='vol-uuid')
         cmd = MagicMock(volumes=[volume])
-        err = Exception('timeout waiting qemu-nbd process[/path/vol] gone after SIGTERM')
+        err = Exception('timeout waiting qemu-nbd export[vol-uuid] gone after SIGTERM')
         with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd):
-            with patch.object(vm_plugin.qemu_nbd, 'kill_nbd_process_by_flag', side_effect=err) as kill_nbd:
+            with patch.object(vm_plugin.qemu_nbd, 'kill_nbd_process_by_export_name', side_effect=err) as kill_nbd:
                 req = _make_req({})
                 result = plugin.unexport_nbd_volumes(req)
                 rsp = json.loads(result)
 
         assert rsp['success'] is False
-        assert 'timeout waiting qemu-nbd process' in rsp['error']
-        kill_nbd.assert_called_once_with('/path/vol')
+        assert 'timeout waiting qemu-nbd export' in rsp['error']
+        kill_nbd.assert_called_once_with('vol-uuid')
         plugin.deactive_volume_if_need.assert_not_called()
 
     def test_unexport_nbd_volumes_uses_configured_cbd_path(self):
@@ -2984,35 +3000,17 @@ class TestUnexportNbdVolumesHandler:
         cbd_path = 'cbd:pool_physical/pool/volume'
         configured_path = cbd_path + '_zbs_:/etc/zbs/client.conf'
         plugin.deactive_volume_if_need = MagicMock()
-        volume = MagicMock(installPath=cbd_path)
+        volume = MagicMock(installPath=cbd_path, volumeUuid='vol-uuid')
         cmd = MagicMock(volumes=[volume])
 
         with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd), \
                 patch.object(vm_plugin, 'get_volume_actual_installpath', return_value=configured_path):
-            with patch.object(vm_plugin.qemu_nbd, 'kill_nbd_process_by_flag', return_value=0) as kill_nbd:
+            with patch.object(vm_plugin.qemu_nbd, 'kill_nbd_process_by_export_name', return_value=0) as kill_nbd:
                 result = plugin.unexport_nbd_volumes(_make_req({}))
                 rsp = json.loads(result)
 
         assert rsp['success'] is True
-        kill_nbd.assert_called_once_with(configured_path)
-        plugin.deactive_volume_if_need.assert_called_once_with(configured_path, False)
-
-    def test_unexport_nbd_volumes_falls_back_to_legacy_cbd_path(self):
-        plugin = _make_vm_plugin()
-        cbd_path = 'cbd:pool_physical/pool/volume'
-        configured_path = cbd_path + '_zbs_:/etc/zbs/client.conf'
-        plugin.deactive_volume_if_need = MagicMock()
-        volume = MagicMock(installPath=cbd_path)
-        cmd = MagicMock(volumes=[volume])
-
-        with patch.object(vm_plugin.jsonobject, 'loads', return_value=cmd), \
-                patch.object(vm_plugin, 'get_volume_actual_installpath', return_value=configured_path), \
-                patch.object(vm_plugin.qemu_nbd, 'kill_nbd_process_by_flag', side_effect=[1, 0]) as kill_nbd:
-            result = plugin.unexport_nbd_volumes(_make_req({}))
-            rsp = json.loads(result)
-
-        assert rsp['success'] is True
-        assert [call.args[0] for call in kill_nbd.call_args_list] == [configured_path, cbd_path]
+        kill_nbd.assert_called_once_with('vol-uuid')
         plugin.deactive_volume_if_need.assert_called_once_with(configured_path, False)
 
 
