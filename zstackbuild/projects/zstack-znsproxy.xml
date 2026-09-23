@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<project name="zstack-znsproxy builder" basedir="../">
+    <property name="znsproxy.python" value="/bin/python" />
+    <property name="zstackzns.go" value="/usr/lib/golang1.24/bin/go" />
+    <property name="znsproxy.bdir" location="${build.dir}/zns-proxy/" />
+    <property name="znsproxy.ansible.dir" location="${ansible.dir}/znsproxy/" />
+
+    <target name="build-zstack-zns-proxy">
+        <makeDir dir="${znsproxy.bdir}" />
+
+        <checkProperty property="zstackzns.source" />
+        <checkFile file="${zstackzns.source}" />
+        <checkFile file="${zstackzns.source}/Makefile" />
+        <checkFile file="${zstackzns.source}/go.mod" />
+        <checkFile file="${zstackzns.go}" />
+
+        <exec executable="${zstackzns.go}" failonerror="true"
+              outputproperty="zstackzns.go.version">
+            <env key="GOROOT" value="" />
+            <arg value="version" />
+        </exec>
+        <echo message="zstack-zns Go toolchain: ${zstackzns.go.version}" />
+        <condition property="zstackzns.go.is.1.24">
+            <matches string="${zstackzns.go.version}"
+                     pattern="go1\.24(\.[0-9]+)?(\s|$)" />
+        </condition>
+        <fail unless="zstackzns.go.is.1.24"
+              message="zstack-zns requires Go 1.24, got: ${zstackzns.go.version}" />
+
+        <exec executable="git" dir="${zstackzns.source}" failonerror="true"
+              outputproperty="zstackzns.commit">
+            <arg value="rev-parse" />
+            <arg value="HEAD" />
+        </exec>
+        <echo message="zstack-zns source commit: ${zstackzns.commit}" />
+
+        <exec executable="make" dir="${zstackzns.source}" failonerror="true">
+            <env key="GOWORK" value="off" />
+            <env key="GOROOT" value="" />
+            <arg value="zns-proxy" />
+            <arg value="ARCH=amd64" />
+            <arg value="GO=${zstackzns.go}" />
+        </exec>
+
+        <exec executable="make" dir="${zstackzns.source}" failonerror="true"
+              outputproperty="zstackzns.proxy.version">
+            <env key="GOWORK" value="off" />
+            <env key="GOROOT" value="" />
+            <arg value="-s" />
+            <arg value="--no-print-directory" />
+            <arg value="print-zns-proxy-version" />
+            <arg value="GO=${zstackzns.go}" />
+        </exec>
+        <echo message="zns-proxy component version: ${zstackzns.proxy.version}" />
+
+        <copy todir="${znsproxy.bdir}/">
+            <fileset dir="${zstackzns.source}/target">
+                <include name="zns-proxy.bin" />
+            </fileset>
+        </copy>
+
+        <exec executable="${znsproxy.python}" dir="${basedir}" failonerror="true">
+            <arg value="${basedir}/scripts/zns_proxy_manifest.py" />
+            <arg value="--package" />
+            <arg value="${znsproxy.bdir}/zns-proxy.bin" />
+            <arg value="--output" />
+            <arg value="${znsproxy.bdir}/zns-proxy-manifest.json" />
+            <arg value="--version" />
+            <arg value="${zstackzns.proxy.version}" />
+            <arg value="--arch" />
+            <arg value="amd64" />
+            <arg value="--path" />
+            <arg value="zns-proxy.bin" />
+        </exec>
+    </target>
+
+    <target name="assemble-zstack-zns-proxy">
+        <makeDir dir="${znsproxy.ansible.dir}" />
+
+        <copy todir="${znsproxy.ansible.dir}">
+            <fileset dir="${znsproxy.bdir}">
+                <include name="**/*" />
+            </fileset>
+        </copy>
+
+        <copy todir="${znsproxy.ansible.dir}">
+            <fileset dir="${znsproxyansibleplaybook.source}/ansible">
+                <include name="**/*" />
+                <exclude name="**/__pycache__/**" />
+                <exclude name="**/*.pyc" />
+            </fileset>
+        </copy>
+
+        <copy todir="${ansible.dir}">
+            <fileset dir="${znsproxyansibleplaybook.source}/ansible">
+                <include name="znsproxy.py" />
+            </fileset>
+        </copy>
+    </target>
+
+    <target name="verify-zstack-zns-proxy-package">
+        <exec executable="${znsproxy.python}" dir="${basedir}" failonerror="true">
+            <arg value="${basedir}/scripts/zns_proxy_iso_guard.py" />
+            <arg value="--ansible-dir" />
+            <arg value="${ansible.dir}" />
+        </exec>
+    </target>
+</project>
