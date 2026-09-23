@@ -5373,13 +5373,23 @@ class Vm(object):
 
             return False
 
+        backend_created = False
         try:
             if check_device(None):
                 return
 
             # if nic type is vDPA/dpdkvhostuser, create vDPA/dpdkvhostuser backends in thread.
             if cmd.nic.type in ovs.OvsDpdkSupportVnic:
-                cmd.nic.srcPath = ovs.getOvsCtl(with_dpdk=True).createNicBackend(cmd.vmUuid, cmd.nic)
+                if ovs.isZnsDpdkNic(cmd.nic) and self.state in (self.VM_STATE_RUNNING, self.VM_STATE_PAUSED):
+                    domain = etree.fromstring(self.domain.XMLDesc(0))
+                    access = domain.find('memoryBacking/access')
+                    if access is None or access.get('mode') != 'shared':
+                        raise kvmagent.KvmError('ZNS DPDK hot attach requires shared VM memory; stop the VM, attach the NIC and start it again')
+                if ovs.isZnsDpdkNic(cmd.nic):
+                    cmd.nic.srcPath = ovs.createNicBackend(cmd.vmUuid, cmd.nic)
+                else:
+                    cmd.nic.srcPath = ovs.getOvsCtl(with_dpdk=True).createNicBackend(cmd.vmUuid, cmd.nic)
+                backend_created = True
 
             # Make sure key:vmInstanceUuid exists
             if cmd.nic.type == "TFVNIC":
@@ -5398,6 +5408,8 @@ class Vm(object):
         except:
             #  check one more time
             if not check_device(None):
+                if backend_created and ovs.isZnsDpdkNic(cmd.nic):
+                    ovs.destroyNicBackend(cmd.vmUuid, cmd.nic.nicInternalName)
                 raise
 
     def attach_nic(self, cmd):
@@ -5441,11 +5453,13 @@ class Vm(object):
                     return iface.dump()
 
         if check_device(None):
+            if ovs.isZnsDpdkNic(cmd.nic):
+                ovs.destroyNicBackend(cmd.vmUuid, cmd.nic.nicInternalName)
             return
 
         try:
             # if nic type is vDPA/dpdkvhostuser, release it before detach.
-            if cmd.nic.type in ovs.OvsDpdkSupportVnic:
+            if cmd.nic.type in ovs.OvsDpdkSupportVnic and not ovs.isZnsDpdkNic(cmd.nic):
                 cmd.nic.srcPath = ovs.getOvsCtl(with_dpdk=True).destoryNicBackend(cmd.vmUuid, cmd.nic.nicInternalName)
 
             xml = None
@@ -5471,6 +5485,9 @@ class Vm(object):
             if not check_device(None):
                 logger.warn('failed to detach a nic[mac:%s], dump vm xml:\n%s' % (cmd.nic.mac, self.domain_xml))
                 raise
+
+        if ovs.isZnsDpdkNic(cmd.nic):
+            ovs.destroyNicBackend(cmd.vmUuid, cmd.nic.nicInternalName)
 
     def detach_nic(self, cmd):
         self._wait_vm_run_until_seconds(10)
@@ -5844,7 +5861,7 @@ class Vm(object):
         return vm
 
     @staticmethod
-    def from_StartVmCmd(cmd):
+    def from_StartVmCmd(cmd, created_zns_nics=None):
         # type: (StartVmCmd) -> None
         use_numa = cmd.useNuma
         numa_nodes = cmd.addons.numaNodes
@@ -5878,7 +5895,9 @@ class Vm(object):
                 e(backing, "hugepages")
                 e(backing, "nosharepages")
                 e(backing, "allocation", attrib={'mode': 'immediate'})
-            if cmd.MemAccess in "shared":
+            if any(ovs.isZnsDpdkNic(nic) for nic in cmd.nics) and not cmd.useHugePage:
+                e(backing, "source", attrib={'type': 'memfd'})
+            if cmd.MemAccess in "shared" or any(ovs.isZnsDpdkNic(nic) for nic in cmd.nics):
                 # <access mode="shared|private"/>
                 e(backing, "access", attrib={'mode': 'shared'})
 
@@ -6979,8 +6998,11 @@ class Vm(object):
 
             for index, nic in enumerate(cmd.nics):
                 if nic.type in ovs.OvsDpdkSupportVnic:
-                    ovsctl = ovs.getOvsCtl(with_dpdk=True)
-                    nic.srcPath = ovsctl.createNicBackend(cmd.priorityConfigStruct.vmUuid, nic)
+                    if ovs.isZnsDpdkNic(nic):
+                        nic.srcPath = ovs.createNicBackend(cmd.vmInstanceUuid, nic, created_zns_nics)
+                    else:
+                        ovsctl = ovs.getOvsCtl(with_dpdk=True)
+                        nic.srcPath = ovsctl.createNicBackend(cmd.priorityConfigStruct.vmUuid, nic)
                     interface = Vm._build_interface_xml(nic, devices, nic.srcPath, 'Attach', brMode, index)
                 elif nic.type == 'TFVNIC':
                     interface = Vm._build_interface_xml(nic, devices, vhostSrcPath, 'Attach', brMode, index, cmd)
@@ -7567,7 +7589,7 @@ class Vm(object):
         if cmd.additionalQmp:
             make_qemu_commandline()
 
-        if cmd.useHugePage or cmd.MemAccess in "shared" or cmd.noSharePages:
+        if cmd.useHugePage or cmd.MemAccess in "shared" or cmd.noSharePages or any(ovs.isZnsDpdkNic(nic) for nic in cmd.nics):
             make_memory_backing()
 
         if HOST_ARCH == "x86_64" and cmd.vmCpuVendorId and cmd.vmCpuVendorId != "None":
@@ -7640,6 +7662,8 @@ class Vm(object):
                 e(interface, 'driver', None, attrib={'queues': '16', 'vhostforce': 'on'})
             elif nic.type in ovs.OvsDpdkSupportVnic:
                 e(interface, 'source', None, attrib={'type': 'unix', 'path': vhostSrcPath, 'mode': 'server'})
+                if ovs.isZnsDpdkNic(nic):
+                    e(interface, 'target', None, attrib={'dev': nic.nicInternalName})
             else:
                 e(interface, 'source', None, attrib={'type': 'unix', 'path': '/var/run/phynic{}'.format(index+1), 'mode':'server'})
                 e(interface, 'driver', None, attrib={'queues': '8'})
@@ -7653,13 +7677,16 @@ class Vm(object):
         else:
             e(interface, 'source', None, attrib={'bridge': nic.bridgeName})
             e(interface, 'target', None, attrib={'dev': nic.nicInternalName})
+            if getattr(nic, 'bridgePortType', None):
+                virtualport = e(interface, 'virtualport', None, attrib={'type': nic.bridgePortType})
+                e(virtualport, 'parameters', None, attrib={'interfaceid': nic.interfaceId})
 
         if nic.pci is not None and (iftype == 'bridge' or iftype == 'direct' or iftype == 'vhostuser'):
             e(interface, 'address', None, attrib={'type': nic.pci.type, 'domain': nic.pci.domain, 'bus': nic.pci.bus, 'slot': nic.pci.slot, "function": nic.pci.function})
         else:
             e(interface, 'address', None, attrib={'type': "pci"})
 
-        if nic.cleanTraffic and iftype == 'bridge':
+        if nic.cleanTraffic and iftype == 'bridge' and not getattr(nic, 'bridgePortType', None):
             if nic.ips:
                 ip4Addr = None
                 ip6Addrs = []
@@ -8126,6 +8153,30 @@ class VmPlugin(kvmagent.KvmAgent):
                 linux.rm_dir_force(mount_path)
 
     def _start_vm(self, cmd):
+        created_zns_nics = []
+        try:
+            return self._start_vm_with_nic_tracking(cmd, created_zns_nics)
+        except Exception:
+            self._rollback_created_zns_nics(cmd.vmInstanceUuid, created_zns_nics)
+            raise
+
+    def _rollback_created_zns_nics(self, vm_uuid, created_zns_nics):
+        if not created_zns_nics:
+            return
+        try:
+            vm = get_vm_by_uuid_no_retry(vm_uuid, False)
+            if (vm and vm.domain.isActive()) or linux.find_vm_pid_by_uuid(vm_uuid):
+                return
+        except Exception as e:
+            logger.warn('cannot confirm vm[%s] is inactive, retain ZNS ports: %s' % (vm_uuid, e))
+            return
+        for name in created_zns_nics:
+            try:
+                ovs.destroyNicBackend(vm_uuid, name)
+            except Exception as e:
+                logger.warn('failed to roll back ZNS port[%s] for vm[%s]: %s' % (name, vm_uuid, e))
+
+    def _start_vm_with_nic_tracking(self, cmd, created_zns_nics):
         try:
             vm = get_vm_by_uuid_no_retry(cmd.vmInstanceUuid, False)
 
@@ -8141,7 +8192,7 @@ class VmPlugin(kvmagent.KvmAgent):
                     # We should keep TPM state file before start VM
                     vm.stop(strategy='cold', undefine=False)
 
-            vm = Vm.from_StartVmCmd(cmd)
+            vm = Vm.from_StartVmCmd(cmd, created_zns_nics)
 
             if cmd.memorySnapshotPath:
                 snapshot_path = None
@@ -9002,7 +9053,7 @@ class VmPlugin(kvmagent.KvmAgent):
                 vm.stop(timeout=cmd.timeout / 2)
 
             if vmUseOpenvSwitch:
-                ovs.getOvsCtl(with_dpdk=True).destoryNicBackend(vmUuid)
+                ovs.destroyNicBackend(vmUuid)
         finally:
             # libvirt is not reliable, c.f. ZSTAC-15412
             self.kill_vm(vmUuid)
@@ -9103,7 +9154,7 @@ class VmPlugin(kvmagent.KvmAgent):
                 vmUseOpenvSwitch = ovs.isVmUseOpenvSwitch(cmd.uuid)
                 vm.destroy()
                 if vmUseOpenvSwitch:
-                    ovs.getOvsCtl(with_dpdk=True).destoryNicBackend(cmd.uuid)
+                    ovs.destroyNicBackend(cmd.uuid)
                 # notify vrouter agent nic removed from source host
                 for nic in cmd.vmNics:
                     if nic.type == 'TFVNIC':

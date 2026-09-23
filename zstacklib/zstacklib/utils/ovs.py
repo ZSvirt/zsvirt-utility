@@ -9,6 +9,7 @@ import yaml
 import glob
 import uuid
 import re
+import pipes
 from enum import Enum, unique
 
 from zstacklib.utils import log
@@ -44,6 +45,99 @@ BridgeNotExist = 2
 
 class OvsError(Exception):
     '''ovs error'''
+
+
+def isZnsDpdkNic(nic):
+    return nic.type == 'dpdkvhostuserclient' and getattr(nic, 'bridgePortType', None) == 'openvswitch'
+
+
+def _nicOvsctl(*args):
+    return shell.call(CtlBin + '--timeout=10 ' + ' '.join(pipes.quote(str(arg)) for arg in args)).strip()
+
+
+def createNicBackend(vmUuid, nic, created=None):
+    if not isZnsDpdkNic(nic):
+        return getOvsCtl(with_dpdk=True).createNicBackend(vmUuid, nic)
+    return _createZnsNicBackend(vmUuid, nic, created)
+
+
+@lock.lock('ovs-zns-nic')
+def _createZnsNicBackend(vmUuid, nic, created=None):
+    name = nic.nicInternalName
+    if not name or not re.match(r'^[a-zA-Z0-9_.-]{1,15}$', name):
+        raise OvsError('Invalid ZNS NIC interface name: {}'.format(name))
+    try:
+        interfaceId = str(uuid.UUID(nic.interfaceId))
+        uuid.UUID(vmUuid)
+    except (ValueError, TypeError, AttributeError):
+        raise OvsError('ZNS NIC requires valid VM and segment port UUIDs')
+    if nic.bridgeName != 'br-int':
+        raise OvsError('ZNS NIC must use br-int')
+    if _nicOvsctl('get', 'Bridge', 'br-int', 'datapath_type').strip('"') != 'netdev':
+        raise OvsError('ZNS DPDK NIC requires a netdev br-int')
+    if _nicOvsctl('get', 'Open_vSwitch', '.', 'dpdk_initialized') != 'true':
+        raise OvsError('ZNS OVS DPDK is not initialized')
+
+    path = os.path.join(OvsPath, name)
+    existing = _nicOvsctl('--if-exists', 'get', 'Interface', name, 'name')
+    if existing:
+        owner = _nicOvsctl('get', 'Interface', name, 'external_ids:vm-id').strip('"')
+        portId = _nicOvsctl('get', 'Interface', name, 'external_ids:iface-id').strip('"')
+        portType = _nicOvsctl('get', 'Interface', name, 'type').strip('"')
+        socket = _nicOvsctl('get', 'Interface', name, 'options:vhost-server-path').strip('"')
+        if (owner != vmUuid or portId != interfaceId or portType != nic.type or socket != path
+                or _nicOvsctl('port-to-br', name) != 'br-int'):
+            raise OvsError('Existing OVS interface {} does not match ZNS NIC ownership/configuration'.format(name))
+        _nicOvsctl('set', 'Interface', name, 'external_ids:zns-managed=true')
+        return path
+
+    _nicOvsctl('--may-exist', 'add-port', 'br-int', name, '--', 'set', 'Interface', name,
+               'type=dpdkvhostuserclient', 'options:vhost-server-path=' + path,
+               'external_ids:iface-id=' + interfaceId, 'external_ids:vm-id=' + vmUuid,
+               'external_ids:zns-managed=true')
+    if created is not None:
+        created.append(name)
+    return path
+
+
+@lock.lock('ovs-zns-nic')
+def destroyNicBackend(vmUuid, specificNic=None):
+    try:
+        names = _nicOvsctl('--format=csv', '--data=bare', '--no-heading', '--columns=name', 'find', 'Interface',
+                          'external_ids:vm-id=' + vmUuid, 'external_ids:zns-managed=true').splitlines()
+    except shell.ShellError:
+        return getOvsCtl(with_dpdk=True).destoryNicBackend(vmUuid, specificNic)
+    names = [name.strip().strip('"') for name in names if name.strip()]
+    if specificNic is not None:
+        names = [name for name in names if name == specificNic]
+    if not names:
+        if specificNic is not None:
+            remaining = _nicOvsctl('--if-exists', 'get', 'Interface', specificNic, 'name')
+        else:
+            remaining = _nicOvsctl('--format=csv', '--data=bare', '--no-heading', '--columns=name',
+                                   'find', 'Interface', 'external_ids:vm-id=' + vmUuid)
+        if not remaining:
+            return None
+        return getOvsCtl(with_dpdk=True).destoryNicBackend(vmUuid, specificNic)
+    return _destroyZnsNicBackend(vmUuid, names, specificNic)
+
+
+def _destroyZnsNicBackend(vmUuid, names, specificNic):
+    path = None
+    for name in names:
+        portType = _nicOvsctl('--if-exists', 'get', 'Interface', name, 'type').strip('"')
+        if not portType:
+            continue
+        if portType != 'dpdkvhostuserclient':
+            raise OvsError('Unexpected type for ZNS interface {}: {}'.format(name, portType))
+        path = _nicOvsctl('--if-exists', 'get', 'Interface', name, 'options:vhost-server-path').strip('"')
+        _nicOvsctl('--if-exists', 'del-port', name)
+    if specificNic is None:
+        remaining = _nicOvsctl('--format=csv', '--data=bare', '--no-heading', '--columns=name', 'find', 'Interface',
+                               'external_ids:vm-id=' + vmUuid)
+        if remaining:
+            getOvsCtl(with_dpdk=True).destoryNicBackend(vmUuid)
+    return path
 
 
 def writeSysfs(path, value, supressRaise=False):
