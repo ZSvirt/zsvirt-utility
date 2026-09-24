@@ -24,6 +24,19 @@ except ImportError:
 
 
 NANOSECONDS_PER_MILLISECOND = 1000000.0
+CPU_READY_SUPPORTED = "SUPPORTED"
+CPU_READY_PARTIAL = "PARTIAL"
+CPU_READY_NO_DATA = "NO_DATA"
+CPU_READY_UNSUPPORTED = "UNSUPPORTED"
+
+# The standard cpu<N> prefix contains nine counters.  Vendor kernels may
+# append private counters, so run_delay must be addressed from the beginning
+# of the record rather than from the end.
+SCHEDSTAT_RUN_DELAY_INDEX = {
+    15: 8,
+    16: 8,
+    17: 8,
+}
 
 
 def _libvirt_flag(name):
@@ -47,7 +60,7 @@ def _read_int(path):
 def _collect_host_cpu(path="/proc/schedstat"):
     version = None
     delays = {}
-    valid = False
+    cpu_records = []
     try:
         with open(path) as stream:
             for line in stream:
@@ -56,14 +69,42 @@ def _collect_host_cpu(path="/proc/schedstat"):
                     continue
                 if fields[0] == "version" and len(fields) > 1:
                     version = int(fields[1])
-                elif re.match(r"^cpu\d+$", fields[0]) and len(fields) >= 4:
-                    # Supported schedstat CPU records end in:
-                    # running_ns, run_delay_ns, timeslices.
-                    delays[fields[0]] = int(fields[-2])
-        valid = version is not None and bool(delays)
+                elif re.match(r"^cpu\d+$", fields[0]):
+                    cpu_records.append(fields)
     except (IOError, OSError, ValueError):
-        pass
-    return {"version": version, "runDelayNs": delays, "valid": valid}
+        return {"version": version, "runDelayNs": {}, "valid": False,
+                "status": CPU_READY_NO_DATA}
+
+    run_delay_index = SCHEDSTAT_RUN_DELAY_INDEX.get(version)
+    if run_delay_index is None:
+        return {"version": version, "runDelayNs": {}, "valid": False,
+                "status": CPU_READY_UNSUPPORTED}
+    if not cpu_records:
+        return {"version": version, "runDelayNs": {}, "valid": False,
+                "status": CPU_READY_NO_DATA}
+
+    invalid_records = 0
+    for fields in cpu_records:
+        # cpu name + the nine standard counters, including timeslices after
+        # run_delay.  Trailing vendor fields are intentionally accepted.
+        if len(fields) < 10:
+            invalid_records += 1
+            continue
+        try:
+            run_delay = int(fields[run_delay_index])
+            timeslices = int(fields[9])
+            if run_delay < 0 or timeslices < 0:
+                raise ValueError("negative schedstat counter")
+            delays[fields[0]] = run_delay
+        except (TypeError, ValueError):
+            invalid_records += 1
+
+    if invalid_records:
+        status = CPU_READY_PARTIAL if delays else CPU_READY_NO_DATA
+        return {"version": version, "runDelayNs": delays, "valid": False,
+                "status": status}
+    return {"version": version, "runDelayNs": delays, "valid": bool(delays),
+            "status": CPU_READY_SUPPORTED if delays else CPU_READY_NO_DATA}
 
 
 def _is_partition(name, sys_block="/sys/class/block"):
@@ -183,9 +224,22 @@ def collect_host_snapshot():
     }
 
 
-def _collect_vcpus(values):
+def _schedstats_wait_supported(
+        path="/proc/sys/kernel/sched_schedstats"):
+    """Return whether libvirt's legacy vcpu.N.wait source is usable.
+
+    A number of older libvirt builds return a successful zero when scheduler
+    wait accounting is disabled.  Treating that value as a counter creates a
+    false zero CPU Ready series, so the fallback is enabled only after an
+    explicit runtime capability check.
+    """
+    return _read_int(path) == 1
+
+
+def _collect_vcpus(values, wait_supported):
     count = int(values.get("vcpu.current", 0))
-    delays = {}
+    delay_values = {}
+    wait_values = {}
     # vcpu.current is the number of online vCPUs, not an upper bound for
     # their IDs. CPU hotplug can therefore produce sparse IDs (for example
     # 0 and 2). Discover the IDs from libvirt's returned keys instead of
@@ -196,11 +250,33 @@ def _collect_vcpus(values):
             continue
         vcpu_id = int(match.group(1))
         field = match.group(2)
-        # Prefer delay when both fields are exposed; wait is the fallback for
-        # libvirt versions which use that name for the scheduler wait counter.
-        if field == "delay" or vcpu_id not in delays:
-            delays[vcpu_id] = int(value)
-    return count, delays
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed < 0:
+            continue
+        if field == "delay":
+            delay_values[vcpu_id] = parsed
+        else:
+            wait_values[vcpu_id] = parsed
+
+    delays = {}
+    for vcpu_id in set(delay_values) | set(wait_values):
+        if vcpu_id in delay_values:
+            delays[vcpu_id] = delay_values[vcpu_id]
+        elif wait_supported:
+            delays[vcpu_id] = wait_values[vcpu_id]
+
+    if count <= 0:
+        status = CPU_READY_NO_DATA
+    elif len(delays) == count:
+        status = CPU_READY_SUPPORTED
+    elif delays:
+        status = CPU_READY_PARTIAL
+    else:
+        status = CPU_READY_UNSUPPORTED
+    return count, delays, status
 
 
 def _collect_vm_disks(values):
@@ -233,20 +309,23 @@ def _optional_int(values, key):
     return int(values[key]) if key in values else None
 
 
-def collect_vm_snapshot(conn):
+def collect_vm_snapshot(conn, wait_supported=None):
     """Collect all active VMs with one libvirt getAllDomainStats call."""
     stats = (_libvirt_flag("VIR_DOMAIN_STATS_VCPU") |
              _libvirt_flag("VIR_DOMAIN_STATS_BLOCK") |
              _libvirt_flag("VIR_DOMAIN_STATS_INTERFACE"))
     flags = _libvirt_flag("VIR_CONNECT_GET_ALL_DOMAINS_STATS_ACTIVE")
     records = conn.getAllDomainStats(stats, flags)
+    if wait_supported is None:
+        wait_supported = _schedstats_wait_supported()
     snapshot = {}
     for domain, values in records:
-        count, delays = _collect_vcpus(values)
+        count, delays, cpu_status = _collect_vcpus(values, wait_supported)
         # libvirt uses RFC-4122 UUIDs; ZStack resource/API labels use 32 hex digits.
         snapshot[domain.UUIDString().replace("-", "").lower()] = {
             "vcpuCount": count,
             "delayNs": delays,
+            "cpuStatus": cpu_status,
             "disks": _collect_vm_disks(values),
             "interfaces": _collect_vm_interfaces(values),
         }
@@ -330,6 +409,7 @@ def calculate_vm_metrics(previous, current):
         }) for name, value in now["disks"].items())
         result[vm_uuid] = {
             "cpu": _calculate_cpu(before, now, interval_ms),
+            "cpuStatus": now.get("cpuStatus", CPU_READY_NO_DATA),
             "disks": _calculate_disk(vm_disks_before, vm_disks_now,
                                      NANOSECONDS_PER_MILLISECOND),
             "interfaces": _calculate_network(before["interfaces"],
@@ -363,6 +443,7 @@ def calculate_host_metrics(previous, current):
     }) for name, value in current["disks"].items())
     return {
         "cpu": cpu,
+        "cpuStatus": current["cpu"].get("status", CPU_READY_NO_DATA),
         "disks": _calculate_disk(disk_before, disk_now, 1.0),
         "interfaces": _calculate_network(previous["interfaces"],
                                          current["interfaces"]),
@@ -373,6 +454,7 @@ def _metric_families():
     specs = (
         ("zstack_vm_vcpu_ready_time_milliseconds", ["vm_uuid", "vcpu_id"]),
         ("zstack_vm_vcpu_readiness_percent", ["vm_uuid", "vcpu_id"]),
+        ("zstack_vm_cpu_ready_status", ["vm_uuid", "status"]),
         ("zstack_vm_disk_read_time_milliseconds", ["vm_uuid", "disk_name"]),
         ("zstack_vm_disk_read_requests", ["vm_uuid", "disk_name"]),
         ("zstack_vm_disk_write_time_milliseconds", ["vm_uuid", "disk_name"]),
@@ -382,6 +464,7 @@ def _metric_families():
         ("zstack_host_cpu_ready_time_milliseconds", []),
         ("zstack_host_cpu_readiness_percent", []),
         ("zstack_host_cpu_ready_time_milliseconds_by_cpu", ["cpu_id"]),
+        ("zstack_host_cpu_ready_status", ["status"]),
         ("zstack_host_disk_read_latency_milliseconds", ["disk_name"]),
         ("zstack_host_disk_write_latency_milliseconds", ["disk_name"]),
         ("zstack_host_network_receive_dropped_packets", ["nic_name"]),
@@ -396,6 +479,9 @@ def _metric_families():
 def build_prometheus_metrics(vm_metrics, host_metrics):
     metrics = _metric_families()
     for vm_uuid, values in vm_metrics.items():
+        cpu_status = values.get("cpuStatus", CPU_READY_NO_DATA)
+        metrics["zstack_vm_cpu_ready_status"].add_metric(
+            [vm_uuid, cpu_status], 1)
         cpu = values["cpu"]
         if cpu is not None:
             interval_ms = cpu["intervalMs"]
@@ -425,6 +511,8 @@ def build_prometheus_metrics(vm_metrics, host_metrics):
                 metrics["zstack_vm_network_transmit_dropped_packets"].add_metric(
                     labels, nic["txDrop"])
 
+    metrics["zstack_host_cpu_ready_status"].add_metric(
+        [host_metrics.get("cpuStatus", CPU_READY_NO_DATA)], 1)
     cpu = host_metrics["cpu"]
     if cpu is not None:
         metrics["zstack_host_cpu_ready_time_milliseconds"].add_metric(
@@ -458,7 +546,8 @@ class VmHostPerformanceCollector(object):
         self.lock = threading.RLock()
         self.previous_vm = None
         self.previous_host = None
-        self.last_host_metrics = {"cpu": None, "disks": {}, "interfaces": {}}
+        self.last_host_metrics = {"cpu": None, "cpuStatus": CPU_READY_NO_DATA,
+                                  "disks": {}, "interfaces": {}}
 
     @staticmethod
     def _component_valid(snapshot, component):
@@ -466,6 +555,8 @@ class VmHostPerformanceCollector(object):
 
     def _update_host_metrics(self, current):
         components = ("cpu", "disks", "interfaces")
+        self.last_host_metrics["cpuStatus"] = current.get(
+            "cpu", {}).get("status", CPU_READY_NO_DATA)
         if self.previous_host is None:
             self.previous_host = {"componentCapturedAt": {}, "valid": {}}
         for component in components:
@@ -507,8 +598,14 @@ class VmHostPerformanceCollector(object):
             current_host = collect_host_snapshot()
             if self.previous_vm is None:
                 self.previous_vm = current_vm
-                self._update_host_metrics(current_host)
-                return list(_metric_families().values())
+                host_metrics = self._update_host_metrics(current_host)
+                vm_metrics = dict((vm_uuid, {
+                    "cpu": None,
+                    "cpuStatus": values.get("cpuStatus", CPU_READY_NO_DATA),
+                    "disks": {},
+                    "interfaces": {},
+                }) for vm_uuid, values in current_vm["vms"].items())
+                return build_prometheus_metrics(vm_metrics, host_metrics)
             vm_metrics = calculate_vm_metrics(self.previous_vm, current_vm)
             host_metrics = self._update_host_metrics(current_host)
             self.previous_vm = current_vm
