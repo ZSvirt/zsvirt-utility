@@ -7032,8 +7032,10 @@ class Vm(object):
             extension = nvram.NvRamVmExtensions()
             extension.vm_uuid = cmd.vmInstanceUuid
 
+            # Ordinary UEFI without TPM or Secure Boot, including VMs where
+            # TPM has been detached and Secure Boot disabled.
             if cmd.nvRam is None:
-                extension.cleanup()
+                extension.cleanup(keep_default_path_nvram=True)
                 return
 
             extension.nvram_volume = cmd.nvRam
@@ -12733,7 +12735,8 @@ host side snapshot files chian:
         vm_uuid = dom.name()
         extension = nvram.NvRamVmExtensions()
         extension.vm_uuid = vm_uuid
-        extension.cleanup()
+        # Always keep default-path UEFI NVRAM on stop; clean it on permanent deletion.
+        extension.cleanup(keep_default_path_nvram=True)
 
     @bash.in_bash
     def _release_sharedblocks(self, conn, dom, event, detail, opaque):
