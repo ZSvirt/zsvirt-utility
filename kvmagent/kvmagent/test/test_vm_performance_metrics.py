@@ -39,6 +39,55 @@ import vm_performance_metrics as metrics
 
 
 class VmPerformanceMetricsTest(unittest.TestCase):
+    def test_thread_schedstat_second_column_and_identity(self):
+        root = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(root, '41'))
+            os.makedirs(os.path.join(root, '40', 'task', '41'))
+            files = {
+                '41/stat': '41 (CPU 2/KVM) ' + ' '.join(['0'] * 19 + ['789']),
+                '41/status': 'Tgid:\t40\n',
+                '40/cmdline': 'qemu\x00-uuid\x00aabb\x00',
+                '40/task/41/schedstat': '100 2300000 3\n',
+            }
+            for path, data in files.items():
+                with open(os.path.join(root, path), 'w') as f:
+                    f.write(data)
+            self.assertEqual((2300000, (40, 41, 789)),
+                             metrics._read_thread_delay(41, 'aabb', root))
+            self.assertRaises(ValueError, metrics._read_thread_delay,
+                              41, 'other-vm', root)
+        finally:
+            shutil.rmtree(root)
+
+    def test_cpu_source_or_thread_change_rebuilds_baseline(self):
+        previous = {'vcpuCount': 1, 'delayNs': {0: 100},
+                    'cpuIdentity': (1, 'wait')}
+        current = {'vcpuCount': 1, 'delayNs': {0: 2000100},
+                   'cpuIdentity': (1, 'schedstat', {0: (40, 41, 789)})}
+        self.assertIsNone(metrics._calculate_cpu(previous, current, 1000))
+        previous['cpuIdentity'] = current['cpuIdentity']
+        self.assertEqual(2.0, metrics._calculate_cpu(previous, current, 1000)['perCpu'][0])
+        current['cpuIdentity'] = (1, 'schedstat', {0: (40, 41, 790)})
+        self.assertIsNone(metrics._calculate_cpu(previous, current, 1000))
+
+    def test_qmp_sparse_mapping_and_shared_thread_rejection(self):
+        old_qmp, old_read = metrics.libvirt_qemu, metrics._read_thread_delay
+        fake = types.ModuleType('libvirt_qemu')
+        fake.qemuMonitorCommand = lambda *a: '{"return":[{"cpu-index":0,"thread-id":40},{"cpu-index":2,"thread-id":42}]}'
+        class Domain(object):
+            def UUIDString(self):
+                return 'aabb'
+        try:
+            metrics.libvirt_qemu = fake
+            metrics._read_thread_delay = lambda tid, vm: (tid * 1000, (39, tid, 7))
+            delays, identities = metrics._collect_thread_delays(Domain(), 2)
+            self.assertEqual({0: 40000, 2: 42000}, delays)
+            fake.qemuMonitorCommand = lambda *a: '{"return":[{"cpu-index":0,"thread-id":40},{"cpu-index":2,"thread-id":40}]}'
+            self.assertRaises(ValueError, metrics._collect_thread_delays, Domain(), 2)
+        finally:
+            metrics.libvirt_qemu, metrics._read_thread_delay = old_qmp, old_read
+
     def test_host_component_last_good_survives_failure_and_recovers(self):
         collector = metrics.VmHostPerformanceCollector()
 
@@ -232,6 +281,9 @@ class VmPerformanceMetricsTest(unittest.TestCase):
 
     def test_uuid_normalization_and_batch_collection(self):
         class Domain(object):
+            def ID(self):
+                return 1
+
             def UUIDString(self):
                 return "7C193600-2180-4DED-A7AD-0AF850D84AC4"
 

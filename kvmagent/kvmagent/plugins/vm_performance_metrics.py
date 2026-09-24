@@ -10,6 +10,7 @@ scrape establishes the baseline and the next scrape exports interval values.
 from __future__ import division
 
 import os
+import json
 import re
 import socket
 import threading
@@ -21,6 +22,11 @@ try:
     import libvirt
 except ImportError:
     libvirt = None
+
+try:
+    import libvirt_qemu
+except ImportError:
+    libvirt_qemu = None
 
 
 NANOSECONDS_PER_MILLISECOND = 1000000.0
@@ -309,6 +315,51 @@ def _optional_int(values, key):
     return int(values[key]) if key in values else None
 
 
+def _read_thread_delay(tid, vm_uuid, proc_root="/proc"):
+    """Read a vCPU counter with process/thread identity guards."""
+    def identity():
+        with open(os.path.join(proc_root, str(tid), "stat")) as stream:
+            # comm may contain spaces and parentheses; starttime is field 22.
+            fields = stream.read().rsplit(")", 1)[1].split()
+            return int(fields[19])
+
+    start = identity()
+    with open(os.path.join(proc_root, str(tid), "status")) as stream:
+        pid = next(int(line.split()[1]) for line in stream
+                   if line.startswith("Tgid:"))
+    with open(os.path.join(proc_root, str(pid), "cmdline")) as stream:
+        args = stream.read().split("\x00")
+    if not any(args[i] == "-uuid" and
+               args[i + 1].replace("-", "").lower() == vm_uuid
+               for i in range(len(args) - 1)):
+        raise ValueError("vCPU thread no longer belongs to VM")
+    with open(os.path.join(proc_root, str(pid), "task", str(tid),
+                           "schedstat")) as stream:
+        fields = stream.read().split()
+    if len(fields) != 3 or any(int(v) < 0 for v in fields):
+        raise ValueError("invalid thread schedstat")
+    if identity() != start:
+        raise ValueError("vCPU thread changed during sampling")
+    return int(fields[1]), (pid, tid, start)
+
+
+def _collect_thread_delays(domain, count):
+    reply = json.loads(libvirt_qemu.qemuMonitorCommand(
+        domain, '{"execute":"query-cpus-fast"}', 0))
+    cpus = reply["return"]
+    if len(cpus) != count or len(set(c["thread-id"] for c in cpus)) != count:
+        # Shared TCG threads cannot provide a separate counter per vCPU.
+        raise ValueError("incomplete or shared vCPU thread mapping")
+    delays, identities = {}, {}
+    vm_uuid = domain.UUIDString().replace("-", "").lower()
+    for cpu in cpus:
+        cpu_id, tid = int(cpu["cpu-index"]), int(cpu["thread-id"])
+        if cpu_id < 0 or tid <= 0 or cpu_id in delays:
+            raise ValueError("invalid vCPU mapping")
+        delays[cpu_id], identities[cpu_id] = _read_thread_delay(tid, vm_uuid)
+    return delays, identities
+
+
 def collect_vm_snapshot(conn, wait_supported=None):
     """Collect all active VMs with one libvirt getAllDomainStats call."""
     stats = (_libvirt_flag("VIR_DOMAIN_STATS_VCPU") |
@@ -321,11 +372,34 @@ def collect_vm_snapshot(conn, wait_supported=None):
     snapshot = {}
     for domain, values in records:
         count, delays, cpu_status = _collect_vcpus(values, wait_supported)
+        sources = dict((i, "delay" if "vcpu.%d.delay" % i in values
+                        else "wait") for i in delays)
+        identity = (domain.ID(), sources)
+        if count > 0 and cpu_status != CPU_READY_SUPPORTED:
+            fallback_conn = None
+            try:
+                # QMP is denied on a read-only libvirt connection. Only the
+                # fallback uses a separate connection and a read-only query.
+                if libvirt is not None and libvirt_qemu is not None:
+                    fallback_conn = libvirt.open("qemu:///system")
+                if fallback_conn is not None:
+                    target = fallback_conn.lookupByUUIDString(domain.UUIDString())
+                    delays, tids = _collect_thread_delays(target, count)
+                    identity = (target.ID(), "schedstat", tids)
+                    cpu_status = CPU_READY_SUPPORTED
+            except Exception:
+                # Failure of one VM must not interrupt disk/network sampling.
+                delays = {}
+                cpu_status = CPU_READY_NO_DATA
+            finally:
+                if fallback_conn is not None:
+                    fallback_conn.close()
         # libvirt uses RFC-4122 UUIDs; ZStack resource/API labels use 32 hex digits.
         snapshot[domain.UUIDString().replace("-", "").lower()] = {
             "vcpuCount": count,
             "delayNs": delays,
             "cpuStatus": cpu_status,
+            "cpuIdentity": identity,
             "disks": _collect_vm_disks(values),
             "interfaces": _collect_vm_interfaces(values),
         }
@@ -333,6 +407,8 @@ def collect_vm_snapshot(conn, wait_supported=None):
 
 
 def _calculate_cpu(previous, current, interval_ms):
+    if previous.get("cpuIdentity") != current.get("cpuIdentity"):
+        return None
     per_cpu = {}
     for cpu_id, current_delay in current["delayNs"].items():
         delta = _counter_delta(previous["delayNs"].get(cpu_id), current_delay)
