@@ -395,8 +395,8 @@ class VmPerformanceMetricsTest(unittest.TestCase):
             {"cpu": None,
              "cpuStatus": metrics.CPU_READY_PARTIAL,
              "disks": {}, "interfaces": {}})
-        vm_status = self.samples(families, "zstack_vm_cpu_ready_support_status")
-        host_status = self.samples(families, "zstack_host_cpu_ready_support_status")
+        vm_status = self.samples(families, "zstack_vm_cpu_ready_status")
+        host_status = self.samples(families, "zstack_host_cpu_ready_status")
         self.assertEqual(1, len(vm_status))
         self.assertEqual(1, len(host_status))
         vm_labels, vm_value = vm_status[0]
