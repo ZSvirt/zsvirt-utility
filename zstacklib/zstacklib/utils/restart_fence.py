@@ -18,10 +18,15 @@ def monotonic_time():
 
 class AgentRestartFence(object):
     """Drain asynchronous Agent calls and fence admission before restart."""
+    OWNER_CONFLICT = 'OWNER_CONFLICT'
+    DRAIN_IN_PROGRESS = 'DRAIN_IN_PROGRESS'
+    DRAIN_TIMEOUT = 'DRAIN_TIMEOUT'
+
     _condition = threading.Condition()
     _fenced = False
     _active_requests = 0
     _generation = 0
+    _owner_operation_id = None
 
     @classmethod
     def _notify_waiters(cls):
@@ -54,18 +59,22 @@ class AgentRestartFence(object):
             }
 
     @classmethod
-    def acquire(cls, drain_timeout_seconds, lease_seconds):
+    def acquire(cls, operation_id, drain_timeout_seconds, lease_seconds):
         deadline = monotonic_time() + drain_timeout_seconds
         with cls._condition:
             if cls._fenced:
+                if operation_id != cls._owner_operation_id:
+                    return False, cls.snapshot(), cls.OWNER_CONFLICT
                 if cls._active_requests:
-                    return False, cls.snapshot()
+                    return False, cls.snapshot(), cls.DRAIN_IN_PROGRESS
                 # A restart command may fail before the old process exits.  A
-                # rollback/fallback restart can renew an already drained fence.
+                # retry of the same operation can renew an already drained
+                # fence without allowing another restart owner to take it.
                 cls._generation += 1
                 generation = cls._generation
             else:
                 cls._fenced = True
+                cls._owner_operation_id = operation_id
                 cls._generation += 1
                 generation = cls._generation
 
@@ -73,21 +82,23 @@ class AgentRestartFence(object):
                 remaining = deadline - monotonic_time()
                 if remaining <= 0:
                     cls._fenced = False
+                    cls._owner_operation_id = None
                     cls._notify_waiters()
-                    return False, cls.snapshot()
+                    return False, cls.snapshot(), cls.DRAIN_TIMEOUT
                 cls._condition.wait(remaining)
 
         timer = threading.Timer(lease_seconds, cls._release_generation,
                                 args=(generation,))
         timer.daemon = True
         timer.start()
-        return True, cls.snapshot()
+        return True, cls.snapshot(), None
 
     @classmethod
     def _release_generation(cls, generation):
         with cls._condition:
             if cls._fenced and cls._generation == generation:
                 cls._fenced = False
+                cls._owner_operation_id = None
                 cls._notify_waiters()
 
     @classmethod
@@ -95,5 +106,6 @@ class AgentRestartFence(object):
         with cls._condition:
             cls._generation += 1
             cls._fenced = False
+            cls._owner_operation_id = None
             cls._active_requests = 0
             cls._notify_waiters()

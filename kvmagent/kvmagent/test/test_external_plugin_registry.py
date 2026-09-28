@@ -525,6 +525,39 @@ class ExternalPluginRegistryTest(unittest.TestCase):
         self.assertTrue(all(item["failure"]["code"] == "PLUGIN_NAMESPACE_CONFLICT"
                             for item in statuses))
 
+    def test_helper_module_conflict_fails_all_records_before_import(self):
+        helper_name = "loader_shared_helper"
+        first = self._release("first-plugin", "sample_plugin", "2.0.0")
+        second = self._release(
+            "second-plugin", "duplicate_plugin", "2.0.1")
+        for release, namespace, value in (
+                (first, "sample_plugin", "first"),
+                (second, "duplicate_plugin", "second")):
+            _write(os.path.join(release, helper_name + ".py"),
+                   "VALUE = %r\n" % value)
+            self._replace_plugin_source(
+                release, namespace,
+                "import %s\n"
+                "class Entry(object):\n"
+                "    def configure(self, config): pass\n"
+                "    def start(self): pass\n"
+                "    def stop(self): pass\n" % helper_name)
+        self._register("first", "first-plugin", first, "sample_plugin")
+        self._register(
+            "second", "second-plugin", second, "duplicate_plugin")
+
+        registry = self._registry()
+        registry.discover()
+        registry.load_and_start()
+        statuses = registry.status_response(reconcile=False)["plugins"]
+
+        self.assertEqual(2, len(statuses))
+        self.assertTrue(all(item["state"] == "FAILED" for item in statuses))
+        self.assertTrue(all(item["failure"]["code"] ==
+                            "PLUGIN_NAMESPACE_CONFLICT"
+                            for item in statuses))
+        self.assertNotIn(helper_name, sys.modules)
+
     def test_status_detects_next_start_drift_without_reloading_plugin(self):
         release = self._release()
         self._register("sample", "sample-plugin", release, "sample_plugin")
@@ -864,7 +897,8 @@ class ExternalPluginRegistryTest(unittest.TestCase):
         context = registry.records[0].instance.context
         context.register_sync_uri(
             "/sample/mutate-sync", lambda req: "changed", mutable=True)
-        acquired, unused_snapshot = AgentRestartFence.acquire(0.1, 1)
+        acquired, unused_snapshot, unused_reason = AgentRestartFence.acquire(
+            "registry-test", 0.1, 1)
         self.assertTrue(acquired)
 
         raw_response = self.http.sync["/sample/mutate-sync"]({})
@@ -897,7 +931,7 @@ class ExternalPluginRegistryTest(unittest.TestCase):
         acquire_result = []
         acquire_worker = threading.Thread(
             target=lambda: acquire_result.append(
-                AgentRestartFence.acquire(0.5, 1)))
+                AgentRestartFence.acquire("registry-test", 0.5, 1)))
         acquire_worker.start()
         try:
             deadline = time.time() + 1
@@ -943,7 +977,8 @@ class ExternalPluginRegistryTest(unittest.TestCase):
         registry = self._registry()
         registry.discover()
         registry.load_and_start()
-        acquired, unused_snapshot = AgentRestartFence.acquire(0.1, 1)
+        acquired, unused_snapshot, unused_reason = AgentRestartFence.acquire(
+            "registry-test", 0.1, 1)
         self.assertTrue(acquired)
 
         response = self.http.sync["/sample/status"]({})
@@ -1215,6 +1250,26 @@ class ExternalPluginRegistryTest(unittest.TestCase):
         self.assertEqual("PLUGIN_IMPORT_FAILED",
                          statuses["broken-plugin"]["failure"]["code"])
         self.assertEqual("STARTED", statuses["healthy-plugin"]["state"])
+
+    def test_import_failure_removes_new_helper_modules_from_release(self):
+        helper_name = "loader_failed_import_helper"
+        broken = self._release()
+        _write(os.path.join(broken, helper_name + ".py"), "VALUE = 1\n")
+        self._replace_plugin_source(
+            broken, "sample_plugin",
+            "import %s\n"
+            "raise RuntimeError('import failed after helper load')\n" %
+            helper_name)
+        self._register(
+            "sample", "sample-plugin", broken, "sample_plugin")
+
+        registry = self._registry()
+        registry.discover()
+        registry.load_and_start()
+
+        status = registry.status_response(False)["plugins"][0]
+        self.assertEqual("PLUGIN_IMPORT_FAILED", status["failure"]["code"])
+        self.assertNotIn(helper_name, sys.modules)
 
     def test_partial_routes_are_removed_when_start_fails(self):
         release = self._release()
@@ -1648,56 +1703,40 @@ class ExternalPluginRegistryTest(unittest.TestCase):
             release_collect.set()
 
     def test_status_next_start_uses_remaining_shared_deadline(self):
-        release_next_start = threading.Event()
-
-        class BlockingNextStart(_Collector):
+        class BudgetCollector(_Collector):
             def __init__(self):
-                super(BlockingNextStart, self).__init__()
-                self.block = False
+                super(BudgetCollector, self).__init__()
+                self.observe_budgets = False
                 self.current_budgets = []
                 self.next_budgets = []
 
             def collect(self, timeout_seconds=None):
-                if self.block:
+                if self.observe_budgets:
                     self.current_budgets.append(timeout_seconds)
-                    time.sleep(0.03)
-                return super(BlockingNextStart, self).collect()
+                return super(BudgetCollector, self).collect()
 
             def collect_next_start(self, timeout_seconds=None):
-                if self.block:
+                if self.observe_budgets:
                     self.next_budgets.append(timeout_seconds)
-                    self.block = False
-                    release_next_start.wait(0.4)
                 return dict(self.versions)
 
-        collector = BlockingNextStart()
+        collector = BudgetCollector()
         release = self._release()
         self._register("sample", "sample-plugin", release, "sample_plugin")
         registry = self._registry(runtime_collector=collector)
         registry.status_reconcile_deadline = 0.05
         registry.discover()
         registry.load_and_start()
-        collector.block = True
+        collector.observe_budgets = True
+        clock_values = iter((100.0, 100.01, 100.03))
+        registry.monotonic = lambda: next(clock_values)
 
-        started = time.time()
-        first = registry.status_response(reconcile=True)["plugins"][0]
-        first_elapsed = time.time() - started
-        try:
-            self.assertLess(first_elapsed, 0.25)
-            self.assertEqual("UNKNOWN", first["compatibilityState"])
-            self.assertTrue(first["stale"])
-            self.assertEqual(1, len(collector.current_budgets))
-            self.assertEqual(1, len(collector.next_budgets))
-            self.assertGreater(collector.current_budgets[0], 0)
-            self.assertLess(collector.next_budgets[0],
-                            collector.current_budgets[0])
-        finally:
-            release_next_start.set()
+        status = registry.status_response(reconcile=True)["plugins"][0]
 
-        started = time.time()
-        second = registry.status_response(reconcile=True)["plugins"][0]
-        self.assertLess(time.time() - started, 0.25)
-        self.assertEqual("COMPATIBLE", second["compatibilityState"])
+        self.assertEqual("COMPATIBLE", status["compatibilityState"])
+        self.assertFalse(status["stale"])
+        self.assertAlmostEqual(0.04, collector.current_budgets[0])
+        self.assertAlmostEqual(0.02, collector.next_budgets[0])
 
 
 if __name__ == "__main__":

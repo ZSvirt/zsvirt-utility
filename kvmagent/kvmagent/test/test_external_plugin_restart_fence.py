@@ -98,6 +98,106 @@ class AgentRestartFenceTest(unittest.TestCase):
         self.assertEqual("FENCED", response["state"])
         self.assertFalse(response["acceptingNewRequests"])
 
+    def test_restart_endpoint_rejects_different_operation_while_fenced(self):
+        first = json.loads(self._call_restart_handler(_request(body=json.dumps({
+            "operationId": "restart-1",
+            "drainTimeoutSeconds": 1,
+            "leaseSeconds": 2,
+        }))))
+        second = json.loads(self._call_restart_handler(_request(body=json.dumps({
+            "operationId": "restart-2",
+            "drainTimeoutSeconds": 1,
+            "leaseSeconds": 2,
+        }))))
+
+        self.assertTrue(first["success"])
+        self.assertFalse(second["success"])
+        self.assertEqual("HOST_OPERATION_IN_PROGRESS", second["errorCode"])
+        self.assertEqual(
+            "restart fence is owned by another operation", second["error"])
+        self.assertEqual("FENCED", second["state"])
+
+    def test_acquire_reports_owner_conflict_reason(self):
+        first = AgentRestartFence.acquire("restart-1", 1, 2)
+        conflict = AgentRestartFence.acquire("restart-2", 1, 2)
+
+        self.assertTrue(first[0])
+        self.assertFalse(conflict[0])
+        self.assertEqual("OWNER_CONFLICT", conflict[2])
+
+    def test_restart_endpoint_reports_same_owner_drain_in_progress(self):
+        with AgentRestartFence._condition:
+            AgentRestartFence._fenced = True
+            AgentRestartFence._owner_operation_id = "restart-1"
+            AgentRestartFence._active_requests = 1
+
+        response = json.loads(self._call_restart_handler(
+            _request(body=json.dumps({
+                "operationId": "restart-1",
+                "drainTimeoutSeconds": 1,
+                "leaseSeconds": 2,
+            }))))
+
+        self.assertFalse(response["success"])
+        self.assertEqual("HOST_OPERATION_IN_PROGRESS", response["errorCode"])
+        self.assertEqual(
+            "asynchronous KVM Agent operations are still draining",
+            response["error"])
+
+    def test_restart_endpoint_reports_drain_timeout(self):
+        snapshot = {
+            "state": "BUSY",
+            "activeRequestCount": 1,
+            "acceptingNewRequests": True,
+            "ownerOperationId": None,
+        }
+        with mock.patch.object(
+                AgentRestartFence, "acquire",
+                return_value=(False, snapshot,
+                              AgentRestartFence.DRAIN_TIMEOUT)):
+            response = json.loads(self._call_restart_handler(
+                _request(body=json.dumps({
+                    "operationId": "restart-1",
+                    "drainTimeoutSeconds": 1,
+                    "leaseSeconds": 2,
+                }))))
+
+        self.assertFalse(response["success"])
+        self.assertEqual("HOST_OPERATION_IN_PROGRESS", response["errorCode"])
+        self.assertEqual(
+            "asynchronous KVM Agent operations did not reach an idle "
+            "restart point before timeout",
+            response["error"])
+
+    def test_restart_endpoint_allows_same_operation_to_renew_lease(self):
+        timers = []
+
+        class FakeTimer(object):
+            def __init__(self, unused_interval, function, args=None,
+                         kwargs=None):
+                self.function = function
+                self.args = tuple(args or ())
+                self.kwargs = dict(kwargs or {})
+                self.daemon = False
+
+            def start(self):
+                timers.append(self)
+
+            def fire(self):
+                self.function(*self.args, **self.kwargs)
+
+        with mock.patch.object(restart_fence.threading, "Timer", FakeTimer):
+            first = AgentRestartFence.acquire("restart-1", 1, 2)
+            renewed = AgentRestartFence.acquire("restart-1", 1, 2)
+
+        self.assertTrue(first[0])
+        self.assertTrue(renewed[0])
+        self.assertEqual(2, len(timers))
+        timers[0].fire()
+        self.assertEqual("FENCED", AgentRestartFence.snapshot()["state"])
+        timers[1].fire()
+        self.assertEqual("IDLE", AgentRestartFence.snapshot()["state"])
+
     def test_restart_endpoint_rejects_non_object_json(self):
         response = json.loads(self._call_restart_handler(
             _request(body='["restart-1", 1, 2]')))
@@ -111,7 +211,7 @@ class AgentRestartFenceTest(unittest.TestCase):
         result = []
 
         def acquire():
-            result.append(AgentRestartFence.acquire(1, 2))
+            result.append(AgentRestartFence.acquire("restart-1", 1, 2))
 
         worker = threading.Thread(target=acquire)
         worker.start()
@@ -129,9 +229,11 @@ class AgentRestartFenceTest(unittest.TestCase):
 
     def test_timeout_reopens_async_request_admission(self):
         self.assertTrue(AgentRestartFence.enter_request())
-        acquired, snapshot = AgentRestartFence.acquire(0.02, 1)
+        acquired, snapshot, failure_reason = AgentRestartFence.acquire(
+            "restart-1", 0.02, 1)
 
         self.assertFalse(acquired)
+        self.assertEqual("DRAIN_TIMEOUT", failure_reason)
         self.assertEqual("BUSY", snapshot["state"])
         self.assertTrue(snapshot["acceptingNewRequests"])
         AgentRestartFence.leave_request()
@@ -150,7 +252,8 @@ class AgentRestartFenceTest(unittest.TestCase):
 
         with mock.patch.object(
                 restart_fence.time, "time", side_effect=jumped_wall_clock):
-            acquired, snapshot = AgentRestartFence.acquire(30, 60)
+            acquired, snapshot, unused_reason = AgentRestartFence.acquire(
+                "restart-1", 30, 60)
 
         self.assertTrue(acquired)
         self.assertEqual("FENCED", snapshot["state"])
@@ -166,7 +269,8 @@ class AgentRestartFenceTest(unittest.TestCase):
         self.assertEqual(123.5, current)
 
     def test_lease_releases_fence_when_restart_does_not_happen(self):
-        acquired, unused_snapshot = AgentRestartFence.acquire(0.02, 0.05)
+        acquired, unused_snapshot, unused_reason = AgentRestartFence.acquire(
+            "restart-1", 0.02, 0.05)
         self.assertTrue(acquired)
         deadline = time.time() + 1
         while AgentRestartFence.snapshot()["state"] == "FENCED":

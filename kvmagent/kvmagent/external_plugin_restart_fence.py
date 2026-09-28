@@ -56,16 +56,27 @@ def restart_fence_handler(request):
             "error": "KVM Agent is already stopping",
         }, sort_keys=True)
 
-    acquired, snapshot = AgentRestartFence.acquire(
-        drain_timeout, lease_seconds)
+    acquired, snapshot, failure_reason = AgentRestartFence.acquire(
+        operation_id, drain_timeout, lease_seconds)
     result = dict(snapshot)
     result.update({
         "success": acquired,
         "operationId": operation_id,
     })
     if not acquired:
+        errors = {
+            AgentRestartFence.OWNER_CONFLICT:
+                "restart fence is owned by another operation",
+            AgentRestartFence.DRAIN_IN_PROGRESS:
+                "asynchronous KVM Agent operations are still draining",
+            AgentRestartFence.DRAIN_TIMEOUT:
+                "asynchronous KVM Agent operations did not reach an idle "
+                "restart point before timeout",
+        }
         result.update({
             "errorCode": "HOST_OPERATION_IN_PROGRESS",
-            "error": "asynchronous KVM Agent operations did not reach an idle restart point",
+            "error": errors.get(
+                failure_reason,
+                "KVM Agent restart fence could not be acquired"),
         })
     return json.dumps(result, sort_keys=True)

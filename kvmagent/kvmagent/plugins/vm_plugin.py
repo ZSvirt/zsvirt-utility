@@ -77,6 +77,7 @@ from zstacklib.utils.linux import is_virtual_machine
 from zstacklib.utils.qga import *
 from zstacklib.utils import jsonobject
 from zstacklib.utils.qmp import get_block_node_name_and_file
+from zstacklib.utils.restart_fence import monotonic_time
 from zstacklib.utils.report import *
 from zstacklib.utils.vm_plugin_queue_singleton import VmPluginQueueSingleton
 from zstacklib.utils.libvirt_singleton import LibvirtEventManager
@@ -2412,7 +2413,15 @@ def _block_struct_contains_volume_uuid(obj, volume_uuid):
     return False
 
 
-def _find_root_block_node(vm_uuid, start_node_name):
+MIRROR_DEVICE_QMP_TIMEOUT_SECONDS = 10
+
+
+def _remaining_qmp_timeout(deadline):
+    remaining = deadline - monotonic_time()
+    return remaining if remaining > 0 else None
+
+
+def _find_root_block_node(vm_uuid, start_node_name, deadline=None):
     """
     Use x-debug-query-block-graph to walk upwards from the given node name
     and find the block-driver node that is directly attached to a block-backend.
@@ -2428,8 +2437,15 @@ def _find_root_block_node(vm_uuid, start_node_name):
     """
     if not vm_uuid or not start_node_name:
         return start_node_name
+    if deadline is None:
+        deadline = monotonic_time() + MIRROR_DEVICE_QMP_TIMEOUT_SECONDS
+    remaining = _remaining_qmp_timeout(deadline)
+    if remaining is None:
+        return start_node_name
     try:
-        graph = qmp.execute_qmp_command(vm_uuid, "x-debug-query-block-graph", raise_exception=False)
+        graph = qmp.execute_qmp_command(
+            vm_uuid, "x-debug-query-block-graph", raise_exception=False,
+            command_timeout=remaining)
     except Exception:
         return start_node_name
     if not graph or not isinstance(graph, dict):
@@ -2538,7 +2554,9 @@ def _extract_device_and_node(block_entry):
     return device, node_name
 
 
-def get_mirror_device_for_volume_uuid(vm_uuid, volume_uuid):
+def get_mirror_device_for_volume_uuid(
+        vm_uuid, volume_uuid,
+        command_timeout=MIRROR_DEVICE_QMP_TIMEOUT_SECONDS):
     """
     Resolve the mirror-capable (node_name, device_name) for a volume from QEMU query-block.
 
@@ -2563,9 +2581,22 @@ def get_mirror_device_for_volume_uuid(vm_uuid, volume_uuid):
     """
     if not vm_uuid or not volume_uuid:
         return None, None
+    try:
+        command_timeout = float(command_timeout)
+    except (TypeError, ValueError):
+        return None, None
+    if (command_timeout <= 0 or math.isnan(command_timeout) or
+            math.isinf(command_timeout)):
+        return None, None
+    deadline = monotonic_time() + command_timeout
+    remaining = _remaining_qmp_timeout(deadline)
+    if remaining is None:
+        return None, None
     vol_str = volume_uuid if isinstance(volume_uuid, str) else str(volume_uuid)
     try:
-        blocks = qmp.execute_qmp_command(vm_uuid, "query-block", raise_exception=False)
+        blocks = qmp.execute_qmp_command(
+            vm_uuid, "query-block", raise_exception=False,
+            command_timeout=remaining)
     except Exception:
         return None, None
     if not blocks:
@@ -2580,7 +2611,7 @@ def get_mirror_device_for_volume_uuid(vm_uuid, volume_uuid):
         raw_node = node_name or device
         if not raw_node:
             return None, None
-        root_node = _find_root_block_node(vm_uuid, raw_node)
+        root_node = _find_root_block_node(vm_uuid, raw_node, deadline=deadline)
         return root_node, (device or raw_node)
 
     # --- Pass 1: high-precision match on inserted.file ---

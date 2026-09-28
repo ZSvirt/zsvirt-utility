@@ -213,7 +213,8 @@ class AsyncHandlerRestartFenceIntegrationTest(unittest.TestCase):
         headers = _Headers({self.http.TASK_UUID: "fenced-task"})
         self.http.cherrypy.request = _Namespace(
             headers=headers, body=None, method="POST", query_string=None)
-        acquired, unused_snapshot = AgentRestartFence.acquire(0.01, 0.1)
+        acquired, unused_snapshot, unused_reason = AgentRestartFence.acquire(
+            "http-integration-test", 0.01, 0.1)
         self.assertTrue(acquired)
 
         with self.assertRaises(_HttpError) as raised:

@@ -7,6 +7,7 @@ import importlib
 import json
 import logging
 import os
+import pkgutil
 import stat
 import sys
 import threading
@@ -101,6 +102,7 @@ class ExternalPluginRecord(object):
         self.capabilities = None
         self.instance = None
         self.context = None
+        self.import_namespaces = set()
         self.lifecycle_lock = threading.RLock()
 
     def add_route(self, path):
@@ -161,6 +163,7 @@ class ExternalPluginRegistry(object):
         self._by_id = {}
         self._route_owners = {STATUS_PATH: "kvmagent"}
         self._route_lock = threading.RLock()
+        self._import_lock = threading.RLock()
         self._stop_requested = threading.Event()
 
     def _check_secure_regular_file(self, path, label):
@@ -399,8 +402,12 @@ class ExternalPluginRegistry(object):
         for record in self.records:
             if not record.enabled or record.manifest is None:
                 continue
-            namespace = record.manifest.namespace
-            namespaces.setdefault(namespace, []).append(record)
+            record.import_namespaces = set(
+                name for unused_importer, name, unused_is_package in
+                pkgutil.iter_modules([record.resolved_release_root]))
+            record.import_namespaces.add(record.manifest.namespace)
+            for namespace in record.import_namespaces:
+                namespaces.setdefault(namespace, []).append(record)
         for namespace, records in namespaces.items():
             conflict = (len(records) > 1 or namespace in self.protected_namespaces or
                         namespace in loaded_top_levels)
@@ -409,6 +416,35 @@ class ExternalPluginRegistry(object):
                     record.fail("PRE_IMPORT_VALIDATION",
                                 "PLUGIN_NAMESPACE_CONFLICT",
                                 "top-level namespace %s conflicts" % namespace)
+
+    @staticmethod
+    def _module_is_from_release(module, release_root):
+        module_path = getattr(module, "__file__", None)
+        if not module_path:
+            return False
+        try:
+            relative = os.path.relpath(
+                os.path.realpath(os.path.abspath(module_path)), release_root)
+        except (TypeError, ValueError):
+            return False
+        return (relative != os.pardir and
+                not relative.startswith(os.pardir + os.sep) and
+                not os.path.isabs(relative))
+
+    def _ensure_import_namespaces_available(self, record):
+        loaded_top_levels = set(
+            name.split(".", 1)[0] for name in sys.modules.copy())
+        conflicts = sorted(record.import_namespaces & loaded_top_levels)
+        if conflicts:
+            raise ManifestError(
+                "top-level namespace %s became loaded before plugin import" %
+                conflicts[0], code="PLUGIN_NAMESPACE_CONFLICT")
+
+    def _cleanup_failed_import(self, previous_modules, release_root):
+        for name, module in list(sys.modules.items()):
+            if (name not in previous_modules and
+                    self._module_is_from_release(module, release_root)):
+                sys.modules.pop(name, None)
 
     def enabled_plugin_ids(self):
         return set(record.plugin_id for record in self.records if record.enabled)
@@ -556,30 +592,30 @@ class ExternalPluginRegistry(object):
         }
 
     def _import_record(self, record, config):
-        namespace = record.manifest.namespace
-        previous_modules = set(sys.modules)
-        previous_bytecode_policy = sys.dont_write_bytecode
-        sys.path.insert(0, record.resolved_release_root)
-        # A verified release is immutable.  Suppress __pycache__ writes while
-        # importing it so root-owned Agent startup cannot mutate the content
-        # tree and manufacture a false content-drift result later.
-        sys.dont_write_bytecode = True
-        try:
-            module = importlib.import_module(record.manifest.entry_module)
-            entry_class = getattr(module, record.manifest.entry_class)
-            instance = entry_class()
-        except Exception:
-            for name in list(sys.modules):
-                if name not in previous_modules and (name == namespace or
-                                                     name.startswith(namespace + ".")):
-                    sys.modules.pop(name, None)
-            raise
-        finally:
-            sys.dont_write_bytecode = previous_bytecode_policy
+        with self._import_lock:
+            self._ensure_import_namespaces_available(record)
+            previous_modules = set(sys.modules)
+            previous_bytecode_policy = sys.dont_write_bytecode
+            sys.path.insert(0, record.resolved_release_root)
+            # A verified release is immutable.  Suppress __pycache__ writes
+            # while importing it so root-owned Agent startup cannot mutate
+            # the content tree and manufacture a false content-drift result
+            # later.
+            sys.dont_write_bytecode = True
             try:
-                sys.path.remove(record.resolved_release_root)
-            except ValueError:
-                pass
+                module = importlib.import_module(record.manifest.entry_module)
+                entry_class = getattr(module, record.manifest.entry_class)
+                instance = entry_class()
+            except Exception:
+                self._cleanup_failed_import(
+                    previous_modules, record.resolved_release_root)
+                raise
+            finally:
+                sys.dont_write_bytecode = previous_bytecode_policy
+                try:
+                    sys.path.remove(record.resolved_release_root)
+                except ValueError:
+                    pass
         context = ExternalPluginContext(self, record, self.http_server)
         with record.lifecycle_lock:
             cancelled = self.is_stop_requested()

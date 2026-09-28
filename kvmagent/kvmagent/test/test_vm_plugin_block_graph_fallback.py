@@ -110,6 +110,38 @@ class TestVmPluginBlockGraphFallback(unittest.TestCase):
         self.assertEqual(
             ["x-debug-query-block-graph"], graph_calls)
 
+    def test_qmp_queries_share_one_finite_monotonic_deadline(self):
+        calls = []
+        clock_values = iter((100.0, 100.0, 103.0))
+        original_monotonic = getattr(vm_plugin, "monotonic_time", None)
+
+        def fake_execute_qmp_command(unused_vm_uuid, command,
+                                     raise_exception=False, **kwargs):
+            calls.append((command, kwargs.get("command_timeout")))
+            if command == "query-block":
+                return self._query_block_result()
+            if command == "x-debug-query-block-graph":
+                return self._block_graph()
+            return None
+
+        vm_plugin.monotonic_time = lambda: next(clock_values)
+        vm_plugin.qmp.execute_qmp_command = fake_execute_qmp_command
+        try:
+            resolved = vm_plugin.get_mirror_device_for_volume_uuid(
+                "vm-deadline", "vol-qemu", command_timeout=10)
+        finally:
+            if original_monotonic is None:
+                del vm_plugin.monotonic_time
+            else:
+                vm_plugin.monotonic_time = original_monotonic
+
+        self.assertEqual(
+            ("root-node0", "drive-virtio-disk0"), resolved)
+        self.assertEqual("query-block", calls[0][0])
+        self.assertEqual(10.0, calls[0][1])
+        self.assertEqual("x-debug-query-block-graph", calls[1][0])
+        self.assertEqual(7.0, calls[1][1])
+
 
 if __name__ == "__main__":
     unittest.main()
