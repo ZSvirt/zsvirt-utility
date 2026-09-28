@@ -39,6 +39,55 @@ import vm_performance_metrics as metrics
 
 
 class VmPerformanceMetricsTest(unittest.TestCase):
+    def test_thread_schedstat_second_column_and_identity(self):
+        root = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(root, '41'))
+            os.makedirs(os.path.join(root, '40', 'task', '41'))
+            files = {
+                '41/stat': '41 (CPU 2/KVM) ' + ' '.join(['0'] * 19 + ['789']),
+                '41/status': 'Tgid:\t40\n',
+                '40/cmdline': 'qemu\x00-uuid\x00aabb\x00',
+                '40/task/41/schedstat': '100 2300000 3\n',
+            }
+            for path, data in files.items():
+                with open(os.path.join(root, path), 'w') as f:
+                    f.write(data)
+            self.assertEqual((2300000, (40, 41, 789)),
+                             metrics._read_thread_delay(41, 'aabb', root))
+            self.assertRaises(ValueError, metrics._read_thread_delay,
+                              41, 'other-vm', root)
+        finally:
+            shutil.rmtree(root)
+
+    def test_cpu_source_or_thread_change_rebuilds_baseline(self):
+        previous = {'vcpuCount': 1, 'delayNs': {0: 100},
+                    'cpuIdentity': (1, 'wait')}
+        current = {'vcpuCount': 1, 'delayNs': {0: 2000100},
+                   'cpuIdentity': (1, 'schedstat', {0: (40, 41, 789)})}
+        self.assertIsNone(metrics._calculate_cpu(previous, current, 1000))
+        previous['cpuIdentity'] = current['cpuIdentity']
+        self.assertEqual(2.0, metrics._calculate_cpu(previous, current, 1000)['perCpu'][0])
+        current['cpuIdentity'] = (1, 'schedstat', {0: (40, 41, 790)})
+        self.assertIsNone(metrics._calculate_cpu(previous, current, 1000))
+
+    def test_qmp_sparse_mapping_and_shared_thread_rejection(self):
+        old_qmp, old_read = metrics.libvirt_qemu, metrics._read_thread_delay
+        fake = types.ModuleType('libvirt_qemu')
+        fake.qemuMonitorCommand = lambda *a: '{"return":[{"cpu-index":0,"thread-id":40},{"cpu-index":2,"thread-id":42}]}'
+        class Domain(object):
+            def UUIDString(self):
+                return 'aabb'
+        try:
+            metrics.libvirt_qemu = fake
+            metrics._read_thread_delay = lambda tid, vm: (tid * 1000, (39, tid, 7))
+            delays, identities = metrics._collect_thread_delays(Domain(), 2)
+            self.assertEqual({0: 40000, 2: 42000}, delays)
+            fake.qemuMonitorCommand = lambda *a: '{"return":[{"cpu-index":0,"thread-id":40},{"cpu-index":2,"thread-id":40}]}'
+            self.assertRaises(ValueError, metrics._collect_thread_delays, Domain(), 2)
+        finally:
+            metrics.libvirt_qemu, metrics._read_thread_delay = old_qmp, old_read
+
     def test_host_component_last_good_survives_failure_and_recovers(self):
         collector = metrics.VmHostPerformanceCollector()
 
@@ -99,9 +148,45 @@ class VmPerformanceMetricsTest(unittest.TestCase):
 
     def test_host_read_failures_are_explicit(self):
         missing = os.path.join(tempfile.gettempdir(), "does-not-exist-zstack")
-        self.assertFalse(metrics._collect_host_cpu(missing)["valid"])
+        cpu = metrics._collect_host_cpu(missing)
+        self.assertFalse(cpu["valid"])
+        self.assertEqual(metrics.CPU_READY_NO_DATA, cpu["status"])
         self.assertIsNone(metrics._collect_host_disks(missing, missing))
         self.assertIsNone(metrics._collect_host_network(missing))
+
+    def test_host_schedstat_uses_standard_prefix_with_vendor_extensions(self):
+        for version in (15, 16):
+            root = tempfile.mkdtemp()
+            try:
+                path = os.path.join(root, "schedstat")
+                with open(path, "w") as stream:
+                    stream.write("version %d\n" % version)
+                    # run_delay is standard counter 8 (split index 8).  The
+                    # seven trailing zeroes model the ARM vendor extension
+                    # which previously made fields[-2] return zero.
+                    stream.write(
+                        "cpu0 1 2 3 4 5 6 700 8123456 9 " +
+                        "0 0 0 0 0 0 0\n")
+                cpu = metrics._collect_host_cpu(path)
+                self.assertTrue(cpu["valid"])
+                self.assertEqual(metrics.CPU_READY_SUPPORTED, cpu["status"])
+                self.assertEqual({"cpu0": 8123456}, cpu["runDelayNs"])
+            finally:
+                shutil.rmtree(root)
+
+    def test_unknown_schedstat_version_is_unsupported(self):
+        root = tempfile.mkdtemp()
+        try:
+            path = os.path.join(root, "schedstat")
+            with open(path, "w") as stream:
+                stream.write("version 99\n")
+                stream.write("cpu0 1 2 3 4 5 6 7 8 9\n")
+            cpu = metrics._collect_host_cpu(path)
+            self.assertFalse(cpu["valid"])
+            self.assertEqual(metrics.CPU_READY_UNSUPPORTED, cpu["status"])
+            self.assertEqual({}, cpu["runDelayNs"])
+        finally:
+            shutil.rmtree(root)
 
     def test_calculates_vm_cpu_disk_and_network_metrics(self):
         previous = {
@@ -196,6 +281,9 @@ class VmPerformanceMetricsTest(unittest.TestCase):
 
     def test_uuid_normalization_and_batch_collection(self):
         class Domain(object):
+            def ID(self):
+                return 1
+
             def UUIDString(self):
                 return "7C193600-2180-4DED-A7AD-0AF850D84AC4"
 
@@ -236,18 +324,20 @@ class VmPerformanceMetricsTest(unittest.TestCase):
                          [f.name for f in families])
 
     def test_sparse_online_vcpu_ids_are_collected_across_two_samples(self):
-        before_count, before_delays = metrics._collect_vcpus({
+        before_count, before_delays, before_status = metrics._collect_vcpus({
             "vcpu.current": 2,
             "vcpu.maximum": 3,
             "vcpu.0.delay": 1000000,
             "vcpu.2.wait": 2000000,
-        })
-        after_count, after_delays = metrics._collect_vcpus({
+        }, True)
+        after_count, after_delays, after_status = metrics._collect_vcpus({
             "vcpu.current": 2,
             "vcpu.maximum": 3,
             "vcpu.0.delay": 3000000,
             "vcpu.2.wait": 6000000,
-        })
+        }, True)
+        self.assertEqual(metrics.CPU_READY_SUPPORTED, before_status)
+        self.assertEqual(metrics.CPU_READY_SUPPORTED, after_status)
 
         cpu = metrics._calculate_cpu(
             {"vcpuCount": before_count, "delayNs": before_delays},
@@ -264,6 +354,63 @@ class VmPerformanceMetricsTest(unittest.TestCase):
             ids = sorted(labels[1] if not isinstance(labels, dict)
                          else labels["vcpu_id"] for labels, _ in samples)
             self.assertEqual(["0", "2"], ids)
+
+    def test_vcpu_delay_is_valid_when_legacy_wait_source_is_disabled(self):
+        count, delays, status = metrics._collect_vcpus({
+            "vcpu.current": 2,
+            "vcpu.0.delay": 0,
+            "vcpu.0.wait": 123,
+            "vcpu.1.delay": 456,
+            "vcpu.1.wait": 789,
+        }, False)
+        self.assertEqual(2, count)
+        self.assertEqual({0: 0, 1: 456}, delays)
+        self.assertEqual(metrics.CPU_READY_SUPPORTED, status)
+
+    def test_vcpu_wait_zero_is_unsupported_when_schedstats_disabled(self):
+        count, delays, status = metrics._collect_vcpus({
+            "vcpu.current": 2,
+            "vcpu.0.wait": 0,
+            "vcpu.1.wait": 0,
+        }, False)
+        self.assertEqual(2, count)
+        self.assertEqual({}, delays)
+        self.assertEqual(metrics.CPU_READY_UNSUPPORTED, status)
+
+    def test_vcpu_wait_zero_is_valid_when_schedstats_enabled(self):
+        count, delays, status = metrics._collect_vcpus({
+            "vcpu.current": 2,
+            "vcpu.0.wait": 0,
+            "vcpu.1.wait": 0,
+        }, True)
+        self.assertEqual(2, count)
+        self.assertEqual({0: 0, 1: 0}, delays)
+        self.assertEqual(metrics.CPU_READY_SUPPORTED, status)
+
+    def test_cpu_ready_status_metrics_are_exported_without_numeric_samples(self):
+        families = metrics.build_prometheus_metrics(
+            {"vm": {"cpu": None,
+                    "cpuStatus": metrics.CPU_READY_UNSUPPORTED,
+                    "disks": {}, "interfaces": {}}},
+            {"cpu": None,
+             "cpuStatus": metrics.CPU_READY_PARTIAL,
+             "disks": {}, "interfaces": {}})
+        vm_status = self.samples(families, "zstack_vm_cpu_ready_status")
+        host_status = self.samples(families, "zstack_host_cpu_ready_status")
+        self.assertEqual(1, len(vm_status))
+        self.assertEqual(1, len(host_status))
+        vm_labels, vm_value = vm_status[0]
+        host_labels, host_value = host_status[0]
+        if isinstance(vm_labels, dict):
+            self.assertEqual(metrics.CPU_READY_UNSUPPORTED,
+                             vm_labels["status"])
+            self.assertEqual(metrics.CPU_READY_PARTIAL,
+                             host_labels["status"])
+        else:
+            self.assertEqual(["vm", metrics.CPU_READY_UNSUPPORTED], vm_labels)
+            self.assertEqual([metrics.CPU_READY_PARTIAL], host_labels)
+        self.assertEqual(1, vm_value)
+        self.assertEqual(1, host_value)
 
     def test_missing_vcpu_or_nonpositive_interval_suppresses_partial_average(self):
         previous = {"vcpuCount": 2, "delayNs": {0: 0, 1: 0}}
