@@ -1,10 +1,14 @@
 import errno
 import json
+import math
 import re
+import signal
 import socket
+import sys
+import threading
 from distutils.version import LooseVersion
 
-from zstacklib.utils import log, bash, qemu
+from zstacklib.utils import log, bash, qemu, shell
 
 logger = log.get_logger(__name__)
 
@@ -53,8 +57,12 @@ def get_block_job_ids(vm):
     if jobs:
         return [job['device'] for job in jobs]
 
-def query_block_jobs_by_device(vm):
-    jobs = execute_qmp_command(vm, "query-block-jobs")
+def query_block_jobs_by_device(vm, command_timeout=None):
+    if command_timeout is None:
+        jobs = execute_qmp_command(vm, "query-block-jobs")
+    else:
+        jobs = execute_qmp_command(
+            vm, "query-block-jobs", command_timeout=command_timeout)
     if not jobs:
         return {}
     return {job['device']: job for job in jobs}
@@ -79,10 +87,108 @@ def block_job_set_speed(vm, device, bandwidth):
     execute_qmp_command(vm, "block-job-set-speed", device=device, speed=bandwidth)
 
 
+def _normalize_command_timeout(timeout):
+    if timeout is None:
+        return None
+    try:
+        normalized = float(timeout)
+    except (TypeError, ValueError):
+        raise ValueError("QMP command timeout must be a positive finite number")
+    if normalized <= 0 or math.isnan(normalized) or math.isinf(normalized):
+        raise ValueError("QMP command timeout must be a positive finite number")
+    return normalized
+
+
+def _communicate_with_timeout(process, timeout):
+    """Communicate with a subprocess and kill it when the deadline expires.
+
+    Python 2's ``Popen.communicate`` has no timeout argument.  A daemon timer
+    keeps the implementation compatible with both Python 2 and Python 3 while
+    still guaranteeing that a stuck virsh process is reaped.
+    """
+    if timeout is None:
+        output, error = process.communicate()
+        return output, error, False
+
+    timeout = _normalize_command_timeout(timeout)
+
+    state = {"kill_sent": False}
+
+    def kill_on_timeout():
+        if process.poll() is not None:
+            return
+        try:
+            process.kill()
+        except OSError:
+            # The process may have exited between poll() and kill().
+            return
+        state["kill_sent"] = True
+
+    timer = None
+    try:
+        timer = threading.Timer(timeout, kill_on_timeout)
+        timer.daemon = True
+        timer.start()
+    except Exception:
+        # A timer infrastructure failure must not strand the already-created
+        # virsh process.  Reap it before preserving the original exception.
+        try:
+            process.kill()
+        except Exception:
+            pass
+        try:
+            process.communicate()
+        except Exception:
+            pass
+        raise
+    try:
+        output, error = process.communicate()
+    finally:
+        timer.cancel()
+        # cancel() cannot stop a callback that has already started.  Wait for
+        # it to finish before inspecting state and the reaped return code.
+        join = getattr(timer, "join", None)
+        if join is not None:
+            join()
+    sigkill = getattr(signal, "SIGKILL", 9)
+    timed_out = state["kill_sent"] and process.returncode == -sigkill
+    return output, error, timed_out
+
+
 @bash.in_bash
-def _execute_qmp_command(domain_id, command, raise_exception=True):
-    r, o, e = bash.bash_roe("virsh qemu-monitor-command %s '%s'" % (domain_id, qmp_subcmd(QEMU_VERSION, command)))
-    if r == 0:
+def _execute_qmp_command(domain_id, command, raise_exception=True,
+                         command_timeout=None):
+    # Validate before spawning virsh.  Invalid deadlines must not create a
+    # child process that no caller will communicate with or reap.
+    command_timeout = _normalize_command_timeout(command_timeout)
+    if isinstance(command, bytes):
+        command = command.decode('utf-8')
+    if isinstance(domain_id, bytes):
+        domain_id = domain_id.decode('utf-8')
+
+    command = qmp_subcmd(QEMU_VERSION, command)
+    if sys.version_info[0] < 3:
+        if isinstance(command, unicode):
+            command = command.encode('utf-8')
+        if isinstance(domain_id, unicode):
+            domain_id = domain_id.encode('utf-8')
+    # Keep every value in a distinct argv entry.  QMP JSON is caller-controlled
+    # data and must never be interpolated into a shell command: JSON escaping
+    # does not escape shell metacharacters such as a single quote.
+    process = shell.get_process(
+        ["virsh", "qemu-monitor-command", domain_id, command],
+        shell=False,
+        pipe=True)
+    o, e, timed_out = _communicate_with_timeout(process, command_timeout)
+    r = process.returncode
+    if isinstance(o, bytes):
+        o = o.decode('utf-8', 'replace')
+    if isinstance(e, bytes):
+        e = e.decode('utf-8', 'replace')
+    if timed_out:
+        err_msg = "Timed out executing qmp command '{}', vmUuid:{}, timeout:{}s".format(
+            command, domain_id, command_timeout)
+    elif r == 0:
         ret = json.loads(o.strip())
         if "error" not in ret:
             return ret["return"]
@@ -91,15 +197,19 @@ def _execute_qmp_command(domain_id, command, raise_exception=True):
         err_msg = "Failed to execute qmp command '{}', vmUuid:{}, retcode:{}, stderr:{}".format(command, domain_id, r, e)
 
     if raise_exception:
+        if timed_out:
+            raise QMPTimeoutError(err_msg)
         raise Exception(err_msg)
     logger.warn(err_msg)
 
 
-def execute_qmp_command(domain, name, raise_exception=True, **kwargs):
+def execute_qmp_command(domain, name, raise_exception=True,
+                        command_timeout=None, **kwargs):
     """
     Execute a QMP command on a domain
     :param domain:
     :param name:
+    :param command_timeout: subprocess deadline in seconds, or None
     :param kwargs:
         qemu monitor command arguments
         ignore_error: ignore error if True
@@ -115,7 +225,43 @@ def execute_qmp_command(domain, name, raise_exception=True, **kwargs):
             normalized_kwargs[k] = v
 
     qmp_cmd['arguments'] = normalized_kwargs
-    return _execute_qmp_command(domain, json.dumps(qmp_cmd).encode('utf-8'), raise_exception)
+    encoded_command = json.dumps(qmp_cmd).encode('utf-8')
+    if command_timeout is None:
+        return _execute_qmp_command(domain, encoded_command, raise_exception)
+    return _execute_qmp_command(
+        domain, encoded_command, raise_exception,
+        command_timeout=command_timeout)
+
+
+def execute_qmp_command_raw(domain_id, command_json, raise_exception=True,
+                            command_timeout=None):
+    """
+    Execute a pre-serialised QMP command JSON string.
+
+    Use this when QMP arguments contain fields that collide with
+    execute_qmp_command's Python parameter ``name`` (e.g. block-dirty-bitmap-add
+    requires an arguments.name field which shadows the function's positional
+    ``name`` parameter).
+
+    :param domain_id: VM UUID / libvirt domain ID
+    :param command_json: complete QMP command as JSON text or UTF-8 bytes
+    :param raise_exception: raise on error if True (default True)
+    :param command_timeout: subprocess deadline in seconds, or None
+    :return: the 'return' value from QMP response, or None on suppressed error
+    """
+    if isinstance(command_json, bytes):
+        command_json = command_json.decode("utf-8")
+    elif sys.version_info[0] < 3:
+        if not isinstance(command_json, (str, unicode)):
+            command_json = str(command_json)
+    elif not isinstance(command_json, str):
+        command_json = str(command_json)
+    if command_timeout is None:
+        return _execute_qmp_command(
+            domain_id, command_json, raise_exception=raise_exception)
+    return _execute_qmp_command(
+        domain_id, command_json, raise_exception=raise_exception,
+        command_timeout=command_timeout)
 
 
 def qmp_subcmd(qemu_version, s_cmd):

@@ -16,6 +16,7 @@ from zstacklib.utils import jsonobject
 from zstacklib.utils import log
 from zstacklib.utils import linux
 from zstacklib.utils import debug
+from zstacklib.utils.restart_fence import AgentRestartFence
 
 TASK_UUID = 'taskuuid'
 ERROR_CODE = 'error'
@@ -139,29 +140,33 @@ class AsyncUirHandler(SyncUriHandler):
 
     @thread.AsyncThread
     def _run_index(self, task_uuid, request):
-        callback_uri = self._get_callback_uri(request)
-        with self.HANDLER_DICT_LOCK:
-            if task_uuid in self.HANDLER_DICT:
-                logger.info("ignored duplicated task: {}".format(task_uuid))
-                return
-            self.HANDLER_DICT[task_uuid] = callback_uri
-
-        headers = {TASK_UUID : task_uuid}
+        registered = False
         try:
-            content = super(AsyncUirHandler, self)._do_index(request)
-            self._check_response(content)
-        except Exception:
-            content = traceback.format_exc()
-            logger.warn('[WARN]: %s]' % content)
-            headers[ERROR_CODE] = content
+            callback_uri = self._get_callback_uri(request)
+            with self.HANDLER_DICT_LOCK:
+                if task_uuid in self.HANDLER_DICT:
+                    logger.info("ignored duplicated task: {}".format(task_uuid))
+                    return
+                self.HANDLER_DICT[task_uuid] = callback_uri
+                registered = True
 
-        try:
+            headers = {TASK_UUID : task_uuid}
+            try:
+                content = super(AsyncUirHandler, self)._do_index(request)
+                self._check_response(content)
+            except Exception:
+                content = traceback.format_exc()
+                logger.warn('[WARN]: %s]' % content)
+                headers[ERROR_CODE] = content
+
             logger.debug("async http call handler finished[task uuid: %s] to %s: %s" % (task_uuid, callback_uri, content))
             json_post(callback_uri, content, headers)
             logger.debug("async http reply[task uuid: %s]" % task_uuid)
         finally:
-            with self.HANDLER_DICT_LOCK:
-                self.HANDLER_DICT.pop(task_uuid, None)
+            if registered:
+                with self.HANDLER_DICT_LOCK:
+                    self.HANDLER_DICT.pop(task_uuid, None)
+            AgentRestartFence.leave_request()
 
     def _get_callback_uri(self, req):
         callback_uri = None
@@ -192,7 +197,15 @@ class AsyncUirHandler(SyncUriHandler):
 
         filter_body = log.mask_sensitive_field(self.uri_obj.cmd, req.body)
         logger.debug('async http call[task uuid: %s], body: %s' % (task_uuid, filter_body))
-        self._run_index(task_uuid, req)
+        if not AgentRestartFence.enter_request():
+            err = 'kvmagent restart fence is active'
+            logger.warn(err)
+            raise cherrypy.HTTPError(409, err)
+        try:
+            self._run_index(task_uuid, req)
+        except Exception:
+            AgentRestartFence.leave_request()
+            raise
 
 def tool_disable_multipart_preprocessing():
     """A cherrypy Tool extension to disable default multipart processing"""
@@ -217,6 +230,7 @@ class HttpServer(object):
         self.logfile_path = log.get_logfile_path()
         self.port = port
         self.mapper = None
+        self.mapping_lock = threading.RLock()
 
     def register_async_uri(self, uri, func, callback_uri=None, cmd=None):
         # type:(str, function, str, object) -> None
@@ -229,7 +243,11 @@ class HttpServer(object):
         async_uri_obj.cmd = cmd
         async_uri_obj.controller = AsyncUirHandler(async_uri_obj)
 
-        self.async_uri_handlers[uri] = async_uri_obj
+        with self.mapping_lock:
+            self.async_uri_handlers[uri] = async_uri_obj
+            if self.mapper is not None:
+                self._add_mapping(async_uri_obj)
+                self._refresh_mapping()
 
     def register_sync_uri(self, uri, func, cmd=None):
         # type:(str, function, object) -> None
@@ -238,28 +256,141 @@ class HttpServer(object):
         sync_uri.uri = uri
         sync_uri.cmd = cmd
         sync_uri.controller = SyncUriHandler(sync_uri)
-        self.sync_uri_handlers[uri] = sync_uri
+        with self.mapping_lock:
+            self.sync_uri_handlers[uri] = sync_uri
+            if self.mapper is not None:
+                self._add_mapping(sync_uri)
+                self._refresh_mapping()
 
     def register_raw_uri(self, uri, func):
         raw_uri = RawUri()
         raw_uri.func = func
         raw_uri.uri = uri
         raw_uri.controller = RawUriHandler(raw_uri)
-        self.raw_uri_handlers[uri] = raw_uri
+        with self.mapping_lock:
+            self.raw_uri_handlers[uri] = raw_uri
+            if self.mapper is not None:
+                self._add_mapping(raw_uri)
+                self._refresh_mapping()
 
     def register_raw_stream_uri(self, uri, func):
         raw_uri = RawUri()
         raw_uri.func = func
         raw_uri.uri = uri
         raw_uri.controller = RawUriStreamHandler(raw_uri)
-        self.raw_uri_handlers[uri] = raw_uri
+        with self.mapping_lock:
+            self.raw_uri_handlers[uri] = raw_uri
+            if self.mapper is not None:
+                self._add_mapping(raw_uri)
+                self._refresh_mapping()
+
+    def register_uri_batch(self, routes):
+        """Publish external sync/async routes with one mapper refresh."""
+        registered = []
+        route_names = []
+        with self.mapping_lock:
+            try:
+                for kind, uri, func in routes:
+                    if (uri in self.async_uri_handlers or
+                            uri in self.sync_uri_handlers or
+                            uri in self.raw_uri_handlers):
+                        raise ValueError('uri already registered: %s' % uri)
+                    if kind == 'sync':
+                        uri_obj = SyncUri()
+                        uri_obj.controller = SyncUriHandler(uri_obj)
+                        handlers = self.sync_uri_handlers
+                    elif kind == 'async':
+                        uri_obj = AsyncUri()
+                        uri_obj.callback_uri = self.async_callback_uri
+                        uri_obj.controller = AsyncUirHandler(uri_obj)
+                        handlers = self.async_uri_handlers
+                    else:
+                        raise ValueError('unsupported batched uri kind: %s' % kind)
+                    uri_obj.uri = uri
+                    uri_obj.func = func
+                    uri_obj.cmd = None
+                    handlers[uri] = uri_obj
+                    registered.append((handlers, uri))
+                    route_names.extend(self._mapping_names(uri))
+                    if self.mapper is not None:
+                        self._add_mapping(uri_obj)
+                if self.mapper is not None:
+                    self._refresh_mapping()
+            except Exception:
+                for handlers, uri in registered:
+                    handlers.pop(uri, None)
+                if self.mapper is not None and route_names:
+                    try:
+                        self._remove_mapping(route_names)
+                    except Exception:
+                        logger.warn('failed to refresh mapper during route rollback')
+                raise
+
+    @staticmethod
+    def _mapping_names(uri):
+        if uri == '/':
+            return (uri,)
+        if uri.endswith('/'):
+            return (uri, uri.rstrip('/'))
+        return (uri, uri + '/')
 
     def unregister_uri(self, uri):
-        del self.async_callback_uri[uri]
+        with self.mapping_lock:
+            base_uri = uri if uri == '/' else uri.rstrip('/')
+            route_names = self._mapping_names(base_uri)
+            for name in route_names:
+                self.async_uri_handlers.pop(name, None)
+                self.sync_uri_handlers.pop(name, None)
+                self.raw_uri_handlers.pop(name, None)
+            if self.mapper is None:
+                return
+            self._remove_mapping(route_names)
+
+    def _refresh_mapping(self):
+        route_mapper = getattr(self.mapper, 'mapper', None)
+        create_regs = getattr(route_mapper, 'create_regs', None)
+        if create_regs is not None:
+            create_regs()
+
+    def _remove_mapping(self, route_names):
+        route_names = set(route_names)
+        dispatcher = self.mapper
+        route_mapper = getattr(dispatcher, 'mapper', None)
+        if route_mapper is None:
+            return
+
+        for name in route_names:
+            getattr(dispatcher, 'controllers', {}).pop(name, None)
+            getattr(route_mapper, '_routenames', {}).pop(name, None)
+
+        matchlist = getattr(route_mapper, 'matchlist', None)
+        if matchlist is not None:
+            matchlist[:] = [route for route in matchlist
+                            if getattr(route, 'name', None) not in route_names]
+        maxkeys = getattr(route_mapper, 'maxkeys', None)
+        if maxkeys is not None:
+            for key in list(maxkeys.keys()):
+                maxkeys[key][:] = [
+                    route for route in maxkeys[key]
+                    if getattr(route, 'name', None) not in route_names]
+                if not maxkeys[key]:
+                    maxkeys.pop(key, None)
+
+        if hasattr(route_mapper, '_created_gens'):
+            route_mapper._created_gens = False
+        if hasattr(route_mapper, '_created_regs'):
+            route_mapper._created_regs = False
+        urlcache = getattr(route_mapper, 'urlcache', None)
+        clear_cache = getattr(urlcache, 'clear', None)
+        if clear_cache is not None:
+            clear_cache()
+        self._refresh_mapping()
 
     def _add_mapping(self, uri_obj):
         if not self.mapper: self.mapper = cherrypy.dispatch.RoutesDispatcher()
         self.mapper.connect(name=uri_obj.uri, route=uri_obj.uri, controller=uri_obj.controller, action="index")
+        if uri_obj.uri == '/':
+            return
         if not uri_obj.uri.endswith('/'):
             nuri = uri_obj.uri + '/'
             self.mapper.connect(name=nuri, route=nuri, controller=uri_obj.controller, action="index")
@@ -270,15 +401,16 @@ class HttpServer(object):
             logger.debug('function[%s] registered uri: %s' % (uri_obj.func.__name__, nuri))
 
     def _build(self):
-        for akey in self.async_uri_handlers.keys():
-            aval = self.async_uri_handlers[akey]
-            self._add_mapping(aval)
-        for skey in self.sync_uri_handlers.keys():
-            sval = self.sync_uri_handlers[skey]
-            self._add_mapping(sval)
-        for skey in self.raw_uri_handlers.keys():
-            sval = self.raw_uri_handlers[skey]
-            self._add_mapping(sval)
+        with self.mapping_lock:
+            for akey in self.async_uri_handlers.keys():
+                aval = self.async_uri_handlers[akey]
+                self._add_mapping(aval)
+            for skey in self.sync_uri_handlers.keys():
+                sval = self.sync_uri_handlers[skey]
+                self._add_mapping(sval)
+            for skey in self.raw_uri_handlers.keys():
+                sval = self.raw_uri_handlers[skey]
+                self._add_mapping(sval)
 
         self.server_conf = {'request.dispatch': self.mapper}
 
@@ -318,13 +450,30 @@ class HttpServer(object):
         self.server.log.access_log = logger
         self.server.log.error_log = logger
 
-    def start(self):
+    def start(self, on_started=None):
         self._build()
-        cherrypy.quickstart(self.server)
+        subscribed = False
+        started_callback = None
+        if on_started is not None:
+            def notify_started_once():
+                try:
+                    cherrypy.engine.unsubscribe(
+                        'start', notify_started_once)
+                finally:
+                    on_started()
+            started_callback = notify_started_once
+            cherrypy.engine.subscribe(
+                'start', started_callback, priority=100)
+            subscribed = True
+        try:
+            cherrypy.quickstart(self.server)
+        finally:
+            if subscribed:
+                cherrypy.engine.unsubscribe('start', started_callback)
 
     @thread.AsyncThread
-    def start_in_thread(self):
-        self.start()
+    def start_in_thread(self, on_started=None):
+        self.start(on_started)
 
     @staticmethod
     def query_string_to_object(query_string):

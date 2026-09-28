@@ -10,6 +10,7 @@ from zstacklib.utils import jsonobject
 from zstacklib.utils import daemon
 from zstacklib.utils import linux
 from zstacklib.utils import qemu
+from . import external_plugin
 
 import functools
 import os.path
@@ -18,6 +19,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import traceback
 
 # TODO: -> python3: delete it
@@ -121,6 +123,10 @@ class KvmRESTService(object):
     NO_DAEMON = 'no_deamon'
     PLUGIN_PATH = 'plugin_path'
     WORKSPACE = 'workspace'
+    EXTERNAL_PLUGIN_REGISTRY_ROOT = 'external_plugin_registry_root'
+    EXTERNAL_PLUGIN_MANAGED_ROOT = 'external_plugin_managed_root'
+    EXTERNAL_PLUGIN_EXPECTED_UID = 'external_plugin_expected_uid'
+    PLUGIN_DEPENDENCY_READY_DEADLINE = 'plugin_dependency_ready_deadline'
     
     def __init__(self, config={}):
         self.config = config
@@ -128,23 +134,49 @@ class KvmRESTService(object):
         if not plugin_path:
             plugin_path = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'plugins')
         self.plugin_path = plugin_path
+        self.external_plugin_rgty = external_plugin.ExternalPluginRegistry(
+            self.http_server,
+            registry_root=self._get_config(self.EXTERNAL_PLUGIN_REGISTRY_ROOT)
+            or external_plugin.DEFAULT_REGISTRY_ROOT,
+            managed_root=self._get_config(self.EXTERNAL_PLUGIN_MANAGED_ROOT)
+            or external_plugin.DEFAULT_MANAGED_ROOT,
+            expected_uid=self.config.get(self.EXTERNAL_PLUGIN_EXPECTED_UID, 0),
+            dependency_ready_deadline=int(
+                self._get_config(self.PLUGIN_DEPENDENCY_READY_DEADLINE) or 30))
         self.plugin_rgty = plugin.PluginRegistry(self.plugin_path)
+        self.external_plugin_rgty.register_status_endpoint()
     
     def _get_config(self, name):
         return self.config.get(name)
+
+    def _start_external_plugins(self, config):
+        worker = threading.Thread(
+            target=self.external_plugin_rgty.load_and_start,
+            args=(config,))
+        worker.daemon = True
+        worker.start()
+        self.external_plugin_loader_thread = worker
+        return worker
     
     def start(self, in_thread=True):
         config = {}
         self.plugin_rgty.configure_plugins(config)
         self.plugin_rgty.start_plugins()
         if in_thread:
-            self.http_server.start_in_thread()
+            self.http_server.start_in_thread(
+                lambda: self._start_external_plugins(config))
         else:
-            self.http_server.start()
+            self.http_server.start(
+                lambda: self._start_external_plugins(config))
     
     def stop(self):
-        self.plugin_rgty.stop_plugins()
+        request_external_stop = getattr(
+            self.external_plugin_rgty, 'request_stop', None)
+        if request_external_stop is not None:
+            request_external_stop()
         self.http_server.stop()
+        self.plugin_rgty.stop_plugins()
+        self.external_plugin_rgty.stop()
 
 class AgentResponse(object):
     def __init__(self, success=True, error=None):

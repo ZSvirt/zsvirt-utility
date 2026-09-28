@@ -77,6 +77,7 @@ from zstacklib.utils.linux import is_virtual_machine
 from zstacklib.utils.qga import *
 from zstacklib.utils import jsonobject
 from zstacklib.utils.qmp import get_block_node_name_and_file
+from zstacklib.utils.restart_fence import monotonic_time
 from zstacklib.utils.report import *
 from zstacklib.utils.vm_plugin_queue_singleton import VmPluginQueueSingleton
 from zstacklib.utils.libvirt_singleton import LibvirtEventManager
@@ -84,6 +85,14 @@ from zstacklib.utils.libvirt_singleton import LibvirtEventManagerSingleton
 from zstacklib.utils.libvirt_singleton import LibvirtSingleton
 
 logger = log.get_logger(__name__)
+
+# Python 2/3 string-type compatibility for block-graph helpers at module bottom.
+# Python 2: basestring covers both str and unicode (QMP json.loads returns unicode).
+# Python 3: basestring does not exist; str is sufficient.
+try:
+    _str_types = basestring
+except NameError:
+    _str_types = str
 
 HOST_ARCH = platform.machine()
 DIST = platform.dist()
@@ -2372,6 +2381,269 @@ def get_vm_by_uuid_no_retry(uuid, exception_if_not_existing=True):
 
         err = 'error happened when looking up vm[uuid:%(uuid)s], libvirt error code: %(error_code)s, %(e)s' % locals()
         raise libvirt.libvirtError(err)
+
+
+def _block_struct_contains_volume_uuid(obj, volume_uuid):
+    """
+    Recursively check whether any string value inside a nested dict/list
+    structure contains the given volume_uuid substring.
+
+    **Design trade-off**: A recursive substring scan is deliberately broad --
+    it matches the UUID wherever it appears (file paths, node names, backing
+    chains, etc.). This maximises recall on diverse QEMU/libvirt
+    configurations but may produce false positives when UUIDs overlap or
+    appear in unrelated metadata fields. Callers that need precision should
+    prefer checking ``inserted.file`` first and falling back to this
+    function only when the narrow check misses (see the two-pass strategy in
+    ``get_mirror_device_for_volume_uuid``).
+
+    This mirrors the logic used by the ZR plugin so that mirror device
+    resolution is always based on the QEMU block graph.
+    """
+    if isinstance(obj, _str_types):
+        return volume_uuid in obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if _block_struct_contains_volume_uuid(v, volume_uuid):
+                return True
+    elif isinstance(obj, list):
+        for v in obj:
+            if _block_struct_contains_volume_uuid(v, volume_uuid):
+                return True
+    return False
+
+
+MIRROR_DEVICE_QMP_TIMEOUT_SECONDS = 10
+
+
+def _remaining_qmp_timeout(deadline):
+    remaining = deadline - monotonic_time()
+    return remaining if remaining > 0 else None
+
+
+def _find_root_block_node(vm_uuid, start_node_name, deadline=None):
+    """
+    Use x-debug-query-block-graph to walk upwards from the given node name
+    and find the block-driver node that is directly attached to a block-backend.
+
+    **Note**: ``x-debug-query-block-graph`` is an experimental QEMU command
+    (``x-`` prefix = unstable API, available since QEMU 4.0).  The
+    command is queried once for each resolution; if it is unavailable this
+    function returns ``start_node_name`` immediately.  Failures are not
+    cached because a VM UUID may be reused and transport errors are transient.
+
+    If the graph is unavailable or cannot be parsed, falls back to
+    ``start_node_name``.
+    """
+    if not vm_uuid or not start_node_name:
+        return start_node_name
+    if deadline is None:
+        deadline = monotonic_time() + MIRROR_DEVICE_QMP_TIMEOUT_SECONDS
+    remaining = _remaining_qmp_timeout(deadline)
+    if remaining is None:
+        return start_node_name
+    try:
+        graph = qmp.execute_qmp_command(
+            vm_uuid, "x-debug-query-block-graph", raise_exception=False,
+            command_timeout=remaining)
+    except Exception:
+        return start_node_name
+    if not graph or not isinstance(graph, dict):
+        logger.debug("x-debug-query-block-graph not available on vm %s (QEMU may not support it)" % vm_uuid)
+        return start_node_name
+
+    nodes_list = graph.get("nodes")
+    edges_list = graph.get("edges")
+    if not nodes_list or not edges_list:
+        return start_node_name
+
+    id_to_node = {}
+    name_to_ids = {}
+    for n in nodes_list:
+        if not isinstance(n, dict):
+            continue
+        nid = n.get("id")
+        if nid is None:
+            continue
+        id_to_node[nid] = n
+        nname = n.get("name") or ""
+        name_to_ids.setdefault(nname, []).append(nid)
+
+    parents_by_child = {}
+    children_by_parent = {}
+    for e in edges_list:
+        if not isinstance(e, dict):
+            continue
+        parent_id = e.get("parent")
+        child_id = e.get("child")
+        if parent_id is None or child_id is None:
+            continue
+        parents_by_child.setdefault(child_id, []).append(parent_id)
+        children_by_parent.setdefault(parent_id, []).append(child_id)
+
+    start_ids = name_to_ids.get(start_node_name) or []
+    if not start_ids:
+        return start_node_name
+
+    visited = set()
+    _MAX_ASCEND_DEPTH = 32  # Safety valve: QEMU block graphs are small (<20 nodes).
+
+    def ascend_from(node_id, depth=0):
+        if depth > _MAX_ASCEND_DEPTH or node_id in visited:
+            return None
+        visited.add(node_id)
+        parents = parents_by_child.get(node_id) or []
+        for pid in parents:
+            pnode = id_to_node.get(pid)
+            if not pnode:
+                continue
+            ptype = pnode.get("type") or ""
+            if ptype == "block-backend":
+                node = id_to_node.get(node_id)
+                root_name = (node or {}).get("name")
+                return root_name or start_node_name
+            if ptype == "block-driver":
+                root = ascend_from(pid, depth + 1)
+                if root:
+                    return root
+            if ptype == "block-job":
+                # A block-job (e.g. mirror/backup) sits between the real
+                # block-driver chain and the block-backend. It breaks the
+                # normal parent walk, so we look at the job's *other*
+                # block-driver children (the source side of the job) and
+                # continue ascending from there to reach the block-backend.
+                job_children = children_by_parent.get(pid) or []
+                for cid in job_children:
+                    cnode = id_to_node.get(cid)
+                    if not cnode:
+                        continue
+                    if cnode.get("type") == "block-driver":
+                        root = ascend_from(cid, depth + 1)
+                        if root:
+                            return root
+        return None
+
+    for sid in start_ids:
+        visited.clear()
+        root_name = ascend_from(sid)
+        if root_name:
+            return root_name
+
+    return start_node_name
+
+
+def _extract_device_and_node(block_entry):
+    """Extract (device, node_name) from a single query-block entry.
+
+    Returns (device_str_or_None, node_name_str_or_None).
+    """
+    device = block_entry.get("device") or ""
+    if not (isinstance(device, _str_types) and device.strip()):
+        device = None
+    qdev_path = block_entry.get("qdev") or block_entry.get("Qdev") or ""
+    if not isinstance(qdev_path, _str_types):
+        qdev_path = str(qdev_path) if qdev_path else ""
+    if (not device or not device.strip()) and qdev_path.strip():
+        parts = qdev_path.strip().rstrip("/").split("/")
+        for p in reversed(parts):
+            if p and p not in ("virtio-backend", "machine", "peripheral", "scsi-backend"):
+                device = p
+                break
+    inserted = block_entry.get("inserted") or {}
+    node_name = inserted.get("node-name") if isinstance(inserted, dict) else None
+    return device, node_name
+
+
+def get_mirror_device_for_volume_uuid(
+        vm_uuid, volume_uuid,
+        command_timeout=MIRROR_DEVICE_QMP_TIMEOUT_SECONDS):
+    """
+    Resolve the mirror-capable (node_name, device_name) for a volume from QEMU query-block.
+
+    Uses a **two-pass** matching strategy:
+
+    1. **High-precision pass** -- only check ``inserted.file`` (the image file
+       path reported by QEMU).  This avoids false positives when the UUID
+       substring accidentally appears in unrelated metadata fields.
+    2. **Recursive fallback pass** -- scan the entire block entry dict
+       recursively (via ``_block_struct_contains_volume_uuid``).  This
+       handles unusual QEMU configurations where the file path lives in a
+       nested sub-driver or backing chain.
+
+    If multiple block entries match in either pass, a warning is logged (the
+    first match is returned).
+
+    Uses the actual QEMU block graph: the root block-driver node name (from the graph)
+    is preferred as node_name for drive-mirror/blockdev-mirror. node_name is the BDS
+    node name (reliable under -blockdev); device_name is the qdev-derived alias or empty.
+
+    Returns (node_name, device_name), or (None, None) if the volume is not found.
+    """
+    if not vm_uuid or not volume_uuid:
+        return None, None
+    try:
+        command_timeout = float(command_timeout)
+    except (TypeError, ValueError):
+        return None, None
+    if (command_timeout <= 0 or math.isnan(command_timeout) or
+            math.isinf(command_timeout)):
+        return None, None
+    deadline = monotonic_time() + command_timeout
+    remaining = _remaining_qmp_timeout(deadline)
+    if remaining is None:
+        return None, None
+    vol_str = volume_uuid if isinstance(volume_uuid, str) else str(volume_uuid)
+    try:
+        blocks = qmp.execute_qmp_command(
+            vm_uuid, "query-block", raise_exception=False,
+            command_timeout=remaining)
+    except Exception:
+        return None, None
+    if not blocks:
+        return None, None
+    # query-block normally returns a list; guard against unusual dict form.
+    if isinstance(blocks, dict):
+        blocks = list(blocks.values())
+
+    def _resolve_from(block_entry):
+        """Build (root_node, device) from a matched block entry."""
+        device, node_name = _extract_device_and_node(block_entry)
+        raw_node = node_name or device
+        if not raw_node:
+            return None, None
+        root_node = _find_root_block_node(vm_uuid, raw_node, deadline=deadline)
+        return root_node, (device or raw_node)
+
+    # --- Pass 1: high-precision match on inserted.file ---
+    pass1_matches = []
+    for b in (blocks or []):
+        if not isinstance(b, dict):
+            continue
+        inserted = b.get("inserted") or {}
+        file_path = inserted.get("file") if isinstance(inserted, dict) else None
+        if file_path and isinstance(file_path, _str_types) and vol_str in file_path:
+            pass1_matches.append(b)
+    if pass1_matches:
+        if len(pass1_matches) > 1:
+            logger.warn("get_mirror_device_for_volume_uuid: %d blocks matched volume %s by inserted.file (using first)"
+                        % (len(pass1_matches), vol_str))
+        return _resolve_from(pass1_matches[0])
+
+    # --- Pass 2: recursive fallback (full dict scan) ---
+    pass2_matches = []
+    for b in (blocks or []):
+        if not isinstance(b, dict):
+            continue
+        if _block_struct_contains_volume_uuid(b, vol_str):
+            pass2_matches.append(b)
+    if pass2_matches:
+        if len(pass2_matches) > 1:
+            logger.warn("get_mirror_device_for_volume_uuid: %d blocks matched volume %s by recursive scan (using first)"
+                        % (len(pass2_matches), vol_str))
+        return _resolve_from(pass2_matches[0])
+
+    return None, None
+
 
 def get_active_vm_uuids_states():
     @LibvirtAutoReconnect
@@ -7269,8 +7541,8 @@ def iso_check(iso):
 
 
 def execute_qmp_command(domain_id, command, raise_exception=False):
-    warnings.warn("Use qmp.execute_qmp_command instead", DeprecationWarning)
-    return qmp._execute_qmp_command(domain_id, command, raise_exception=raise_exception)
+    warnings.warn("Use qmp.execute_qmp_command or qmp.execute_qmp_command_raw instead", DeprecationWarning)
+    return qmp.execute_qmp_command_raw(domain_id, command, raise_exception=raise_exception)
 
 def get_vm_blocks(domain_id):
     blocks = qmp.execute_qmp_command(domain_id, "query-block")
