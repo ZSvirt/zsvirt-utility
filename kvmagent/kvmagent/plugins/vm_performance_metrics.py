@@ -530,7 +530,7 @@ def _metric_families():
     specs = (
         ("zstack_vm_vcpu_ready_time_milliseconds", ["vm_uuid", "vcpu_id"]),
         ("zstack_vm_vcpu_readiness_percent", ["vm_uuid", "vcpu_id"]),
-        ("zstack_vm_cpu_ready_status", ["vm_uuid", "status"]),
+        ("zstack_vm_cpu_ready_support_status", ["vm_uuid", "status"]),
         ("zstack_vm_disk_read_time_milliseconds", ["vm_uuid", "disk_name"]),
         ("zstack_vm_disk_read_requests", ["vm_uuid", "disk_name"]),
         ("zstack_vm_disk_write_time_milliseconds", ["vm_uuid", "disk_name"]),
@@ -540,7 +540,7 @@ def _metric_families():
         ("zstack_host_cpu_ready_time_milliseconds", []),
         ("zstack_host_cpu_readiness_percent", []),
         ("zstack_host_cpu_ready_time_milliseconds_by_cpu", ["cpu_id"]),
-        ("zstack_host_cpu_ready_status", ["status"]),
+        ("zstack_host_cpu_ready_support_status", ["status"]),
         ("zstack_host_disk_read_latency_milliseconds", ["disk_name"]),
         ("zstack_host_disk_write_latency_milliseconds", ["disk_name"]),
         ("zstack_host_network_receive_dropped_packets", ["nic_name"]),
@@ -556,7 +556,7 @@ def build_prometheus_metrics(vm_metrics, host_metrics):
     metrics = _metric_families()
     for vm_uuid, values in vm_metrics.items():
         cpu_status = values.get("cpuStatus", CPU_READY_NO_DATA)
-        metrics["zstack_vm_cpu_ready_status"].add_metric(
+        metrics["zstack_vm_cpu_ready_support_status"].add_metric(
             [vm_uuid, cpu_status], 1)
         cpu = values["cpu"]
         if cpu is not None:
@@ -587,7 +587,7 @@ def build_prometheus_metrics(vm_metrics, host_metrics):
                 metrics["zstack_vm_network_transmit_dropped_packets"].add_metric(
                     labels, nic["txDrop"])
 
-    metrics["zstack_host_cpu_ready_status"].add_metric(
+    metrics["zstack_host_cpu_ready_support_status"].add_metric(
         [host_metrics.get("cpuStatus", CPU_READY_NO_DATA)], 1)
     cpu = host_metrics["cpu"]
     if cpu is not None:
