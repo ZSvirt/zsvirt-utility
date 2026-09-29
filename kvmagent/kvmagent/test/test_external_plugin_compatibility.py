@@ -90,10 +90,10 @@ class ExternalPluginCompatibilityTest(unittest.TestCase):
         self.assertTrue(validate_compatibility(manifest.compatibility,
                                                self.versions))
 
-    def test_target_distribution_versions_satisfy_5_2_contract(self):
+    def test_target_distribution_versions_satisfy_5_0_contract(self):
         compatibility = dict(self.compatibility)
-        compatibility["kvmAgent"] = ">=5.2.0,<5.3.0"
-        compatibility["zstacklib"] = ">=5.2.0,<5.3.0"
+        compatibility["kvmAgent"] = ">=5.0.0"
+        compatibility["zstacklib"] = ">=5.0.0"
         versions = dict(self.versions)
         versions["kvmAgent"] = self._declared_distribution_version("kvmagent")
         versions["zstacklib"] = self._declared_distribution_version("zstacklib")
