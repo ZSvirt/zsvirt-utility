@@ -18,7 +18,7 @@ from zstacklib.utils import qemu_img, qcow2
 from zstacklib.utils import secret
 from zstacklib.utils import traceable_shell
 from zstacklib.utils.bash import *
-from zstacklib.utils.file_metadata_handler import FileBasedMetadataHandler, qcow2_prefix_rebase_backing_files
+from zstacklib.utils.file_metadata_handler import FileBasedMetadataHandler, nfs_qcow2_prefix_rebase_backing_files
 from zstacklib.utils.misc import IgnoreError
 from zstacklib.utils.plugin import completetask
 from zstacklib.utils.report import *
@@ -1296,6 +1296,6 @@ class NfsPrimaryStoragePlugin(kvmagent.KvmAgent):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         self.check_nfs_mounted(self.mount_path.get(cmd.uuid))
         rsp = PrefixRebaseBackingFilesRsp()
-        rsp.rebasedCount = qcow2_prefix_rebase_backing_files(
+        rsp.rebasedCount = nfs_qcow2_prefix_rebase_backing_files(
             cmd.filePaths, cmd.oldPrefix, cmd.newPrefix)
         return jsonobject.dumps(rsp)

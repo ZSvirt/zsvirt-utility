@@ -13,6 +13,7 @@ from zstacklib.utils import bash, file_metadata_handler, linux
 from zstacklib.utils.file_metadata_handler import (
     FileBasedMetadataHandler,
     qcow2_prefix_rebase_backing_files,
+    nfs_qcow2_prefix_rebase_backing_files,
     _is_imagecache_path,
     _get_rebase_lock_path,
     _validate_metadata_path,
@@ -741,6 +742,30 @@ class TestFileMetadata(TestCase):
         self.assertEqual(count, 1)
         self.assertEqual(_get_backing(vol), new_base)
 
+    def _test_nfs_rebase_historical_mount_backing(self):
+        mount_parent = os.path.join(self.tmpdir, 'nfsprimarystorage')
+        metadata_prefix = os.path.join(mount_parent, 'prim-metadata')
+        historical_prefix = os.path.join(mount_parent, 'prim-history')
+        current_prefix = os.path.join(mount_parent, 'prim-current')
+        relative_cache = os.path.join(
+            'imagecache', 'template', 'image-uuid', 'image-uuid.qcow2')
+        historical_cache = os.path.join(historical_prefix, relative_cache)
+        current_cache = os.path.join(current_prefix, relative_cache)
+        volume = os.path.join(
+            current_prefix, 'rootVolumes', 'acct-uuid', 'vol-uuid', 'vol.qcow2')
+
+        _qemu_img_create(historical_cache, '64M')
+        os.makedirs(os.path.dirname(current_cache))
+        shutil.copy2(historical_cache, current_cache)
+        _qemu_img_create(volume, backing=historical_cache)
+        os.remove(historical_cache)
+
+        count = nfs_qcow2_prefix_rebase_backing_files(
+            [volume], metadata_prefix, current_prefix)
+
+        self.assertEqual(1, count)
+        self.assertEqual(current_cache, _get_backing(volume))
+
     def _test_rebase_multi_level_chain(self):
         """vol -> /old/snap -> /old/base   all get rebased."""
         old_dir = os.path.join(self.tmpdir, 'old', 'rootVolumes')
@@ -1123,6 +1148,8 @@ class TestFileMetadata(TestCase):
         self._test_rebase_no_backing_returns_zero()
         self._clean_tmpdir()
         self._test_rebase_single_backing()
+        self._clean_tmpdir()
+        self._test_nfs_rebase_historical_mount_backing()
         self._clean_tmpdir()
         self._test_rebase_multi_level_chain()
         self._clean_tmpdir()
