@@ -14,6 +14,7 @@ from zstacklib.utils import form
 from zstacklib.utils import http, debug
 from zstacklib.utils import jsonobject
 from zstacklib.utils import linux
+from zstacklib.utils.restart_fence import monotonic_time
 from zstacklib.utils import lock
 from zstacklib.utils import lvm
 from zstacklib.utils import shell
@@ -844,11 +845,22 @@ def collect_ssd_state():
     return metrics.values()
 
 
+HARDWARE_COLLECTION_TIMEOUT = 30
+
+
+def _collect_hardware_command(command, deadline):
+    remaining = deadline - monotonic_time()
+    if remaining <= 0:
+        return shell.TIMEOUT_EXIT_CODE, ''
+    return bash_ro("timeout -k 5s %.3fs %s" % (max(0.001, remaining), command), pipe_fail=True)
+
+
 collect_equipment_state_last_time = None
 collect_equipment_state_last_result = None
 
 
 def collect_ipmi_state():
+    deadline = monotonic_time() + HARDWARE_COLLECTION_TIMEOUT
     metrics = {
         'power_supply': GaugeMetricFamily('power_supply',
                                           'power supply', None, ['ps_id']),
@@ -870,10 +882,10 @@ def collect_ipmi_state():
         return collect_equipment_state_last_result
 
     # get ipmi status
-    metrics['ipmi_status'].add_metric([], bash_r("ipmitool mc info"))
+    metrics['ipmi_status'].add_metric([], _collect_hardware_command("ipmitool mc info", deadline)[0])
 
     # get cpu info
-    r, cpu_temps = bash_ro("sensors")
+    r, cpu_temps = _collect_hardware_command("sensors", deadline)
     if r == 0:
         count = 0
         for info in cpu_temps.splitlines():
@@ -892,7 +904,7 @@ def collect_ipmi_state():
                     count = count + 1
 
     # get cpu status
-    r, cpu_infos = bash_ro("hd_ctl -c cpu")
+    r, cpu_infos = _collect_hardware_command("hd_ctl -c cpu", deadline)
     if r == 0:
         infos = jsonobject.loads(cpu_infos)
         for info in infos:
@@ -910,7 +922,7 @@ def collect_ipmi_state():
                 send_cpu_status_alarm_to_mn(cpu_id, info.Status)
                 
     # get physical memory info
-    r, memory_infos = bash_ro("hd_ctl -c memory")
+    r, memory_infos = _collect_hardware_command("hd_ctl -c memory", deadline)
     if r == 0:
         memory_locator_list = collect_memory_locator()
         infos = jsonobject.loads(memory_infos)
@@ -937,7 +949,7 @@ def collect_ipmi_state():
 
     # get fan info
     origin_fan_flag = False
-    r, fan_infos = bash_ro("hd_ctl -c fan")
+    r, fan_infos = _collect_hardware_command("hd_ctl -c fan", deadline)
     if r == 0:
         infos = jsonobject.loads(fan_infos)
         for info in infos.fan_list:
@@ -1144,6 +1156,7 @@ def get_power_info_from_ipmi(sensor_info, metrics):
 
 
 def collect_equipment_state_from_ipmi():
+    deadline = monotonic_time() + HARDWARE_COLLECTION_TIMEOUT
     metrics = {
         'power_supply': GaugeMetricFamily('power_supply', 'power supply', None, ['ps_id']),
         "power_supply_current_output_power": GaugeMetricFamily('power_supply_current_output_power',
@@ -1159,7 +1172,7 @@ def collect_equipment_state_from_ipmi():
     if is_virtual_machine():
         return metrics.values()
 
-    metrics['ipmi_status'].add_metric([], bash_r("ipmitool mc info"))
+    metrics['ipmi_status'].add_metric([], _collect_hardware_command("ipmitool mc info", deadline)[0])
 
     '''
         ================
@@ -1213,13 +1226,14 @@ def collect_equipment_state_from_ipmi():
 
 
 def collect_equipment_state():
+    deadline = monotonic_time() + HARDWARE_COLLECTION_TIMEOUT
     metrics = {
         'power_supply': GaugeMetricFamily('power_supply',
                                           'power supply', None, ['ps_id']),
         'ipmi_status': GaugeMetricFamily('ipmi_status', 'ipmi status', None, []),
     }
 
-    r, ps_info = bash_ro("ipmitool sdr type 'power supply'")  # type: (int, str)
+    r, ps_info = _collect_hardware_command("ipmitool sdr type 'power supply'", deadline)  # type: (int, str)
     if r == 0:
         for info in ps_info.splitlines():
             info = info.strip()
@@ -1227,7 +1241,7 @@ def collect_equipment_state():
             health = 10 if "fail" in info.lower() or "lost" in info.lower() else 0
             metrics['power_supply'].add_metric([ps_id], health)
 
-    metrics['ipmi_status'].add_metric([], bash_r("ipmitool mc info"))
+    metrics['ipmi_status'].add_metric([], _collect_hardware_command("ipmitool mc info", deadline)[0])
     return metrics.values()
 
 
@@ -2350,11 +2364,13 @@ modules:
             if "collectd_exporter" in cmd.binaryPath:
                 start_collectd_exporter(cmd)
             elif "ipmi_exporter" in cmd.binaryPath:
-                if not is_virtual_machine() and is_support_bmc():
-                    start_ipmi_exporter(cmd)
-                else:
+                if is_virtual_machine():
                     logger.info("Current environment is a virtualized environment, skipping ipmi_exporter startup")
                     continue
+                if not is_support_bmc():
+                    logger.info("BMC capability probe failed, skipping ipmi_exporter startup")
+                    continue
+                start_ipmi_exporter(cmd)
             else:
                 start_exporter(cmd)
 
