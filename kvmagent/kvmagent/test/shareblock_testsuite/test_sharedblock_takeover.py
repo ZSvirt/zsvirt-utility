@@ -42,6 +42,11 @@ def _call_vgs_info(plugin):
     return jsonobject.loads(rsp_str)
 
 
+def _call_managed_vgs_info(plugin):
+    rsp_str = plugin.vgs_managed_info(misc.make_a_request({}))
+    return jsonobject.loads(rsp_str)
+
+
 class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
     @classmethod
     def setUpClass(cls):
@@ -49,7 +54,7 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
 
     @pytest_utils.ztest_decorater
     def test_1_vgs_info_after_connect(self):
-        """vgs_info should return VG info including disk details after connect"""
+        """vgs/all reports physical records while vgs/managed keeps the LVM view"""
         iscsi_server = env.get_vm_metadata('self')
         rsp = storage_device_utils.iscsi_login(iscsi_server.ip, "3260")
         self.assertEqual(True, rsp.success, rsp.error)
@@ -60,13 +65,19 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
         rsp = self.connect([blockUuid], [blockUuid], vgUuid, hostUuid, hostId, forceWipe=True)
         self.assertEqual(True, rsp.success, rsp.error)
 
-        # call vgs_info
         plugin = sharedblock_utils.get_sharedblock_plugin()
         rsp = _call_vgs_info(plugin)
         self.assertEqual(True, rsp.success, rsp.error)
-        self.assertTrue(rsp.groupDiskInfos is not None, "groupDiskInfos should not be None")
+        self.assertTrue(rsp.vgDiskInfos is not None, "vgDiskInfos should not be None")
+        matches = [info for info in rsp.vgDiskInfos
+                   if info.vgUuid == vgUuid and info.disk.wwid == blockUuid]
+        self.assertEqual(1, len(matches),
+                         "physical VG/LUN record not found in vgs/all: %s" % rsp.vgDiskInfos)
+
+        rsp = _call_managed_vgs_info(plugin)
+        self.assertEqual(True, rsp.success, rsp.error)
         self.assertTrue(rsp.groupDiskInfos.hasattr(vgUuid),
-                        "vgUuid %s not found in groupDiskInfos: %s" % (vgUuid, rsp.groupDiskInfos))
+                        "vgUuid %s not found in vgs/managed: %s" % (vgUuid, rsp.groupDiskInfos))
 
     @pytest_utils.ztest_decorater
     def test_2_takeover_same_vg_uuid(self):

@@ -3077,9 +3077,84 @@ def _resolve_vgs_info(o, tag):
     return groupDiskInfos
 
 
+def _get_block_device_node_path(block_device):
+    if block_device.multipathPath:
+        return "/dev/mapper/%s" % block_device.multipathPath
+    if block_device.dev_name:
+        return "/dev/%s" % block_device.dev_name
+    return None
+
+
+def _parse_pvck_vg_summary(output, tag):
+    vg_match = re.search(r"# vgname\s+(\S+)", output or "")
+    if vg_match is None:
+        return None
+
+    header = (output or "").split("logical_volumes {", 1)[0]
+    tags_match = re.search(r"^tags\s*=\s*\[(.*?)\]", header, re.MULTILINE | re.DOTALL)
+    tags = re.findall(r'"([^"]+)"', tags_match.group(1)) if tags_match else []
+    if not any(t.startswith(tag) for t in tags):
+        return None
+
+    pv_count = len(re.findall(r"^pv\d+\s*\{", header, re.MULTILINE))
+    if pv_count == 0:
+        return None
+
+    return vg_match.group(1), pv_count
+
+
+def _to_vg_disk_infos(group_disk_infos):
+    vg_disk_infos = []
+    for vg_uuid, disk_info in group_disk_infos.items():
+        for block_device in disk_info["disks"]:
+            vg_disk_infos.append({
+                "vgUuid": vg_uuid,
+                "diskCount": disk_info["diskCount"],
+                "disk": dict(block_device.__dict__),
+            })
+    return vg_disk_infos
+
+
+def _scan_unreported_vg_disk_infos(tag, reported_wwids=None):
+    """Raw-scan only LUNs that the full LVM view did not already report."""
+    reported = set(w.strip().lower() for w in (reported_wwids or []) if w and w.strip())
+    vg_disk_infos = []
+    for block_device in get_block_devices():
+        if not block_device.wwid:
+            continue
+        if block_device.wwid.strip().lower() in reported:
+            continue
+
+        device_path = _get_block_device_node_path(block_device)
+        if device_path is None:
+            continue
+
+        r, o, e = bash.bash_roe(
+            "set -o pipefail; timeout -s SIGKILL 30 pvck "
+            "--config 'devices/filter=[\"a|.*|\"] devices/global_filter=[\"a|.*|\"]' "
+            "--dump metadata %s 2>&1 | sed -n '1,/^logical_volumes {/p'" %
+            linux.shellquote(device_path))
+        if r != 0:
+            logger.debug("skip raw VG metadata scan for %s: %s" % (device_path, e or o))
+            continue
+
+        vg_summary = _parse_pvck_vg_summary(o, tag)
+        if vg_summary is None:
+            continue
+
+        vg_name, pv_count = vg_summary
+        vg_disk_infos.append({
+            "vgUuid": vg_name,
+            "diskCount": pv_count,
+            "disk": dict(block_device.__dict__),
+        })
+
+    return vg_disk_infos
+
+
 @bash.in_bash
 def get_all_vgs(tag):
-    """Full-scan VG view: includes foreign sanlock VGs, bypasses lvm.conf filter."""
+    """Return every physical VG/LUN record; the management node filters managed disks."""
     accept_all_config = (
         '--config \'devices/filter=["a|.*|"] devices/global_filter=["a|.*|"]\''
     )
@@ -3088,7 +3163,12 @@ def get_all_vgs(tag):
         "-o vg_name,pv_count,pv_name,tags --noheadings" % accept_all_config)
     if r != 0:
         raise Exception("get all vgs failed, error: %s" % e)
-    return _resolve_vgs_info(o, tag)
+
+    visible_vgs = _resolve_vgs_info(o, tag)
+    vg_disk_infos = _to_vg_disk_infos(visible_vgs)
+    visible_wwids = [info["disk"]["wwid"] for info in vg_disk_infos]
+    vg_disk_infos.extend(_scan_unreported_vg_disk_infos(tag, visible_wwids))
+    return vg_disk_infos
 
 
 @bash.in_bash

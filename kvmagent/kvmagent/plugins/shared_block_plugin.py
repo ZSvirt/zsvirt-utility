@@ -271,7 +271,7 @@ class TakeoverRsp(AgentRsp):
 class GetVgsInfoRsp(AgentRsp):
     def __init__(self):
         super(GetVgsInfoRsp, self).__init__()
-        self.groupDiskInfos = {}
+        self.vgDiskInfos = []
 
 
 class GetManagedVgsInfoRsp(AgentRsp):
@@ -2267,7 +2267,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
     @kvmagent.replyerror
     def vgs_all_info(self, req):
         rsp = GetVgsInfoRsp()
-        rsp.groupDiskInfos = lvm.get_all_vgs(tag=INIT_TAG)
+        rsp.vgDiskInfos = lvm.get_all_vgs(tag=INIT_TAG)
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
