@@ -10,7 +10,7 @@ from kvmagent.plugins.imagestore import ImageStoreClient
 from zstacklib.utils import jsonobject
 from zstacklib.utils import shell
 from zstacklib.utils import lock
-from zstacklib.utils import lvm, sanlock
+from zstacklib.utils import lvm, lvm_takeover, sanlock
 from zstacklib.utils import list_ops
 from zstacklib.utils import bash
 from zstacklib.utils import qemu_img, qcow2
@@ -271,7 +271,7 @@ class TakeoverRsp(AgentRsp):
 class GetVgsInfoRsp(AgentRsp):
     def __init__(self):
         super(GetVgsInfoRsp, self).__init__()
-        self.groupDiskInfos = {}
+        self.vgDiskInfos = []
 
 
 class GetManagedVgsInfoRsp(AgentRsp):
@@ -2118,6 +2118,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
                     % (cmd.vgUuid, cmd.hostId, cmd.hostUuid, cmd.sharedBlockUuids))
 
         # Step 1: prepare disk paths - all disks are required (consistent with do_connect)
+        logger.info("takeover[1/7] begin prepare disk paths: vgUuid=%s" % cmd.vgUuid)
         diskPaths = set()
         allDiskPaths = set()
 
@@ -2139,135 +2140,54 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
             logger.warn("get exception: %s" % e.message)
             allDiskPaths.add("/dev/sd*")
             allDiskPaths.add("/dev/vd*")
-        logger.info("takeover[1/8] prepared %d disk paths" % len(allDiskPaths))
+        logger.info("takeover[1/7] done prepare %d disk paths: vgUuid=%s" % (len(allDiskPaths), cmd.vgUuid))
 
         # Step 2: configure LVM
+        logger.info("takeover[2/7] begin LVM config: vgUuid=%s" % cmd.vgUuid)
         lvm.config_lvm(cmd.hostId, allDiskPaths, cmd.vgUuid, cmd.hostUuid, DEFAULT_SANLOCK_LV_SIZE,
                        kvmagent.get_host_os_type(), cmd.enableLvmetad)
-        logger.info("takeover[2/8] LVM config applied")
+        logger.info("takeover[2/7] done LVM config: vgUuid=%s" % cmd.vgUuid)
 
         # Step 3: start lock service
+        logger.info("takeover[3/7] begin lock service: vgUuid=%s" % cmd.vgUuid)
         lvm.start_lock_service(cmd.ioTimeout)
-        logger.info("takeover[3/8] lock service started")
+        logger.info("takeover[3/7] done lock service: vgUuid=%s" % cmd.vgUuid)
 
-        # Step 4: find VG on storage by exact WWID match
-        def get_vg_name_by_shared_block_uuid():
-            groupDiskInfos = lvm.get_managed_vgs(tag=INIT_TAG)
-            target_wwids = set(w.strip().lower() for w in cmd.sharedBlockUuids if w and w.strip())
-            matched_vgs = []
-
-            for _vg_uuid, disk_info in groupDiskInfos.items():
-                block_devices = disk_info["disks"]
-                expected_pv_count = disk_info["diskCount"]
-                if any(not bd.wwid for bd in block_devices) or len(block_devices) != expected_pv_count:
-                    logger.warn("skip VG %s: incomplete WWID set" % _vg_uuid)
-                    continue
-                vg_wwids = set(bd.wwid.strip().lower() for bd in block_devices)
-                if target_wwids == vg_wwids:
-                    matched_vgs.append(_vg_uuid)
-
-            if len(matched_vgs) == 0:
-                available = {k: [bd.wwid for bd in v["disks"]]
-                             for k, v in groupDiskInfos.items()}
-                raise Exception("cannot find VG with tag prefix [%s] and exact WWID match. "
-                                "target=%s, available=%s" % (INIT_TAG, cmd.sharedBlockUuids, available))
-            if len(matched_vgs) > 1:
-                raise Exception("found multiple VGs matching the same WWID set: %s" % matched_vgs)
-            return matched_vgs[0]
-
-        vg_uuid_on_storage = get_vg_name_by_shared_block_uuid()
-        logger.info("takeover[4/8] matched VG: %s (target: %s)" % (vg_uuid_on_storage, cmd.vgUuid))
-
-        # Step 5: reset sanlock lockspace and re-establish lock
-        lvm.check_stuck_vglk_and_gllk()
-        retry_times = lvm.get_retry_times_for_checking_vg_lockspace()
-
-        active_vg_uuid = vg_uuid_on_storage
-        drop_lock_on_failure = False
+        # Every takeover normalizes only the selected LUNs through clone import
+        # so their VG/PV identities and sanlock metadata are independent,
+        # regardless of whether the source VG is visible on this cluster.
         try:
-            running_lockspace = sanlock.get_lockspace(vg_uuid_on_storage)
-            if not running_lockspace:
-                drop_lock_on_failure = True
-                logger.info("takeover[5/8] remove stale device maps for %s before lock start" %
-                            vg_uuid_on_storage)
-                lvm.remove_device_map_for_vg(vg_uuid_on_storage, raise_exception=True)
-            else:
-                logger.info("takeover[5/8] skip stale device map cleanup for %s, active lockspace exists: %s" %
-                            (vg_uuid_on_storage, running_lockspace))
-
-            reset_done = False
-            try:
-                lvm.start_vg_lock(vg_uuid_on_storage, cmd.hostId, retry_times)
-            except Exception as e:
-                if running_lockspace:
-                    raise
-                lockspace_after_failed_start = sanlock.get_lockspace(vg_uuid_on_storage)
-                if lockspace_after_failed_start:
-                    raise Exception("lockspace for %s became active after lock start failure, "
-                                    "skip offline reset: %s" %
-                                    (vg_uuid_on_storage, lockspace_after_failed_start))
-                logger.warn("takeover[5/8] initial lock start failed for %s, "
-                            "reset sanlock lockspace and retry: %s" % (vg_uuid_on_storage, str(e)))
-                lvm.reset_sanlock_lockspace(vg_uuid_on_storage, cmd.ioTimeout)
-                lvm.drop_vg_lock(vg_uuid_on_storage)
-                lvm.start_vg_lock(vg_uuid_on_storage, cmd.hostId, retry_times)
-                reset_done = True
-
-            if running_lockspace:
-                logger.info("takeover[5/8] sanlock lockspace already active for %s, skip reset" %
-                            vg_uuid_on_storage)
-            elif not reset_done:
-                lvm.reset_sanlock_lockspace(vg_uuid_on_storage, cmd.ioTimeout)
-                lvm.drop_vg_lock(vg_uuid_on_storage)
-                lvm.start_vg_lock(vg_uuid_on_storage, cmd.hostId, retry_times)
-                logger.info("takeover[5/8] sanlock lockspace reset for %s" % vg_uuid_on_storage)
-            else:
-                logger.info("takeover[5/8] sanlock lockspace reset for %s" % vg_uuid_on_storage)
-
-            lvm.check_gl_lock()
-
-            # Step 6: rename VG to match the target platform's database UUID
-            if vg_uuid_on_storage != cmd.vgUuid:
-                lvm.rename_vg(vg_uuid_on_storage, cmd.vgUuid)
-                active_vg_uuid = cmd.vgUuid
-                logger.info("takeover[6/8] VG renamed %s -> %s" % (vg_uuid_on_storage, cmd.vgUuid))
-                lvm.start_vg_lock(cmd.vgUuid, cmd.hostId, retry_times)
-                drop_lock_on_failure = True
-            else:
-                logger.info("takeover[6/8] VG name already matches, skip rename")
-
-            self.clear_stalled_qmp_socket()
-
-            # Step 7: fix PV state
-            lvm.check_missing_pv(cmd.vgUuid)
-            lvm.update_lockspace_io_timeout_if_need(cmd.vgUuid, cmd.ioTimeout)
-            lvm.reset_pv_uuids(cmd.vgUuid)
-            logger.info("takeover[7/8] PV state fixed for %s" % cmd.vgUuid)
-
-            # Step 8: stamp VG tag with current host info
-            new_tag = "%s::%s::%s::%s" % (INIT_TAG, cmd.hostUuid, time.time(), linux.get_hostname())
-            lvm.update_vg_tag(cmd.vgUuid, INIT_TAG, new_tag)
-            logger.info("takeover[8/8] VG tag updated for %s" % cmd.vgUuid)
+            logger.info("takeover[4/7] begin prepare copied VG: vgUuid=%s" % cmd.vgUuid)
+            lvm_takeover.prepare_takeover_vg(
+                cmd.vgUuid, cmd.sharedBlockUuids, diskPaths, INIT_TAG)
+            logger.info("takeover[4/7] done prepare copied VG: vgUuid=%s" % cmd.vgUuid)
+            logger.info("takeover[5/7] begin lock start: vgUuid=%s" % cmd.vgUuid)
+            lvm_takeover.start_takeover_vg_lock(cmd.vgUuid, diskPaths)
+            logger.info("takeover[5/7] done lock start: vgUuid=%s" % cmd.vgUuid)
         except Exception:
-            if drop_lock_on_failure:
-                logger.warn("takeover failed after lockspace setup, "
-                            "dropping vg lock for %s to allow next host to retry" % active_vg_uuid)
-                try:
-                    lvm.drop_vg_lock(active_vg_uuid)
-                except Exception as drop_err:
-                    logger.warn("drop vg lock failed for %s during takeover cleanup: %s" %
-                                (active_vg_uuid, str(drop_err)))
-            else:
-                logger.warn("takeover failed while lockspace already active for %s, skip dropping vg lock" %
-                            active_vg_uuid)
+            try:
+                lvm.log_vg_lock_diagnostics(cmd.vgUuid, "after takeover preparation/lock start failure", warn=True)
+            except Exception as e:
+                logger.warn("failed to collect takeover diagnostics for %s: %s" % (cmd.vgUuid, e))
             raise
+        logger.info("takeover[6/7] begin PV/lock checks and ioTimeout update: vgUuid=%s" % cmd.vgUuid)
+        self.clear_stalled_qmp_socket()
+        lvm.check_missing_pv(cmd.vgUuid)
+        lvm.update_lockspace_io_timeout_if_need(cmd.vgUuid, cmd.ioTimeout)
+        logger.info("takeover[6/7] done PV/lock checks and ioTimeout update: vgUuid=%s" % cmd.vgUuid)
+        logger.info("takeover[7/7] begin init tag update: vgUuid=%s" % cmd.vgUuid)
+        new_tag = "%s::%s::%s::%s" % (INIT_TAG, cmd.hostUuid, time.time(), linux.get_hostname())
+        lvm_takeover.update_imported_vg_tag(cmd.vgUuid, INIT_TAG, new_tag, diskPaths)
+        logger.info("takeover[7/7] done init tag update: vgUuid=%s" % cmd.vgUuid)
+        logger.info("takeover completed after importing copied VG: vgUuid=%s, disks=%s" %
+                    (cmd.vgUuid, cmd.sharedBlockUuids))
 
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
     def vgs_all_info(self, req):
         rsp = GetVgsInfoRsp()
-        rsp.groupDiskInfos = lvm.get_all_vgs(tag=INIT_TAG)
+        rsp.vgDiskInfos = lvm.get_all_vgs(tag=INIT_TAG)
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
