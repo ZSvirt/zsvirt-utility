@@ -7,6 +7,13 @@ import os
 from zstacklib.utils import log
 from zstacklib.utils import lock
 
+# GNU timeout normally returns 124 on timeout without --preserve-status.
+TIMEOUT_EXIT_CODE = 124
+# Bash encodes termination by SIGKILL (9) as 128 + 9.
+SIGKILL_EXIT_CODE = 137
+# POSIX subprocess returncode is -9 when its child is killed by SIGKILL.
+SIGKILL_RETURN_CODE = -9
+
 # instead of closing [3, ulimit -n)
 def _linux_close_fds(self, but):
     for fd in [ int(n) for n in os.listdir('/proc/%d/fd' % os.getpid()) ]:

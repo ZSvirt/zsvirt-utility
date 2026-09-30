@@ -32,6 +32,7 @@ from kvmagent.plugins.vm_file_uploader import VmFileUploader, VmFileUploadError
 from zstacklib.utils import http, lvm, ceph, form, pci, report, upload_task
 from zstacklib.utils import qemu
 from zstacklib.utils import linux
+from zstacklib.utils.restart_fence import monotonic_time
 from zstacklib.utils import iptables
 from zstacklib.utils import iproute
 from zstacklib.utils import ebtables
@@ -1100,6 +1101,7 @@ class UpdateConfigration(object):
         bash_o("modprobe vfio && modprobe vfio-pci")
 
 logger = log.get_logger(__name__)
+IPMI_COMMAND = "timeout -k 5s 30s ipmitool"
 
 
 def _run_package_post_update_hooks():
@@ -2591,23 +2593,7 @@ class HostPlugin(kvmagent.KvmAgent):
                 libvirtCapabilitiesList.append("blockcopynetworktarget")
             rsp.libvirtCapabilities = libvirtCapabilitiesList
 
-        bmc_version = shell.call("ipmitool mc info | grep 'Firmware Revision' | awk -F ':' '{print $2}'").strip()
-        rsp.bmcVersion = bmc_version if bmc_version else 'unknown'
-
-        # To see which lan the BMC is listening on, try the following (1-11), https://wiki.docking.org/index.php/Configuring_IPMI
-        for channel in range(1, 12):
-            '''     
-            example:
-            except result:         IP Address              : xxx.xxx.xxx.xxx 
-            set ipmi_address "None" when got results unexpected or happened some errors   
-            '''
-            ret, out, err = bash_roe("ipmitool lan print %s | grep -w 'IP Address'| grep -v 'Source'" % channel)
-            if ret == 0 and out != "":
-                rsp.ipmiAddress = out.split(":")[1].strip()
-                break
-            else:
-                rsp.ipmiAddress = 'None'
-                logger.debug("failed to get ipmi address from BMC lan channel [%s], because %s" % (channel, err))
+        self._collect_ipmi_info(rsp)
 
         if IS_AARCH64:
             # FIXME how to check vt of aarch64?
@@ -3350,10 +3336,41 @@ done
         return jsonobject.dumps(rsp)
 
 
+    def _collect_ipmi_info(self, rsp):
+        deadline = monotonic_time() + 30
+
+        def collect(arguments):
+            remaining = deadline - monotonic_time()
+            if remaining <= 0:
+                return shell.TIMEOUT_EXIT_CODE, '', 'IPMI discovery budget exhausted'
+            return bash_roe("timeout -k 5s %.3fs ipmitool %s" % (max(0.001, remaining), arguments))
+
+        ret, info, _ = collect("mc info")
+        version = re.search(r'(?m)^\s*Firmware Revision\s*:\s*(\S+)', info) if ret == 0 else None
+        rsp.bmcVersion = version.group(1) if version else 'unknown'
+        rsp.ipmiAddress = 'None'
+        if ret in (shell.TIMEOUT_EXIT_CODE, shell.SIGKILL_EXIT_CODE):
+            return
+
+        for channel in range(1, 12):
+            ret, out, err = collect("lan print %s" % channel)
+            address = re.search(r'(?m)^\s*IP Address\s*:\s*(\S+)', out) if ret == 0 else None
+            if address:
+                rsp.ipmiAddress = address.group(1)
+                break
+            logger.debug("failed to get ipmi address from BMC lan channel [%s], because %s" % (channel, err))
+            if ret in (shell.TIMEOUT_EXIT_CODE, shell.SIGKILL_EXIT_CODE):
+                break
+
     def identify_host(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = kvmagent.AgentResponse()
-        sc = shell.ShellCmd("ipmitool chassis identify %s" % cmd.interval)
+        interval = str(cmd.interval)
+        if not re.match(r'\A[0-9]{1,3}\Z', interval) or not 0 <= int(interval) <= 255:
+            rsp.success = False
+            rsp.error = "identify interval must be an integer between 0 and 255"
+            return jsonobject.dumps(rsp)
+        sc = shell.ShellCmd(IPMI_COMMAND + " chassis identify %s" % shell_quote(str(int(interval))))
         sc(True)
         return jsonobject.dumps(rsp)
 

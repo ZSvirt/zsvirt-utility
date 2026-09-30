@@ -4453,8 +4453,10 @@ def is_virtual_machine():
     return product_name == "KVM Virtual Machine" or product_name == "KVM" or product_name == "VMware Virtual Platform"
 
 def is_support_bmc():
-    cmd = shell.ShellCmd("ipmitool mc info")
+    cmd = shell.ShellCmd("timeout -k 5s 30s ipmitool mc info")
     cmd(is_exception=False)
+    if cmd.return_code in (shell.TIMEOUT_EXIT_CODE, shell.SIGKILL_EXIT_CODE, shell.SIGKILL_RETURN_CODE):
+        logger.warn("BMC capability probe timed out, skipping IPMI monitoring")
     if cmd.return_code != 0:
         return False
     return True
