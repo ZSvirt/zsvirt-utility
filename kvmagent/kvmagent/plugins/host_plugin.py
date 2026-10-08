@@ -4,6 +4,7 @@
 '''
 import base64
 import copy
+import errno
 import hashlib
 import os
 import os.path
@@ -4466,7 +4467,16 @@ done
             pf_net = pf_path + '/net'
             for name in os.listdir(pf_net) if os.path.isdir(pf_net) else []:
                 port = pf_net + '/' + name + '/phys_port_name'
-                match = re.search(r'(?:^|pf[0-9]+)vf([0-9]+)$', _read(port)) if os.path.exists(port) else None
+                if not os.path.exists(port):
+                    continue
+                try:
+                    port_name = _read(port)
+                except (IOError, OSError) as error:
+                    # Normal PFs may expose this attribute without driver support.
+                    if error.errno in (errno.EOPNOTSUPP, errno.ENOTSUP):
+                        continue
+                    raise
+                match = re.search(r'(?:^|pf[0-9]+)vf([0-9]+)$', port_name)
                 if match:
                     vf = os.path.basename(os.path.realpath(pf_path + '/virtfn' + match.group(1)))
                     if vf in drivers:

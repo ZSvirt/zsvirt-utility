@@ -26,6 +26,7 @@ class FakeKernel:
         self.links = {}
         self.events = []
         self.failures = {}
+        self.read_errors = {}
         self.denied = set()
         self.vfs = VF_ADDRESSES[:count]
         self.driver = driver
@@ -44,6 +45,11 @@ class FakeKernel:
         self.mkdir('/proc/sys/net/ipv6')
         self.add_file('/proc/net/packet', 'sk RefCnt Type Proto Iface R Rmem User Inode\n')
         self.links[PF_PATH + '/driver'] = '/sys/bus/pci/drivers/txgbe'
+        self.mkdir(PF_PATH + '/net')
+        self.links[PF_PATH + '/net/eth11'] = '/sys/class/net/eth11'
+        self.mkdir('/sys/class/net/eth11')
+        self.links['/sys/class/net/eth11/device'] = PF_PATH
+        self.add_file('/sys/class/net/eth11/phys_port_name', '')
         for index, address in enumerate(self.vfs):
             path = '/sys/bus/pci/devices/' + address
             self.mkdir(path)
@@ -105,6 +111,11 @@ class FakeKernel:
         fs = self
 
         class Stream(io.StringIO):
+            def read(self, *args):
+                if path in fs.read_errors:
+                    raise fs.read_errors[path]
+                return super().read(*args)
+
             def __exit__(self, exc_type, exc_value, traceback):
                 if mode == 'w' and exc_type is None:
                     fs.write(path, self.getvalue())
@@ -216,7 +227,9 @@ class SriovNetworkTests(unittest.TestCase):
         start = source.index('    def _ungenerate_sriov_net_devices(')
         end = source.index('\n    @', start)
         self.module_os = self.fs.module_os()
+        # The handler runs on Linux, where EOPNOTSUPP and ENOTSUP are both 95.
         namespace = {'os': self.module_os, 're': __import__('re'),
+                     'errno': SimpleNamespace(EOPNOTSUPP=95, ENOTSUP=95),
                      'shell_quote': shlex.quote, 'bash_roe': self.fs.run, 'open': self.fs.open}
         exec(compile(ast.parse(textwrap.dedent(source[start:end])), str(HOST_SOURCE), 'exec'), namespace)
         self.disable = namespace['_ungenerate_sriov_net_devices']
@@ -321,8 +334,48 @@ class SriovNetworkTests(unittest.TestCase):
                 self.fs.mkdir('/sys/bus/pci/devices/' + self.fs.vfs[-1] + '/' + kind + '/device0')
                 self.assert_blocked('mlx5_core.*' + kind + ' endpoints require userspace usage verification')
 
+    def unsupported_pf_port_name(self):
+        path = '/sys/class/net/eth11/phys_port_name'
+        self.assertTrue(self.fs.exists(PF_PATH + '/net/eth11/phys_port_name'))
+        self.fs.read_errors[path] = OSError(95, 'Operation not supported', path)
+
+    def test_pf_port_name_unsupported_allows_idle_bound_vfs(self):
+        for driver in ('txgbevf', 'ixgbevf', 'iavf'):
+            with self.subTest(driver=driver):
+                self.use_kernel(FakeKernel(driver=driver))
+                self.unsupported_pf_port_name()
+                response = self.invoke()
+                self.assertTrue(response.success, response.error)
+                self.assertEqual([('unbind', vf) for vf in self.fs.vfs] +
+                                 [('sriov_numvfs', '0')], self.fs.events)
+
+    def test_pf_port_name_unsupported_allows_already_unbound_vfs(self):
+        self.use_kernel(FakeKernel(driver=None))
+        self.unsupported_pf_port_name()
+        response = self.invoke()
+        self.assertTrue(response.success, response.error)
+        self.assertEqual([('sriov_numvfs', '0')], self.fs.events)
+
+    def test_pf_port_name_other_read_errors_still_block(self):
+        for code in (errno.EACCES, errno.EIO, errno.ENOENT, errno.ENODEV, errno.EINVAL):
+            with self.subTest(errno=code):
+                path = '/sys/class/net/eth11/phys_port_name'
+                self.fs.read_errors[path] = OSError(code, 'PF attribute read failed', path)
+                self.assert_blocked('PF attribute read failed')
+
+    def test_unsupported_pf_port_name_does_not_bypass_vf_usage_checks(self):
+        self.unsupported_pf_port_name()
+        self.fs.files['/sys/class/net/eth86/flags'] = '0x1003'
+        self.assert_blocked('eth86.*UP')
+
+    def test_unsupported_error_on_other_sysfs_attributes_still_blocks(self):
+        path = '/sys/class/net/eth86/flags'
+        self.fs.read_errors[path] = OSError(95, 'flags read failed', path)
+        self.assert_blocked('flags read failed')
+
     def test_pf_representor_requires_switchdev_cleanup(self):
         self.use_kernel(FakeKernel(driver='bnxt_en'))
+        self.unsupported_pf_port_name()
         self.fs.add_file(PF_PATH + '/net/rep3/phys_port_name', 'pf0vf3')
         self.assert_blocked(r'VF\[0000:42:10.7\].*bnxt_en.*rep3.*switchdev cleanup')
 
