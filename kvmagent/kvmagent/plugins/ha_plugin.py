@@ -105,6 +105,12 @@ class ReportSelfFencerCmd(object):
         self.fencerFailure = None
 
 
+class FencerStateRsp(AgentRsp):
+    def __init__(self):
+        super(FencerStateRsp, self).__init__()
+        self.psUuids = None
+
+
 class AbstractHaFencer(object):
     _ha_fencers = {}
 
@@ -1701,6 +1707,7 @@ class HaPlugin(kvmagent.KvmAgent):
     SETUP_CBD_SELF_FENCER_PATH = "/ha/cbd/setupselffencer"
     CANCEL_CBD_SELF_FENCER_PATH = "/ha/cbd/cancelselffencer"
     CBD_CHECK_VMSTATE_PATH = "/cbd/check/vmstate"
+    FENCER_STATE_PATH = "/ha/selffencer/state"
 
     RET_SUCCESS = "success"
     RET_FAILURE = "failure"
@@ -1720,6 +1727,7 @@ class HaPlugin(kvmagent.KvmAgent):
         self.abstract_ha_fencer_checker = {}
         self.vpc_uuids = []
         self.vpc_lock = threading.RLock()
+        self.fencer_storage_list = set()
 
     @kvmagent.replyerror
     def cancel_ceph_self_fencer(self, req):
@@ -2250,7 +2258,8 @@ class HaPlugin(kvmagent.KvmAgent):
             if host_storage_name in fencer_list:
                 fencer_list.append(ceph_controller.get_ha_fencer_name())
 
-            self.setup_fencer(get_fencer_key(ps_uuid, pool_name), created_time)
+            self.setup_fencer(get_fencer_key(ps_uuid, pool_name),
+                              created_time, origin_uuid=ps_uuid)
 
             ha_fencer = AbstractHaFencer(cmd.interval, cmd.maxAttempts, cmd.vgUuid, fencer_list)
             update_fencer = True
@@ -2585,6 +2594,12 @@ class HaPlugin(kvmagent.KvmAgent):
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
+    def get_fencer_state(self, req):
+        rsp = FencerStateRsp()
+        rsp.psUuids = list(self.fencer_storage_list)
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
     def add_vm_fencer_rule_to_host(self, req):
         rsp = AgentRsp()
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
@@ -2635,6 +2650,7 @@ class HaPlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.SETUP_CBD_SELF_FENCER_PATH, self.setup_cbd_self_fencer)
         http_server.register_async_uri(self.CANCEL_CBD_SELF_FENCER_PATH, self.cancel_cbd_self_fencer)
         http_server.register_async_uri(self.CBD_CHECK_VMSTATE_PATH, self.cbd_check_vmstate)
+        http_server.register_async_uri(self.FENCER_STATE_PATH, self.get_fencer_state)
 
 
 
@@ -2720,10 +2736,15 @@ class HaPlugin(kvmagent.KvmAgent):
             self.run_fencer_timestamp[ps_uuid] = created_time
             return True
 
-    def setup_fencer(self, ps_uuid, created_time):
+    def setup_fencer(self, ps_uuid, created_time, origin_uuid=None):
         with self.fencer_lock:
             logger.debug('setup fencer for ps: %s, create time: %d' % (ps_uuid, created_time))
             self.run_fencer_timestamp[ps_uuid] = created_time
+
+            if origin_uuid is not None:
+                self.fencer_storage_list.add(origin_uuid)
+            else:
+                self.fencer_storage_list.add(ps_uuid)
 
     def cancel_fencer(self, ps_uuid):
         with self.fencer_lock:
@@ -2732,3 +2753,5 @@ class HaPlugin(kvmagent.KvmAgent):
                     logger.debug('cancel fencer for ps: %s, with fencer key: %s' % (ps_uuid, key))
                     self.run_fencer_timestamp.pop(key, None)
                     self.sblk_health_checker.delvg(ps_uuid)  # ugly ...
+            if ps_uuid in self.fencer_storage_list:
+                self.fencer_storage_list.remove(ps_uuid)
