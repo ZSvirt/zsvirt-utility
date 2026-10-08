@@ -4284,6 +4284,7 @@ done
 
 
     @in_bash
+    @lock.lock("sriov-net-devices")
     def _generate_sriov_net_devices(self, cmd, rsp):
         numvfs = os.path.join('/sys/bus/pci/devices/', cmd.pciDeviceAddress, 'sriov_numvfs')
         if not os.path.exists(numvfs):
@@ -4342,45 +4343,179 @@ done
 
 
     @in_bash
+    @lock.lock("sriov-net-devices")
     def _ungenerate_sriov_net_devices(self, cmd, rsp):
-        numvfs = os.path.join('/sys/bus/pci/devices/', cmd.pciDeviceAddress, 'sriov_numvfs')
-        if not os.path.exists(numvfs):
-            rsp.success = False
-            rsp.error = 'cannot find sriov_numvfs file for pci device[addr:%s, type:%s]' % (cmd.pciDeviceAddress, cmd.pciDeviceType)
-            return
+        import xml.etree.ElementTree as ET
 
-        def _check_allocated_virtual_functions():
-            _addr = cmd.pciDeviceAddress
+        detached = []
+        drivers = {}
+        address = cmd.pciDeviceAddress.lower()
+        if re.match(r'^[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$', address):
+            address = '0000:' + address
+        pf_path = os.path.join('/sys/bus/pci/devices', address)
+        numvfs = os.path.join(pf_path, 'sriov_numvfs')
 
-            if len(_addr.split(':')) != 3:
-                _addr = '0000:' + _addr
+        def _read(path):
+            with open(path) as stream:
+                return stream.read().strip()
 
-            pf = "pci_%s_%s_%s_%s" % tuple(re.split(':|\.', _addr))
-            r, vf_lines, e = bash_roe("virsh nodedev-dumpxml %s | grep 'address domain'" % pf)
+        def _write(path, value):
+            if not os.path.exists(path):
+                raise RuntimeError('cannot find sysfs attribute[%s]' % path)
+            with open(path, 'w') as stream:
+                stream.write(value)
+
+        def _run(command):
+            r, o, e = bash_roe("timeout -k 5s 15s " + command)
             if r != 0:
-                return "failed to run `virsh nodedev-dumpxml %s`: %s" % (pf, e)
+                raise RuntimeError('command[%s] failed: %s' % (command, e or o))
+            return o.strip()
 
-            pattern = re.compile(r'.*0x([0-9a-f]*).*0x([0-9a-f]*).*0x([0-9a-f]*).*0x([0-9a-f]*).*')
-            for vf_line in vf_lines.split('\n'):
-                vf_line = vf_line.strip()
-                match = pattern.match(vf_line)
+        def _driver(vf):
+            path = os.path.join('/sys/bus/pci/devices', vf, 'driver')
+            return os.path.basename(os.path.realpath(path)) if os.path.islink(path) else None
+
+        def _vfs():
+            vfs = [os.path.basename(os.path.realpath(os.path.join(pf_path, name)))
+                   for name in sorted(os.listdir(pf_path)) if re.match(r'^virtfn[0-9]+$', name)]
+            if len(set(vfs)) != int(_read(numvfs)) or len(set(vfs)) != len(vfs):
+                raise RuntimeError('VF topology changed; retry after device discovery')
+            for vf in vfs:
+                if os.path.realpath('/sys/bus/pci/devices/%s/physfn' % vf) != os.path.realpath(pf_path):
+                    raise RuntimeError('cannot verify PF ownership of VF[%s]' % vf)
+            return vfs
+
+        def _busy(vf, owner):
+            raise RuntimeError('VF[%s], driver[%s], used by[%s]' % (vf, drivers[vf] or 'unbound', owner))
+
+        def _check_net(vf):
+            vf_path = '/sys/bus/pci/devices/' + vf
+            # Bifurcated DPDK/RDMA can use the VF while its kernel netdev is DOWN.
+            for kind in ('infiniband', 'infiniband_verbs', 'uio'):
+                path = vf_path + '/' + kind
+                if os.path.isdir(path) and os.listdir(path):
+                    _busy(vf, '%s endpoints require userspace usage verification' % kind)
+            net_path = vf_path + '/net'
+            names = os.listdir(net_path) if os.path.isdir(net_path) else []
+            if not names:
+                _busy(vf, 'no visible host network interface; cannot verify usage')
+            for name in names:
+                net = '/sys/class/net/' + name
+                if os.path.realpath(net + '/device') != os.path.realpath('/sys/bus/pci/devices/' + vf):
+                    _busy(vf, 'netdev[%s] is outside the host network namespace or has changed' % name)
+                if int(_read(net + '/flags'), 0) & 1:
+                    _busy(vf, 'netdev[%s] is administratively UP' % name)
+                for entry in os.listdir(net):
+                    if entry == 'master' or entry.startswith('upper_'):
+                        _busy(vf, 'netdev[%s] attached to[%s]' %
+                              (name, os.path.basename(os.path.realpath(net + '/' + entry))))
+                if re.search(r'\binet6?\s', _run('ip -o addr show dev %s' % shell_quote(name))):
+                    _busy(vf, 'netdev[%s] has IP addresses' % name)
+                families = ['-4', '-6'] if os.path.isdir('/proc/sys/net/ipv6') else ['-4']
+                for family in families:
+                    routes = _run('ip %s -o route show table all dev %s' % (family, shell_quote(name)))
+                    if routes:
+                        _busy(vf, 'netdev[%s] has routes[%s]' % (name, routes))
+                if os.path.exists('/etc/sysconfig/network-scripts/ifcfg-' + name):
+                    _busy(vf, 'netdev[%s] has persistent host network configuration' % name)
+                if os.path.exists('/var/run/openvswitch/db.sock'):
+                    owner = _run('ovs-vsctl --timeout=10 --if-exists get Interface %s name' % shell_quote(name))
+                    if owner and owner != '[]':
+                        _busy(vf, 'OVS interface[%s]' % name)
+            return names
+
+        def _check_vms():
+            domains = set(_run('virsh list --all --uuid').split())
+            persistent = set(_run('virsh list --all --persistent --uuid').split())
+            for domain in domains | persistent:
+                options = ['', ' --inactive'] if domain in persistent else ['']
+                for option in options:
+                    xml = ET.fromstring(_run('virsh dumpxml %s%s' % (shell_quote(domain), option)))
+                    owner = 'VM[%s]' % (xml.findtext('name') or domain)
+                    sources = (xml.findall('./devices/hostdev/source') +
+                               xml.findall('./devices/interface/source') +
+                               xml.findall('./devices/interface/actual/source'))
+                    for source in sources:
+                        for addr in source.findall('address'):
+                            keys = ('domain', 'bus', 'slot', 'function')
+                            if all(addr.get(key) is not None for key in keys):
+                                vf = '%04x:%02x:%02x.%x' % tuple(int(addr.get(key), 0) for key in keys)
+                                if vf in drivers:
+                                    _busy(vf, owner)
+                        for vf, names in interfaces.items():
+                            if source.get('dev') in names:
+                                _busy(vf, owner + ' network interface')
+
+        try:
+            if not re.match(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$', address):
+                raise RuntimeError('invalid PCI address[%s]' % address)
+            if not os.path.exists(numvfs):
+                raise RuntimeError('cannot find sriov_numvfs file')
+            vfs = _vfs()
+            if not vfs:
+                return
+            drivers = dict((vf, _driver(vf)) for vf in vfs)
+            for vf, driver in drivers.items():
+                if driver and (driver.startswith('vfio') or driver in ('igb_uio', 'uio_pci_generic', 'pci-stub')):
+                    _busy(vf, 'passthrough/userspace driver binding')
+                if driver:
+                    for attribute in ('bind', 'unbind'):
+                        if not os.path.exists('/sys/bus/pci/drivers/%s/%s' % (driver, attribute)):
+                            _busy(vf, 'driver has no %s attribute; cannot safely release and restore VF' % attribute)
+            # PF representors need switchdev cleanup before removing their VFs.
+            pf_net = pf_path + '/net'
+            for name in os.listdir(pf_net) if os.path.isdir(pf_net) else []:
+                port = pf_net + '/' + name + '/phys_port_name'
+                match = re.search(r'(?:^|pf[0-9]+)vf([0-9]+)$', _read(port)) if os.path.exists(port) else None
                 if match:
-                    vf = "pci_%s_%s_%s_%s" % tuple(match.groups())
-                    r, o, e = bash_roe("virsh nodedev-dumpxml %s | grep vfio-pci" % vf)
-                    if r == 0:
-                        return "virtual function %s of pf %s still allocated to some vm" % (vf, pf)
-
-        _error = _check_allocated_virtual_functions()
-        if _error:
+                    vf = os.path.basename(os.path.realpath(pf_path + '/virtfn' + match.group(1)))
+                    if vf in drivers:
+                        _busy(vf, 'PF representor[%s] requires switchdev cleanup' % name)
+            # Check every bound host VF before releasing any of their drivers.
+            targets = [vf for vf in vfs if drivers[vf]]
+            interfaces = dict((vf, _check_net(vf)) for vf in targets)
+            _check_vms()
+            if _vfs() != vfs or any(_driver(vf) != drivers[vf] for vf in vfs):
+                raise RuntimeError('VF topology or driver changed during usage checks; retry')
+            for vf in targets:
+                _check_net(vf)
+                if _driver(vf) != drivers[vf]:
+                    raise RuntimeError('VF[%s] driver changed before unbind; retry' % vf)
+                # Record the attempt so an ambiguous sysfs write failure can also recover.
+                detached.append(vf)
+                _write('/sys/bus/pci/devices/%s/driver/unbind' % vf, vf)
+                if _driver(vf):
+                    raise RuntimeError('VF[%s] is still bound after unbind' % vf)
+            _check_vms()
+            if _vfs() != vfs or any(_driver(vf) for vf in vfs):
+                raise RuntimeError('VF topology or driver changed before disable; retry')
+            _run('lspci >/dev/null && echo 0 > %s' % shell_quote(numvfs))
+            if _vfs():
+                raise RuntimeError('VFs still exist after writing sriov_numvfs=0')
+        except Exception as error:
+            recovery = []
+            for vf in reversed(detached):
+                try:
+                    if os.path.realpath('/sys/bus/pci/devices/%s/physfn' % vf) != os.path.realpath(pf_path):
+                        raise RuntimeError('VF no longer belongs to this PF')
+                    current = _driver(vf)
+                    if current == drivers[vf]:
+                        continue
+                    if current:
+                        raise RuntimeError('VF now uses driver[%s]; refusing to replace it' % current)
+                    _write('/sys/bus/pci/drivers/%s/bind' % drivers[vf], vf)
+                    if _driver(vf) != drivers[vf]:
+                        raise RuntimeError('original driver did not bind')
+                except Exception as restore_error:
+                    recovery.append('VF[%s], driver[%s]: %s' % (vf, drivers[vf], restore_error))
             rsp.success = False
-            rsp.error = _error
-            return
-
-        r, o, e = bash_roe("lspci >/dev/null && echo 0 > %s" % numvfs)
-        if r != 0:
-            rsp.success = False
-            rsp.error = 'failed to ungenerate virtual functions on pci device[addr:%s, type:%s]' % (cmd.pciDeviceAddress, cmd.pciDeviceType)
-            return
+            rsp.error = 'failed to ungenerate virtual functions on pci device[addr:%s, type:%s]: %s' % (
+                address, cmd.pciDeviceType, error)
+            if drivers:
+                rsp.error += '; VF bindings[%s]' % ', '.join('%s:%s' % (vf, driver or 'unbound')
+                                                           for vf, driver in sorted(drivers.items()))
+            if recovery:
+                rsp.error += '; failed to restore VF drivers: ' + '; '.join(recovery)
 
 
     @kvmagent.replyerror
