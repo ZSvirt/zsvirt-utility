@@ -1,6 +1,6 @@
-"""Offline SR-IOV lifecycle tests. No real PCI/sysfs writes or Linux commands.
+"""SR-IOV unit tests for host_plugin using simulated Linux/sysfs boundaries.
 
-Run: python -B -m unittest discover -s tests/offline -p test_sriov_network_device.py -v
+Run with Python 3: python -B tests/unit/kvmagent/test_sriov_network_device.py
 """
 import ast
 import errno
@@ -12,7 +12,7 @@ import textwrap
 from types import SimpleNamespace
 import unittest
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 PF = '0000:42:00.1'
 PF_PATH = '/sys/bus/pci/devices/' + PF
 VF_ADDRESSES = ['0000:42:10.%s' % value for value in (1, 3, 5, 7)] + [
