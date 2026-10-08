@@ -1727,7 +1727,8 @@ class HaPlugin(kvmagent.KvmAgent):
         self.abstract_ha_fencer_checker = {}
         self.vpc_uuids = []
         self.vpc_lock = threading.RLock()
-        self.fencer_storage_list = set()
+        # ps_uuid -> {generation, expected, alive}
+        self.fencer_workers = {}
 
     @kvmagent.replyerror
     def cancel_ceph_self_fencer(self, req):
@@ -1775,6 +1776,12 @@ class HaPlugin(kvmagent.KvmAgent):
 
         @thread.AsyncThread
         def heartbeat_on_aliyunnas():
+            try:
+                _try_heartbeats()
+            finally:
+                self.mark_fencer_dead(cmd.uuid, cmd.uuid, created_time)
+
+        def _try_heartbeats():
             failure = 0
 
             while self.run_fencer(cmd.uuid, created_time):
@@ -1858,6 +1865,12 @@ class HaPlugin(kvmagent.KvmAgent):
 
         @thread.AsyncThread
         def heartbeat_on_block():
+            try:
+                _try_heartbeats()
+            finally:
+                self.mark_fencer_dead(cmd.uuid, cmd.uuid, created_time)
+
+        def _try_heartbeats():
             failure = 0
 
             while self.run_fencer(cmd.uuid, created_time):
@@ -1955,6 +1968,8 @@ class HaPlugin(kvmagent.KvmAgent):
                 content = traceback.format_exc()
                 logger.warn(content)
                 self.report_storage_status([cmd.uuid], self.STORAGE_DISCONNECTED)
+            finally:
+                self.mark_fencer_dead(ps_uuid, ps_uuid, created_time)
 
         heartbeat_on_cbd(cmd.uuid, cmd.coveringPaths)
         return jsonobject.dumps(AgentRsp())
@@ -2034,6 +2049,8 @@ class HaPlugin(kvmagent.KvmAgent):
                 content = traceback.format_exc()
                 logger.warn(content)
                 self.report_storage_status([cmd.uuid], self.STORAGE_DISCONNECTED)
+            finally:
+                self.mark_fencer_dead(ps_uuid, ps_uuid, created_time)
 
         heartbeat_on_iscsi(cmd.uuid, cmd.coveringPaths)
         return jsonobject.dumps(AgentRsp())
@@ -2196,6 +2213,7 @@ class HaPlugin(kvmagent.KvmAgent):
 
         created_time = time.time()
         self.setup_fencer(cmd.vgUuid, created_time)
+        self.mark_fencer_alive(cmd.vgUuid, cmd.vgUuid, created_time)
         self.sblk_health_checker.addvg(created_time, cmd)
 
         def init_fencer_params(cmd):
@@ -2294,7 +2312,12 @@ class HaPlugin(kvmagent.KvmAgent):
                 content = traceback.format_exc()
                 logger.warn(content)
                 self.report_storage_status([cmd.uuid], self.STORAGE_DISCONNECTED)
+            finally:
+                self.mark_fencer_dead(ps_uuid, get_fencer_key(ps_uuid, pool_name), created_time)
 
+        self.begin_fencer_generation(cmd.uuid, created_time, [
+            get_fencer_key(cmd.uuid, pool_name) for pool_name in cmd.poolNames
+        ])
         for pool_name in cmd.poolNames:
             heartbeat_on_ceph(cmd.uuid, pool_name)
 
@@ -2374,6 +2397,8 @@ class HaPlugin(kvmagent.KvmAgent):
             except:
                 content = traceback.format_exc()
                 logger.warn(content)
+            finally:
+                self.mark_fencer_dead(ps_uuid, ps_uuid, created_time)
 
         for mount_path, uuid, mounted_by_zstack, url, options in zip(cmd.mountPaths, cmd.uuids, cmd.mountedByZStack, cmd.urls, cmd.mountOptions):
             if not linux.timeout_isdir(mount_path):
@@ -2596,7 +2621,7 @@ class HaPlugin(kvmagent.KvmAgent):
     @kvmagent.replyerror
     def get_fencer_state(self, req):
         rsp = FencerStateRsp()
-        rsp.psUuids = list(self.fencer_storage_list)
+        rsp.psUuids = self.get_alive_fencer_ps_uuids()
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
@@ -2734,17 +2759,60 @@ class HaPlugin(kvmagent.KvmAgent):
                 return False
 
             self.run_fencer_timestamp[ps_uuid] = created_time
+            self._mark_fencer_alive_locked(ps_uuid, created_time)
             return True
+
+    def begin_fencer_generation(self, ps_uuid, generation, keys):
+        with self.fencer_lock:
+            expected = set(keys)
+            self.fencer_workers[ps_uuid] = {
+                'generation': generation,
+                'expected': expected,
+                'alive': set(),
+            }
+            for key in expected:
+                self._touch_fencer_timestamp_locked(key, generation)
 
     def setup_fencer(self, ps_uuid, created_time, origin_uuid=None):
         with self.fencer_lock:
             logger.debug('setup fencer for ps: %s, create time: %d' % (ps_uuid, created_time))
-            self.run_fencer_timestamp[ps_uuid] = created_time
+            self._touch_fencer_timestamp_locked(ps_uuid, created_time)
+            # Ceph registers the whole pool set once via begin_fencer_generation.
+            # A per-pool setup must not replace that record.
+            if origin_uuid is None:
+                self.fencer_workers[ps_uuid] = {
+                    'generation': created_time,
+                    'expected': set([ps_uuid]),
+                    'alive': set(),
+                }
 
-            if origin_uuid is not None:
-                self.fencer_storage_list.add(origin_uuid)
-            else:
-                self.fencer_storage_list.add(ps_uuid)
+    def mark_fencer_alive(self, ps_uuid, key, generation):
+        with self.fencer_lock:
+            self._mark_fencer_alive_locked(key, generation)
+
+    def mark_fencer_dead(self, ps_uuid, key, generation):
+        with self.fencer_lock:
+            rec = self.fencer_workers.get(ps_uuid)
+            if rec is not None and rec['generation'] == generation:
+                rec['alive'].discard(key)
+
+    def get_alive_fencer_ps_uuids(self):
+        with self.fencer_lock:
+            alive = []
+            for ps_uuid, rec in self.fencer_workers.items():
+                if rec['expected'] and rec['expected'] <= rec['alive']:
+                    alive.append(ps_uuid)
+            return alive
+
+    def _touch_fencer_timestamp_locked(self, key, created_time):
+        exists_time = self.run_fencer_timestamp.get(key)
+        if exists_time is None or exists_time <= created_time:
+            self.run_fencer_timestamp[key] = created_time
+
+    def _mark_fencer_alive_locked(self, key, generation):
+        for rec in self.fencer_workers.values():
+            if rec['generation'] == generation and key in rec['expected']:
+                rec['alive'].add(key)
 
     def cancel_fencer(self, ps_uuid):
         with self.fencer_lock:
@@ -2753,5 +2821,4 @@ class HaPlugin(kvmagent.KvmAgent):
                     logger.debug('cancel fencer for ps: %s, with fencer key: %s' % (ps_uuid, key))
                     self.run_fencer_timestamp.pop(key, None)
                     self.sblk_health_checker.delvg(ps_uuid)  # ugly ...
-            if ps_uuid in self.fencer_storage_list:
-                self.fencer_storage_list.remove(ps_uuid)
+            self.fencer_workers.pop(ps_uuid, None)
