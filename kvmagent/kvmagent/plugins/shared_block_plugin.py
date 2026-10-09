@@ -10,7 +10,7 @@ from kvmagent.plugins.imagestore import ImageStoreClient
 from zstacklib.utils import jsonobject
 from zstacklib.utils import shell
 from zstacklib.utils import lock
-from zstacklib.utils import lvm, lvm_takeover, sanlock
+from zstacklib.utils import lvm, lvm_takeover, sanlock, sharedblock_lanfree
 from zstacklib.utils import list_ops
 from zstacklib.utils import bash
 from zstacklib.utils import qemu_img, qcow2
@@ -204,6 +204,20 @@ class GetBackingChainRsp(AgentRsp):
         super(GetBackingChainRsp, self).__init__()
         self.backingChain = None
         self.totalSize = 0L
+
+
+class GetVolumeSnapshotLanFreeLayoutsRsp(AgentRsp):
+    def __init__(self):
+        super(GetVolumeSnapshotLanFreeLayoutsRsp, self).__init__()
+        self.luns = []
+        self.layouts = []
+
+
+class GetVolumeLanFreeLayoutsRsp(AgentRsp):
+    def __init__(self):
+        super(GetVolumeLanFreeLayoutsRsp, self).__init__()
+        self.luns = []
+        self.layouts = []
 
 
 class SharedBlockMigrateVolumeStruct:
@@ -428,6 +442,8 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
     CANCEL_DOWNLOAD_BITS_FROM_KVM_HOST_PATH = "/sharedblock/kvmhost/download/cancel"
     GET_DOWNLOAD_BITS_FROM_KVM_HOST_PROGRESS_PATH = "/sharedblock/kvmhost/download/progress"
     GET_BACKING_CHAIN_PATH = "/sharedblock/volume/backingchain"
+    GET_VOLUME_SNAPSHOT_LAN_FREE_LAYOUTS_PATH = "/sharedblock/volume/volume-snapshot-lan-free-layouts"
+    GET_VOLUME_LAN_FREE_LAYOUTS_PATH = "/sharedblock/volume/volume-lan-free-layouts"
     CONVERT_VOLUME_PROVISIONING_PATH = "/sharedblock/volume/convertprovisioning"
     CONFIG_FILTER_PATH = "/sharedblock/disks/filter"
     CONVERT_VOLUME_FORMAT_PATH = "/sharedblock/volume/convertformat"
@@ -493,6 +509,8 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         http_server.register_async_uri(self.DOWNLOAD_BITS_FROM_KVM_HOST_PATH, self.download_from_kvmhost)
         http_server.register_async_uri(self.CANCEL_DOWNLOAD_BITS_FROM_KVM_HOST_PATH, self.cancel_download_from_kvmhost)
         http_server.register_async_uri(self.GET_BACKING_CHAIN_PATH, self.get_backing_chain)
+        http_server.register_async_uri(self.GET_VOLUME_SNAPSHOT_LAN_FREE_LAYOUTS_PATH, self.get_volume_snapshot_lan_free_layouts)
+        http_server.register_async_uri(self.GET_VOLUME_LAN_FREE_LAYOUTS_PATH, self.get_volume_lan_free_layouts)
         http_server.register_async_uri(self.CONVERT_VOLUME_PROVISIONING_PATH, self.convert_volume_provisioning)
         http_server.register_async_uri(self.CONFIG_FILTER_PATH, self.config_filter)
         http_server.register_async_uri(self.CONVERT_VOLUME_FORMAT_PATH, self.convert_volume_format)
@@ -1753,6 +1771,43 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
                 rsp.actualSizes[uuid] = lvm.get_lv_size(install_abs_path)
 
         rsp.totalCapacity, rsp.availableCapacity = lvm.get_vg_size(cmd.vgUuid)
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    def get_volume_snapshot_lan_free_layouts(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        if not cmd.vgUuid or not cmd.targets:
+            raise Exception("vgUuid and at least one Volume Snapshot LAN-free target are required")
+
+        rsp = GetVolumeSnapshotLanFreeLayoutsRsp()
+        lun_groups = []
+        for target in cmd.targets:
+            snapshot_abs_path = sharedblock_lanfree.absolute_install_path(cmd.vgUuid, target.volumeSnapshotInstallPath, target.volumeSnapshotUuid, "snapshot")
+            with lvm.RecursiveOperateLv(snapshot_abs_path, shared=True, skip_deactivate_tags=[IMAGE_TAG], delete_when_exception=False):
+                chain = linux.qcow2_get_file_chain(snapshot_abs_path)
+                plan = sharedblock_lanfree.build_source_plan(cmd.vgUuid, target, chain)
+                range_result = sharedblock_lanfree.get_lv_range_descriptors(cmd.vgUuid, plan["rangeTargets"])
+                formats = {}
+                lv_sizes = {}
+                for path in plan["paths"]:
+                    formats[path] = linux.get_img_fmt(path)
+                    lv_sizes[path] = long(lvm.get_lv_size(path))
+                virtual_size = long(linux.qcow2_virtualsize(snapshot_abs_path))
+                layout = sharedblock_lanfree.build_source_layout(target, plan, range_result, formats, lv_sizes, virtual_size)
+
+            lun_groups.append(range_result["luns"])
+            rsp.layouts.append(layout)
+
+        rsp.luns = sharedblock_lanfree.merge_luns(lun_groups)
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
+    def get_volume_lan_free_layouts(self, req):
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        result = sharedblock_lanfree.collect_volume_layouts(cmd.vgUuid, cmd.targets, lvm.OperateLv, linux.get_img_fmt, lvm.get_lv_size, linux.qcow2_virtualsize)
+        rsp = GetVolumeLanFreeLayoutsRsp()
+        rsp.luns = result["luns"]
+        rsp.layouts = result["layouts"]
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
