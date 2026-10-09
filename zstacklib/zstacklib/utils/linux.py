@@ -731,7 +731,7 @@ def get_filesystem_folder_size(path = "."):
 
 def is_mounted(path=None, url=None):
     if url:
-        url = re.sub(r'/{2,}','/',url.rstrip('/'))
+        url = re.sub(r'/{2,}', '/', url.rstrip('/')).replace(':/', ':/{1,2}', 1)
 
     if url and path:
         cmdstr = "mount | grep -E '%s[ /]+on' | grep '%s ' " % (url, path)
