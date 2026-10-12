@@ -1,6 +1,7 @@
 import base64
 import json
 import time
+import threading
 
 import libvirt
 import libvirt_qemu
@@ -76,6 +77,10 @@ def is_qga_connected(vm_dom):
 
 # windows zs-tools command wait 120s
 zs_tools_wait_retry = 120
+# Preserve unconfirmed net executions across VmQga instances. This protects
+# older guests too; the Guest mutex additionally survives Agent restarts.
+_zs_tools_net_pending = {}
+_zs_tools_net_lock = threading.RLock()
 
 
 class QgaException(Exception):
@@ -319,53 +324,97 @@ class VmQga(object):
 
         return exit_code, ret_data
 
+    def _cleanup_zs_tools_net(self, pid):
+        # Never kill by image name: other zs-tools operations may be active.
+        result = self.guest_exec({"path": "C:\\Windows\\System32\\taskkill.exe",
+                                  "arg": ["/PID", str(pid), "/T", "/F"],
+                                  "capture-output": True})
+        if not result or "pid" not in result:
+            raise Exception("could not start taskkill for guest pid {}: {}".format(pid, result))
+        cleanup_pid = result["pid"]
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            status = self.guest_exec_status_with_timeout(cleanup_pid, 2)
+            if status.get('exited'):
+                if status.get('exitcode') != 0:
+                    raise Exception("taskkill failed for guest pid {}: {}".format(pid, status))
+                # Successful /T /F confirms the tree has been terminated. Reap
+                # the QGA record when possible; a lost record is not a kill failure.
+                try:
+                    self.guest_exec_status_with_timeout(pid, 2)
+                except Exception:
+                    pass
+                return
+            time.sleep(0.2)
+        raise Exception("taskkill guest pid {} did not finish within 10s".format(cleanup_pid))
+
     def guest_exec_zs_tools(self, operate, config, config_obj=None, output=True, wait=qga_exec_wait_interval, retry=zs_tools_wait_retry):
         def get_return_data(result):
-            return self._get_zs_tools_output(result)
+            if not result:
+                return ""
+            parts = []
+            for field in ('out-data', 'err-data'):
+                if result.get(field):
+                    parts.append(decode_with_fallback(result[field]))
+            return '\n'.join(parts).replace('\r\n', '\n')
 
+        started = time.time()
+        pid = None
         ret = None
+        is_net = operate == 'net'
+        # Serializes direct callers as well as vm_config's decorated methods.
+        if is_net:
+            _zs_tools_net_lock.acquire()
         try:
+            if is_net and self.vm_uuid in _zs_tools_net_pending:
+                old_pid = _zs_tools_net_pending[self.vm_uuid]
+                # Re-check before starting a new task. Keep the record if QGA
+                # cannot confirm exit or cleanup, and retry on the next request.
+                try:
+                    old_status = self.guest_exec_status_with_timeout(old_pid, 2)
+                    if not old_status.get('exited'):
+                        self._cleanup_zs_tools_net(old_pid)
+                    _zs_tools_net_pending.pop(self.vm_uuid, None)
+                except Exception as old_error:
+                    raise Exception("previous guest net pid {} cleanup is unconfirmed; new execution blocked: {}".format(old_pid, old_error))
+
+            execution_started = time.time()
             ret = self.guest_exec(
                 {"path": self.ZS_TOOLS_PATN_WIN, "arg": [operate, "--config", config], "capture-output": output})
+            if not ret or "pid" not in ret:
+                raise Exception("guest-exec did not return a pid: {}".format(ret))
+            pid = ret["pid"]
+            if is_net:
+                _zs_tools_net_pending[self.vm_uuid] = pid
 
-            if ret and "pid" in ret:
-                pid = ret["pid"]
-            else:
-                raise Exception('guest-exec did not return pid, ret={}'.format(
-                    json.dumps(ret, default=repr)))
-
+            deadline = execution_started + wait * retry
             ret = None
-            for i in range(retry):
-                time.sleep(wait)
-                ret = self.guest_exec_status_with_timeout(pid, 15)
-                if ret['exited']:
+            while time.time() < deadline:
+                time.sleep(min(wait, max(0, deadline - time.time())))
+                remaining = deadline - time.time()
+                if remaining < 1:
                     break
-
-            if not ret or not ret.get('exited'):
-                raise Exception('zs-tools pid {} not exited after {} retries, ret={}, {}'.format(
-                    pid, retry, json.dumps(ret, default=repr), get_return_data(ret)))
-
-            exitcode = ret.get('exitcode')
-            if exitcode is None:
-                raise Exception('zs-tools pid {} exited without exitcode, ret={}, {}'.format(
-                    pid, json.dumps(ret, default=repr), get_return_data(ret)))
-            result = get_return_data(ret)
-            if exitcode != 0:
-                result = 'zs-tools pid {} exitcode {}, {}'.format(pid, exitcode, result)
-                tail = self._try_read_zs_tools_log_tail()
-                if tail:
-                    result += '\nzs-tools.log tail:\n' + tail
-            return exitcode, result
+                ret = self.guest_exec_status_with_timeout(pid, min(15, max(1, int(remaining))))
+                if ret.get('exited'):
+                    if is_net:
+                        _zs_tools_net_pending.pop(self.vm_uuid, None)
+                    return ret.get('exitcode'), get_return_data(ret)
+            raise Exception("guest pid {} exceeded deadline {}s; last status={}".format(pid, wait * retry, ret))
         except Exception as e:
-            detail = str(e) or type(e).__name__
-            partial_output = get_return_data(ret)
-            if partial_output and partial_output not in detail:
-                detail += '\n' + partial_output
-            tail = self._try_read_zs_tools_log_tail()
-            if tail:
-                detail += '\nzs-tools.log tail:\n' + tail
-            return 1, 'qga exec zs-tools operate {} failed for vm {}, config: {}, error: {}'.format(
-                    operate, self.vm_uuid, log.mask_sensitive_field(config_obj, config), detail)
+            cleanup = ''
+            if is_net and pid is not None and (not ret or not ret.get('exited')):
+                try:
+                    self._cleanup_zs_tools_net(pid)
+                    _zs_tools_net_pending.pop(self.vm_uuid, None)
+                    cleanup = '; guest process tree terminated'
+                except Exception as cleanup_error:
+                    cleanup = '; cleanup unconfirmed: {}; subsequent net execution blocked'.format(cleanup_error)
+            return 1, 'qga exec zs-tools operate {} failed for vm {}, pid={}, elapsed={:.3f}s, config: {}, error: {}{}'.format(
+                operate, self.vm_uuid, pid, time.time() - started,
+                log.mask_sensitive_field(config_obj, config), e, cleanup)
+        finally:
+            if is_net:
+                _zs_tools_net_lock.release()
 
     @staticmethod
     def _decode_zs_tools_data(data):
