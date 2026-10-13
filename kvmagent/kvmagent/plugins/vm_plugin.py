@@ -4626,7 +4626,8 @@ class Vm(object):
 
         flag = (libvirt.VIR_MIGRATE_LIVE |
                 libvirt.VIR_MIGRATE_PEER2PEER |
-                libvirt.VIR_MIGRATE_UNDEFINE_SOURCE)
+                libvirt.VIR_MIGRATE_UNDEFINE_SOURCE |
+                libvirt.VIR_MIGRATE_PERSIST_DEST)
 
         if migrate_tls:
             if not hasattr(libvirt, 'VIR_MIGRATE_TLS'):
@@ -4686,9 +4687,6 @@ class Vm(object):
         except Exception as e:
             tpm_device_exists = True
             logger.warn('get vm[uuid:%s] tpm device in xml failed, %s' % (self.uuid, str(e)))
-
-        if cmd.useNuma or storage_migration_required or tpm_device_exists:
-            flag |= libvirt.VIR_MIGRATE_PERSIST_DEST
 
         stage = get_task_stage(cmd)
         timeout = get_timeout(cmd)
