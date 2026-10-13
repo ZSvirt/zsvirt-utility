@@ -60,7 +60,7 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
         self.assertEqual((0, ''), self.run_net())
         self.vm.guest_exec.assert_called_once()
-        self.vm._cleanup_zs_tools_net.assert_not_called()
+        self.assertEqual([mock.call(41), mock.call(42)], self.vm._cleanup_zs_tools_net.call_args_list)
         self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
 
     def test_status_error_also_cleans_tree(self):
@@ -116,11 +116,10 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         other = self.qga.VmQga.__new__(self.qga.VmQga)
         other.vm_uuid = 'vm-a'
         other.guest_exec = mock.Mock(return_value={'pid': 99})
-        other.guest_exec_status_with_timeout = mock.Mock(side_effect=[
-            RuntimeError('PID record not found'), {'exited': True, 'exitcode': 0}])
+        other.guest_exec_status_with_timeout = mock.Mock(return_value={'exited': True, 'exitcode': 0})
         other._query_zs_tools_net_process_state = mock.Mock(return_value='absent')
         self.assertEqual((0, ''), other.guest_exec_zs_tools('net', '{}', wait=1, retry=3))
-        other._query_zs_tools_net_process_state.assert_called_once_with(42)
+        self.assertEqual([mock.call(42), mock.call(99)], other._query_zs_tools_net_process_state.call_args_list)
         other.guest_exec.assert_called_once()
         self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
 
@@ -153,7 +152,7 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         self.vm.guest_exec.return_value = {'pid': 99}
         self.vm.guest_exec_status_with_timeout.return_value = {
             'exited': True, 'exitcode': 0,
-            'out-data': b'{"state":"absent","pid":42,"descendants":0}'}
+            'out-data': b'ZS_TOOLS_NET_STATE|absent|42|0\r\n'}
         self.assertEqual('absent', self.vm._query_zs_tools_net_process_state(42))
         self.assertTrue(self.vm.guest_exec.call_args[0][0]['path'].endswith('powershell.exe'))
 
@@ -162,9 +161,67 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         self.vm.guest_exec.return_value = {'pid': 99}
         self.vm.guest_exec_status_with_timeout.return_value = {
             'exited': True, 'exitcode': 0,
-            'out-data': b'{"state":"absent","pid":42,"descendants":1}'}
+            'out-data': b'ZS_TOOLS_NET_STATE|absent|42|1\r\n'}
         with self.assertRaises(Exception):
             self.vm._query_zs_tools_net_process_state(42)
+
+    def test_pending_exited_parent_with_live_children_blocks_every_retry(self):
+        del self.vm._cleanup_zs_tools_net
+        self.qga._zs_tools_net_pending['vm-a'] = 41
+        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
+        self.vm._query_zs_tools_net_process_state = mock.Mock(return_value='orphaned')
+        for unused in range(3):
+            code, message = self.run_net()
+            self.assertEqual(1, code)
+            self.assertIn('new execution blocked', message)
+            self.assertEqual(41, self.qga._zs_tools_net_pending['vm-a'])
+        self.vm.guest_exec.assert_not_called()
+        self.assertEqual([mock.call(41)] * 3, self.vm._query_zs_tools_net_process_state.call_args_list)
+        self.vm.guest_exec_status_with_timeout.assert_not_called()
+
+    def test_normal_parent_exit_with_live_children_also_retains_pending(self):
+        del self.vm._cleanup_zs_tools_net
+        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
+        self.vm._query_zs_tools_net_process_state = mock.Mock(return_value='orphaned')
+        code, message = self.run_net()
+        self.assertEqual(1, code)
+        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a'])
+        self.assertIn('orphaned', message)
+
+    def test_ps2_query_and_lost_exit_record_allow_three_cross_instance_retries(self):
+        import base64
+        self.qga._zs_tools_net_pending['vm-a'] = 41
+        scripts = []
+        launches = []
+        for unused in range(3):
+            vm = self.qga.VmQga.__new__(self.qga.VmQga)
+            vm.vm_uuid = 'vm-a'
+            vm.ZS_TOOLS_PATN_WIN = r'C:\Program Files\GuestTools\zs-tools\zs-tools.exe'
+            def execute(args):
+                if args['path'].endswith('powershell.exe'):
+                    script = base64.b64decode(args['arg'][-1]).decode('utf-16le')
+                    # Model the PS2 compatibility failure rather than silently
+                    # returning a successful mocked response for a PS3 script.
+                    if 'ConvertTo-Json' in script or '[PSCustomObject]' in script:
+                        raise RuntimeError('PowerShell 2.0 unsupported command')
+                    scripts.append(script)
+                    return {'pid': 100}
+                launches.append(args)
+                return {'pid': 42}
+            def status(pid, timeout):
+                if pid == 41:
+                    raise RuntimeError('consumed exit record')
+                if pid == 100:
+                    target = 41 if len(scripts) == 1 else 42
+                    return {'exited': True, 'exitcode': 0,
+                            'out-data': ('ZS_TOOLS_NET_STATE|absent|%s|0' % target).encode('ascii')}
+                return {'exited': True, 'exitcode': 0}
+            vm.guest_exec = mock.Mock(side_effect=execute)
+            vm.guest_exec_status_with_timeout = mock.Mock(side_effect=status)
+            self.assertEqual((0, ''), vm.guest_exec_zs_tools('net', '{}', wait=1, retry=3))
+            self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
+        self.assertEqual(3, len(launches))
+        self.assertEqual(4, len(scripts))
 
 if __name__ == '__main__':
     unittest.main()

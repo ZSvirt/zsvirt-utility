@@ -358,8 +358,10 @@ if ($root.Count -gt 0) {
     # than killing descendants of an unverified/reused PID.
     $state = 'orphaned'
 }
-[PSCustomObject]@{state=$state; pid=$targetPid; descendants=($tree.Count-1)} |
-    ConvertTo-Json -Compress
+# Fixed ASCII fields use only PowerShell 2.0 / .NET APIs. No PS3 object
+# construction or serialization cmdlets are required.
+[Console]::Out.WriteLine(('ZS_TOOLS_NET_STATE|{0}|{1}|{2}' -f
+    $state, $targetPid, ($tree.Count-1)))
 """ % (int(pid), self.ZS_TOOLS_PATN_WIN.replace("'", "''"))
         encoded = base64.b64encode(script.encode('utf-16le'))
         if not isinstance(encoded, str):
@@ -376,14 +378,17 @@ if ($root.Count -gt 0) {
             if status.get('exited'):
                 if status.get('exitcode') != 0 or not status.get('out-data'):
                     raise Exception('Guest OS process query failed for pid {}'.format(pid))
-                state = json.loads(status['out-data'])
-                if (state.get('pid') != int(pid) or
-                        state.get('state') not in ('absent', 'running', 'identity_mismatch', 'orphaned') or
-                        not isinstance(state.get('descendants'), int) or
-                        state['descendants'] < 0 or
-                        (state['state'] == 'absent' and state['descendants'] != 0)):
+                data = status['out-data']
+                if not isinstance(data, str):
+                    data = data.decode('ascii')
+                fields = data.strip().split('|')
+                if (len(fields) != 4 or fields[0] != 'ZS_TOOLS_NET_STATE' or
+                        fields[1] not in ('absent', 'running', 'identity_mismatch', 'orphaned') or
+                        not fields[2].isdigit() or not fields[3].isdigit() or
+                        int(fields[2]) != int(pid) or
+                        (fields[1] == 'absent' and int(fields[3]) != 0)):
                     raise Exception('invalid Guest OS process state for pid {}'.format(pid))
-                return state['state']
+                return fields[1]
             time.sleep(0.2)
         raise Exception('Guest OS process query for pid {} timed out'.format(pid))
 
@@ -447,12 +452,9 @@ if ($root.Count -gt 0) {
                 # Re-check before starting a new task. Keep the record if QGA
                 # cannot confirm exit or cleanup, and retry on the next request.
                 try:
-                    try:
-                        old_status = self.guest_exec_status_with_timeout(old_pid, 2)
-                    except Exception:
-                        old_status = None
-                    if not old_status or not old_status.get('exited'):
-                        self._cleanup_zs_tools_net(old_pid)
+                    # Parent exit is never evidence that its children exited.
+                    # This also works after the QGA PID record was consumed.
+                    self._cleanup_zs_tools_net(old_pid)
                     _zs_tools_net_pending.pop(self.vm_uuid, None)
                 except Exception as old_error:
                     raise Exception("previous guest net pid {} cleanup is unconfirmed; new execution blocked: {}".format(old_pid, old_error))
@@ -476,12 +478,15 @@ if ($root.Count -gt 0) {
                 ret = self.guest_exec_status_with_timeout(pid, min(15, max(1, int(remaining))))
                 if ret.get('exited'):
                     if is_net:
+                        # Apply the same full-tree invariant on the normal
+                        # exit path, including Guests without kill-on-close jobs.
+                        self._cleanup_zs_tools_net(pid)
                         _zs_tools_net_pending.pop(self.vm_uuid, None)
                     return ret.get('exitcode'), get_return_data(ret)
             raise Exception("guest pid {} exceeded deadline {}s; last status={}".format(pid, wait * retry, ret))
         except Exception as e:
             cleanup = ''
-            if is_net and pid is not None and (not ret or not ret.get('exited')):
+            if is_net and pid is not None and self.vm_uuid in _zs_tools_net_pending:
                 try:
                     self._cleanup_zs_tools_net(pid)
                     _zs_tools_net_pending.pop(self.vm_uuid, None)
