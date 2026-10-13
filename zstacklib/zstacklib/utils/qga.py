@@ -324,29 +324,105 @@ class VmQga(object):
 
         return exit_code, ret_data
 
-    def _cleanup_zs_tools_net(self, pid):
-        # Never kill by image name: other zs-tools operations may be active.
-        result = self.guest_exec({"path": "C:\\Windows\\System32\\taskkill.exe",
-                                  "arg": ["/PID", str(pid), "/T", "/F"],
-                                  "capture-output": True})
-        if not result or "pid" not in result:
-            raise Exception("could not start taskkill for guest pid {}: {}".format(pid, result))
-        cleanup_pid = result["pid"]
+    def _query_zs_tools_net_process_state(self, pid):
+        # guest-exec-status is a consumable QGA record, not an OS liveness
+        # check. Query Windows independently, including descendants whose
+        # parent has exited. Never infer absence from a failed query.
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$targetPid = %d
+$expectedPath = '%s'
+$all = @(Get-WmiObject -Class Win32_Process -ErrorAction Stop)
+$root = @($all | Where-Object { $_.ProcessId -eq $targetPid })
+$tree = @{}; $tree[$targetPid] = $true
+do {
+    $previous = $tree.Count
+    foreach ($process in $all) {
+        if ($tree.ContainsKey([int]$process.ParentProcessId)) {
+            $tree[[int]$process.ProcessId] = $true
+        }
+    }
+} while ($tree.Count -ne $previous)
+$state = 'absent'
+if ($root.Count -gt 0) {
+    if ($root.Count -eq 1 -and
+        [string]::Equals($root[0].ExecutablePath, $expectedPath,
+            [StringComparison]::OrdinalIgnoreCase) -and
+        $root[0].CommandLine -match '^\s*(?:"[^"]+"|\S+)\s+net(?:\s|$)') {
+        $state = 'running'
+    } else {
+        $state = 'identity_mismatch'
+    }
+} elseif ($tree.Count -gt 1) {
+    # The root identity can no longer be checked. Preserve pending rather
+    # than killing descendants of an unverified/reused PID.
+    $state = 'orphaned'
+}
+[PSCustomObject]@{state=$state; pid=$targetPid; descendants=($tree.Count-1)} |
+    ConvertTo-Json -Compress
+""" % (int(pid), self.ZS_TOOLS_PATN_WIN.replace("'", "''"))
+        encoded = base64.b64encode(script.encode('utf-16le'))
+        if not isinstance(encoded, str):
+            encoded = encoded.decode('ascii')
+        result = self.guest_exec({
+            'path': r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+            'arg': ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+            'capture-output': True})
+        if not result or 'pid' not in result:
+            raise Exception('could not start Guest OS process query for pid {}'.format(pid))
         deadline = time.time() + 10
         while time.time() < deadline:
-            status = self.guest_exec_status_with_timeout(cleanup_pid, 2)
+            status = self.guest_exec_status_with_timeout(result['pid'], 2)
             if status.get('exited'):
-                if status.get('exitcode') != 0:
-                    raise Exception("taskkill failed for guest pid {}: {}".format(pid, status))
-                # Successful /T /F confirms the tree has been terminated. Reap
-                # the QGA record when possible; a lost record is not a kill failure.
-                try:
-                    self.guest_exec_status_with_timeout(pid, 2)
-                except Exception:
-                    pass
-                return
+                if status.get('exitcode') != 0 or not status.get('out-data'):
+                    raise Exception('Guest OS process query failed for pid {}'.format(pid))
+                state = json.loads(status['out-data'])
+                if (state.get('pid') != int(pid) or
+                        state.get('state') not in ('absent', 'running', 'identity_mismatch', 'orphaned') or
+                        not isinstance(state.get('descendants'), int) or
+                        state['descendants'] < 0 or
+                        (state['state'] == 'absent' and state['descendants'] != 0)):
+                    raise Exception('invalid Guest OS process state for pid {}'.format(pid))
+                return state['state']
             time.sleep(0.2)
-        raise Exception("taskkill guest pid {} did not finish within 10s".format(cleanup_pid))
+        raise Exception('Guest OS process query for pid {} timed out'.format(pid))
+
+    def _cleanup_zs_tools_net(self, pid):
+        state = self._query_zs_tools_net_process_state(pid)
+        if state == 'absent':
+            return
+        if state != 'running':
+            raise Exception('cannot verify zs-tools net identity/tree for pid {}: {}'.format(pid, state))
+        cleanup_error = None
+        try:
+            # Never kill by image name or a PID whose identity is unverified.
+            result = self.guest_exec({"path": r"C:\Windows\System32\taskkill.exe",
+                                      "arg": ["/PID", str(pid), "/T", "/F"],
+                                      "capture-output": True})
+            if not result or "pid" not in result:
+                raise Exception("could not start taskkill for guest pid {}".format(pid))
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                status = self.guest_exec_status_with_timeout(result['pid'], 2)
+                if status.get('exited'):
+                    if status.get('exitcode') != 0:
+                        raise Exception("taskkill failed for guest pid {}: {}".format(pid, status))
+                    break
+                time.sleep(0.2)
+            else:
+                raise Exception("taskkill guest pid {} did not finish within 10s".format(result['pid']))
+        except Exception as error:
+            cleanup_error = error
+        # A nonzero taskkill result may simply mean the process exited between
+        # inspection and cleanup. A successful/lost response also needs an
+        # independent check; only an absent complete tree releases pending.
+        state = self._query_zs_tools_net_process_state(pid)
+        if state != 'absent':
+            raise Exception('guest pid {} cleanup unconfirmed: state={}, error={}'.format(pid, state, cleanup_error))
+        try:
+            self.guest_exec_status_with_timeout(pid, 2)
+        except Exception:
+            pass
 
     def guest_exec_zs_tools(self, operate, config, config_obj=None, output=True, wait=qga_exec_wait_interval, retry=zs_tools_wait_retry):
         def get_return_data(result):
@@ -371,8 +447,11 @@ class VmQga(object):
                 # Re-check before starting a new task. Keep the record if QGA
                 # cannot confirm exit or cleanup, and retry on the next request.
                 try:
-                    old_status = self.guest_exec_status_with_timeout(old_pid, 2)
-                    if not old_status.get('exited'):
+                    try:
+                        old_status = self.guest_exec_status_with_timeout(old_pid, 2)
+                    except Exception:
+                        old_status = None
+                    if not old_status or not old_status.get('exited'):
                         self._cleanup_zs_tools_net(old_pid)
                     _zs_tools_net_pending.pop(self.vm_uuid, None)
                 except Exception as old_error:

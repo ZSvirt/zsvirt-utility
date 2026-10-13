@@ -48,6 +48,7 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         other.vm_uuid = 'vm-a'
         other.guest_exec = mock.Mock()
         other.guest_exec_status_with_timeout = mock.Mock(side_effect=RuntimeError('QGA disconnected'))
+        other._cleanup_zs_tools_net = mock.Mock(side_effect=RuntimeError('QGA disconnected'))
         code, message = other.guest_exec_zs_tools('net', '{}', wait=1, retry=3)
         self.assertEqual(1, code)
         self.assertIn('new execution blocked', message)
@@ -85,6 +86,7 @@ class ZsToolsTimeoutTest(unittest.TestCase):
 
     def test_cleanup_uses_exact_pid_and_checks_taskkill_exit(self):
         del self.vm._cleanup_zs_tools_net
+        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=['running', 'absent'])
         self.vm.guest_exec.return_value = {'pid': 99}
         self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
         self.vm._cleanup_zs_tools_net(42)
@@ -94,10 +96,75 @@ class ZsToolsTimeoutTest(unittest.TestCase):
 
     def test_failed_taskkill_is_not_confirmed_cleanup(self):
         del self.vm._cleanup_zs_tools_net
+        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=['running', 'running'])
         self.vm.guest_exec.return_value = {'pid': 99}
         self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 1}
         with self.assertRaises(Exception):
             self.vm._cleanup_zs_tools_net(42)
+
+    def test_lost_exited_response_recovers_across_instances(self):
+        del self.vm._cleanup_zs_tools_net
+        # Exit response consumed the QGA record and was lost. During this
+        # first call the channel also prevents an independent OS query.
+        self.vm.guest_exec_status_with_timeout.side_effect = RuntimeError('PID record not found')
+        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=RuntimeError('channel lost'))
+        code, message = self.run_net()
+        self.assertEqual(1, code)
+        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a'])
+        # A new instance after channel recovery still cannot read the consumed
+        # PID record, but Windows confirms the entire old tree is absent.
+        other = self.qga.VmQga.__new__(self.qga.VmQga)
+        other.vm_uuid = 'vm-a'
+        other.guest_exec = mock.Mock(return_value={'pid': 99})
+        other.guest_exec_status_with_timeout = mock.Mock(side_effect=[
+            RuntimeError('PID record not found'), {'exited': True, 'exitcode': 0}])
+        other._query_zs_tools_net_process_state = mock.Mock(return_value='absent')
+        self.assertEqual((0, ''), other.guest_exec_zs_tools('net', '{}', wait=1, retry=3))
+        other._query_zs_tools_net_process_state.assert_called_once_with(42)
+        other.guest_exec.assert_called_once()
+        self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
+
+    def test_taskkill_not_found_is_resolved_by_os_absence(self):
+        del self.vm._cleanup_zs_tools_net
+        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=['running', 'absent'])
+        self.vm.guest_exec.return_value = {'pid': 99}
+        self.vm.guest_exec_status_with_timeout.side_effect = [
+            {'exited': True, 'exitcode': 128}, RuntimeError('PID record not found')]
+        self.vm._cleanup_zs_tools_net(42)
+        self.assertEqual(2, self.vm._query_zs_tools_net_process_state.call_count)
+
+    def test_reused_pid_or_orphaned_tree_is_never_killed(self):
+        del self.vm._cleanup_zs_tools_net
+        for state in ('identity_mismatch', 'orphaned'):
+            self.vm._query_zs_tools_net_process_state = mock.Mock(return_value=state)
+            with self.assertRaises(Exception):
+                self.vm._cleanup_zs_tools_net(42)
+        self.vm.guest_exec.assert_not_called()
+
+    def test_lost_taskkill_response_requires_os_confirmation(self):
+        del self.vm._cleanup_zs_tools_net
+        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=['running', 'absent'])
+        self.vm.guest_exec.return_value = {'pid': 99}
+        self.vm.guest_exec_status_with_timeout.side_effect = RuntimeError('response lost')
+        self.vm._cleanup_zs_tools_net(42)
+
+    def test_os_query_parses_independent_process_state(self):
+        self.vm.ZS_TOOLS_PATN_WIN = r'C:\\Program Files\\GuestTools\\zs-tools\\zs-tools.exe'
+        self.vm.guest_exec.return_value = {'pid': 99}
+        self.vm.guest_exec_status_with_timeout.return_value = {
+            'exited': True, 'exitcode': 0,
+            'out-data': b'{"state":"absent","pid":42,"descendants":0}'}
+        self.assertEqual('absent', self.vm._query_zs_tools_net_process_state(42))
+        self.assertTrue(self.vm.guest_exec.call_args[0][0]['path'].endswith('powershell.exe'))
+
+    def test_os_query_cannot_confirm_absence_with_descendants(self):
+        self.vm.ZS_TOOLS_PATN_WIN = r'C:\\Program Files\\GuestTools\\zs-tools\\zs-tools.exe'
+        self.vm.guest_exec.return_value = {'pid': 99}
+        self.vm.guest_exec_status_with_timeout.return_value = {
+            'exited': True, 'exitcode': 0,
+            'out-data': b'{"state":"absent","pid":42,"descendants":1}'}
+        with self.assertRaises(Exception):
+            self.vm._query_zs_tools_net_process_state(42)
 
 if __name__ == '__main__':
     unittest.main()
