@@ -4,6 +4,8 @@ import os
 import os.path
 import platform
 import json
+import socket
+from contextlib import closing
 
 from kvmagent import kvmagent
 from kvmagent.plugins import volume_secret
@@ -281,7 +283,22 @@ class ImageStoreClient(object):
             os.close(fd)
         return path
 
+    @staticmethod
+    def _check_nbd_connection(dest):
+        if not dest or not dest.startswith('nbd://'):
+            return
+
+        host, _, ports = dest[len('nbd://'):].rpartition(':')
+        host = host.strip('[]')
+        for port in ports.split(','):
+            with closing(socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET, socket.SOCK_STREAM)) as sock:
+                sock.settimeout(3)
+                if sock.connect_ex((host, int(port))) != 0:
+                    endpoint = '[%s]:%s' % (host, port) if ':' in host else '%s:%s' % (host, port)
+                    raise kvmagent.KvmError('cannot connect to NBD target %s, check the backup network' % endpoint)
+
     def backup_volume(self, vm, node, bitmap, mode, dest, point_in_time, speed, reporter, stage):
+        self._check_nbd_connection(dest)
         self.check_capacity(os.path.dirname(dest))
 
         PFILE = linux.create_temp_file()
@@ -312,6 +329,7 @@ class ImageStoreClient(object):
     # {'drive-virtio-disk0': { "backupFile": "foo", "mode":"full" },
     #  'drive-virtio-disk1': { "backupFile": "bar", "mode":"top" }}
     def backup_volumes(self, vm, args, dstdir, point_in_time, reporter, stage, addons=None, device_ids=None):
+        self._check_nbd_connection(dstdir)
         self.check_capacity(dstdir)
         PFILE = linux.create_temp_file()
         args_file = None
