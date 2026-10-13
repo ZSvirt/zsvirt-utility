@@ -4920,7 +4920,7 @@ class Vm(object):
     # after restoring from a memory snapshot, the CD-ROM tray will automatically close
     # interim solution: must manually open the tray before attaching or detaching iso
     # fixed in upstream patch: http://jira.zstack.io/browse/ZSV-9648
-    def open_cdrom_tray(self, vm_uuid, alias_name):
+    def open_cdrom_tray(self, vm_uuid, alias_name, force=False):
         if alias_name is None:
             logger.warn("skip opening cdrom tray: qdev is None on vm %s" % vm_uuid)
             return
@@ -4966,11 +4966,29 @@ class Vm(object):
             return
 
         try:
-            qmp.execute_qmp_command(vm_uuid, "blockdev-open-tray", id=alias_name)
+            qmp.execute_qmp_command(vm_uuid, "blockdev-open-tray", id=alias_name, force=force)
         except Exception as err:
             logger.warning("failed to open tray for cdrom %s, error: %s" % (alias_name, err))
             return
-        logger.debug("opened tray for cdrom %s on vm %s" % (alias_name, vm_uuid))
+
+        # QMP success may only acknowledge an eject request to a locked guest.
+        # Wait for the target tray before libvirt removes or replaces its media.
+        # libvirt's CHANGE_MEDIA_TIMEOUT is 5000 ms; allow extra time
+        # for the guest to respond to the eject request.
+        TRAY_OPEN_TIMEOUT_SECONDS = 30
+        deadline = monotonic_time() + TRAY_OPEN_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - monotonic_time()
+            if remaining <= 0:
+                raise kvmagent.KvmError(
+                    "timed out waiting to open tray for cdrom %s on vm %s after %s seconds" %
+                    (alias_name, vm_uuid, TRAY_OPEN_TIMEOUT_SECONDS))
+            blocks = qmp.execute_qmp_command(vm_uuid, "query-block", command_timeout=remaining)
+            for block in blocks:
+                if block.get('qdev') == alias_name and block.get('tray_open') is True:
+                    logger.debug("opened tray for cdrom %s on vm %s" % (alias_name, vm_uuid))
+                    return
+            time.sleep(min(0.1, max(0, deadline - monotonic_time())))
 
     def attach_iso(self, cmd):
         iso = cmd.iso
@@ -5074,7 +5092,7 @@ class Vm(object):
 
         logger.debug('detaching ISO from the vm[uuid:%s]:\n%s' % (self.uuid, xml))
 
-        self.open_cdrom_tray(cmd.vmUuid, find_domain_cdrom_alias_name(self.domain.XMLDesc(0), dev))
+        self.open_cdrom_tray(cmd.vmUuid, find_domain_cdrom_alias_name(self.domain.XMLDesc(0), dev), force=True)
         try:
             self.domain.updateDeviceFlags(xml, libvirt.VIR_DOMAIN_AFFECT_LIVE | libvirt.VIR_DOMAIN_DEVICE_MODIFY_FORCE)
         except libvirt.libvirtError as ex:
