@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Regression coverage for orphaned Windows network configuration tasks."""
+"""Task-bound cancellation must never turn stale PIDs into kill targets."""
+import base64
 import unittest
 import test_qga_guest_exec_program as loader
-
 mock = loader.mock
 
 class ZsToolsTimeoutTest(unittest.TestCase):
@@ -12,65 +12,169 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         self.qga.log.mask_sensitive_field = lambda obj, value: '<masked>'
         self.vm = self.qga.VmQga.__new__(self.qga.VmQga)
         self.vm.vm_uuid = 'vm-a'
+        self.vm.ZS_TOOLS_PATN_WIN = r'C:\zs-tools.exe'
         self.vm.guest_exec = mock.Mock(return_value={'pid': 42})
         self.vm.guest_exec_status_with_timeout = mock.Mock(return_value={'exited': False})
-        self.vm._cleanup_zs_tools_net = mock.Mock()
-        self.vm._net_task_control = mock.Mock(return_value={'phase': 'finished', 'pid': 42, 'wrapper_pid': 42})
+        self.record = {'phase': 'running', 'pid': 42, 'wrapper_pid': 43}
+        self.active = False
+        self.finished = False
+        self.vm._net_task_control = mock.Mock(side_effect=self.control)
         self.now = 100.0
-        def sleep(seconds):
-            self.now += seconds
         self.patches = [mock.patch.object(self.qga.time, 'time', side_effect=lambda: self.now),
-                        mock.patch.object(self.qga.time, 'sleep', side_effect=sleep)]
-        for patch in self.patches:
-            patch.start()
+                        mock.patch.object(self.qga.time, 'sleep', side_effect=self.sleep)]
+        for patch in self.patches: patch.start()
+
+    def control(self, task, action):
+        if action in ('cancel', 'seal'):
+            if self.active: raise RuntimeError('Job still active or cannot be observed')
+            return dict(self.record, phase='cancelled')
+        if action == 'inspect' and self.finished: return dict(self.record, phase='finished')
+        if action == 'collect':
+            if self.active: raise RuntimeError('Job still active')
+            return dict(self.record, exitcode=0)
+        return self.record.copy()
+
+    def sleep(self, seconds): self.now += seconds
 
     def tearDown(self):
-        for patch in reversed(self.patches):
-            patch.stop()
+        for patch in reversed(self.patches): patch.stop()
         loader._restore_sys_modules(self.modules)
 
     def run_net(self):
         return self.vm.guest_exec_zs_tools('net', 'secret-config', wait=1, retry=3)
 
-    def test_timeout_kills_tree_and_reports_pid_elapsed(self):
+    def test_timeout_cancels_by_task_and_reports_safe_diagnostics(self):
         code, message = self.run_net()
         self.assertEqual(1, code)
-        self.vm._cleanup_zs_tools_net.assert_called_once_with(42)
         self.assertIn('pid=42', message)
         self.assertIn('elapsed=3.000s', message)
         self.assertIn('exceeded deadline', message)
         self.assertNotIn('secret-config', message)
         self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
+        self.assertEqual('cancel', self.vm._net_task_control.call_args[0][1])
 
-    def test_failed_cleanup_blocks_next_instance(self):
-        self.vm._cleanup_zs_tools_net.side_effect = RuntimeError('QGA disconnected')
-        self.run_net()
-        other = self.qga.VmQga.__new__(self.qga.VmQga)
-        other.vm_uuid = 'vm-a'
-        other.guest_exec = mock.Mock()
-        other.guest_exec_status_with_timeout = mock.Mock(side_effect=RuntimeError('QGA disconnected'))
-        other._cleanup_zs_tools_net = mock.Mock(side_effect=RuntimeError('QGA disconnected'))
-        other._net_task_control = mock.Mock(side_effect=RuntimeError('QGA disconnected'))
-        code, message = other.guest_exec_zs_tools('net', '{}', wait=1, retry=3)
-        self.assertEqual(1, code)
-        self.assertIn('new execution blocked', message)
-        other.guest_exec.assert_not_called()
-        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a']['pid'])
-
-    def test_exited_previous_pid_allows_next_request(self):
-        self.qga._zs_tools_net_pending['vm-a'] = 41
+    def test_exited_parent_with_live_job_blocks_three_cross_instance_retries(self):
+        self.active = True
         self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
-        self.assertEqual((0, ''), self.run_net())
-        self.vm.guest_exec.assert_called_once()
-        self.assertEqual([mock.call(41), mock.call(42)], self.vm._cleanup_zs_tools_net.call_args_list)
-        self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
+        self.assertEqual(1, self.run_net()[0])
+        task = self.qga._zs_tools_net_pending['vm-a']
+        for unused in range(3):
+            other = self.qga.VmQga.__new__(self.qga.VmQga)
+            other.__dict__.update(self.vm.__dict__)
+            code, message = other.guest_exec_zs_tools('net', '{}', wait=1, retry=3)
+            self.assertEqual(1, code)
+            self.assertIn('new execution blocked', message)
+            self.assertIs(task, self.qga._zs_tools_net_pending['vm-a'])
+        self.assertEqual(1, self.vm.guest_exec.call_count)
 
-    def test_status_error_also_cleans_tree(self):
-        self.vm.guest_exec_status_with_timeout.side_effect = RuntimeError('channel lost')
-        code, message = self.run_net()
-        self.assertEqual(1, code)
-        self.assertIn('channel lost', message)
-        self.vm._cleanup_zs_tools_net.assert_called_once_with(42)
+    def test_lost_exited_status_recovers_from_job_absence(self):
+        self.active = True
+        self.vm.guest_exec_status_with_timeout.side_effect = RuntimeError('PID record gone')
+        self.assertEqual(1, self.run_net()[0])
+        self.active = False
+        self.vm.guest_exec_status_with_timeout.side_effect = None
+        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
+        self.finished = True
+        self.assertEqual((0, ''), self.run_net())
+        self.assertEqual(2, self.vm.guest_exec.call_count)
+
+    def test_legacy_numeric_pending_is_not_killed_or_released(self):
+        self.qga._zs_tools_net_pending['vm-a'] = 42
+        for unused in range(3): self.assertEqual(1, self.run_net()[0])
+        self.vm.guest_exec.assert_not_called()
+        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a'])
+
+    def test_stale_root_and_wrapper_pid_reuse_do_not_change_cancellation_identity(self):
+        task = {'task_id': 'a'*32, 'phase': 'submitted', 'pid': 9001, 'wrapper_pid': 9002}
+        self.record.update(pid=9001, wrapper_pid=9002)
+        self.vm._recover_net_task(task)
+        script = self.vm._net_task_script(task, 'cancel')
+        self.assertNotIn('9001', script)
+        self.assertNotIn('9002', script)
+        self.assertNotIn('taskkill', script.lower())
+        self.assertNotIn('OpenProcess', script)
+        self.assertNotIn('Get-WmiObject', script)
+        self.assertIn("$recordPath + '.cancel'", script)
+        self.assertIn('OpenJobObject(4, false, name)', script)
+        self.assertIn('[ZStackNetJob]::Absent($jobName)', script)
+
+    def test_job_binding_precedes_child_creation_and_survives_wrapper_crash(self):
+        script = self.vm._net_task_script({'task_id': 'b'*32}, 'launch', '{}')
+        self.assertLess(script.index('[ZStackNetJob]::Enter($jobName)'), script.index('Start-Process -FilePath'))
+        self.assertIn('Marshal.WriteInt32(info, 16, 0x2000)', script)
+        self.assertIn('AssignProcessToJobObject(job, GetCurrentProcess())', script)
+        self.assertIn('[ZStackNetJob]::Stop($job)', script)
+        self.assertIn('[ZStackNetJob]::Active($job) -ne 1', script)
+
+    def test_job_query_access_error_cannot_release_pending(self):
+        self.vm._net_task_control.side_effect = RuntimeError('access denied')
+        task = {'task_id': 'c'*32, 'phase': 'unknown'}
+        self.qga._zs_tools_net_pending['vm-a'] = task
+        self.assertEqual(1, self.run_net()[0])
+        self.assertIs(task, self.qga._zs_tools_net_pending['vm-a'])
+        self.vm.guest_exec.assert_not_called()
+
+    def test_control_rejects_old_receipt_protocol(self):
+        del self.vm._net_task_control
+        task = {'task_id': 'd'*32}
+        self.vm.guest_exec_status_with_timeout.return_value = {
+            'exited': True, 'exitcode': 0,
+            'out-data': ('ZSN1|%s|finished|42|43' % task['task_id']).encode('ascii')}
+        with self.assertRaises(Exception): self.vm._net_task_control(task, 'cancel')
+
+    def test_finished_receipt_cannot_release_a_live_job(self):
+        self.finished = True
+        self.active = True
+        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
+        self.assertEqual(1, self.run_net()[0])
+        self.assertIn('vm-a', self.qga._zs_tools_net_pending)
+        self.vm.guest_exec_status_with_timeout.assert_not_called()
+
+    def test_lost_wrapper_exit_record_uses_bound_result_instead(self):
+        self.finished = True
+        self.vm.guest_exec_status_with_timeout.side_effect = RuntimeError('old PID record lost')
+        self.assertEqual((0, ''), self.run_net())
+        self.vm.guest_exec_status_with_timeout.assert_called_once()
+
+    def test_failed_late_launcher_cannot_overwrite_cancelled_receipt(self):
+        script = self.vm._net_task_script({'task_id': 'e'*32}, 'launch', '{}')
+        catch = script.split("[Console]::Error.WriteLine('Net task launcher failed')", 1)[1]
+        self.assertIn("$record[2] -eq 'reserved'", catch)
+        self.assertNotIn("if ($locked -ne $null) { Write-Record 'failed'", catch)
+
+    def test_stale_control_pid_reply_is_consumed_until_nonce_matches(self):
+        del self.vm._net_task_control
+        task = {'task_id': 'f'*32}
+        control_id = '1'*32
+        fixed = mock.Mock(hex=control_id)
+        replies = [
+            {'exited': True, 'exitcode': 0, 'out-data': b'old command output\xff'},
+            {'exited': True, 'exitcode': 1},
+            {'exited': True, 'exitcode': 0, 'out-data':
+             ('ZSN2|%s|cancelled|42|43|%s' % (task['task_id'], '2'*32)).encode('ascii')},
+            {'exited': True, 'exitcode': 0, 'out-data':
+             ('ZSN2|%s|cancelled|42|43|%s' % (task['task_id'], control_id)).encode('ascii')}]
+        self.vm.guest_exec_status_with_timeout.side_effect = replies
+        with mock.patch.object(self.qga.uuid, 'uuid4', return_value=fixed):
+            self.assertEqual('cancelled', self.vm._net_task_control(task, 'cancel')['phase'])
+        self.assertEqual(4, self.vm.guest_exec_status_with_timeout.call_count)
+
+    def test_result_collection_decodes_only_matching_invocation(self):
+        del self.vm._net_task_control
+        task = {'task_id': 'f'*32}
+        fixed = mock.Mock(hex='1'*32)
+        frame = 'ZSN2|%s|finished|42|43|%s|0|Y29tcGxldGVk|' % (task['task_id'], fixed.hex)
+        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0, 'out-data': frame.encode('ascii')}
+        with mock.patch.object(self.qga.uuid, 'uuid4', return_value=fixed):
+            result = self.vm._net_task_control(task, 'collect')
+        self.assertEqual(0, result['exitcode'])
+        self.assertEqual(b'completed', result['out-data'])
+        self.assertIn('![ZStackNetJob]::Absent($jobName)', self.vm._net_task_script(task, 'collect'))
+
+    def test_no_matching_nonce_never_confirms_cleanup(self):
+        del self.vm._net_task_control
+        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0, 'out-data': b'stale'}
+        with self.assertRaises(Exception): self.vm._net_task_control({'task_id': 'f'*32}, 'cancel')
 
     def test_wall_clock_budget_includes_slow_status_calls(self):
         def status(pid, timeout):
@@ -78,155 +182,6 @@ class ZsToolsTimeoutTest(unittest.TestCase):
             return {'exited': False}
         self.vm.guest_exec_status_with_timeout.side_effect = status
         self.run_net()
-        self.assertEqual(1, self.vm.guest_exec_status_with_timeout.call_count)
-
-    def test_other_vm_can_run_while_previous_cleanup_pending(self):
-        self.qga._zs_tools_net_pending['vm-b'] = 43
-        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
-        self.assertEqual((0, ''), self.run_net())
-        self.assertEqual(43, self.qga._zs_tools_net_pending['vm-b'])
-
-    def test_cleanup_uses_exact_pid_and_checks_taskkill_exit(self):
-        del self.vm._cleanup_zs_tools_net
-        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=['running', 'absent'])
-        self.vm.guest_exec.return_value = {'pid': 99}
-        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
-        self.vm._cleanup_zs_tools_net(42)
-        args = self.vm.guest_exec.call_args[0][0]
-        self.assertEqual(['/PID', '42', '/T', '/F'], args['arg'])
-        self.assertTrue(args['path'].endswith('taskkill.exe'))
-
-    def test_failed_taskkill_is_not_confirmed_cleanup(self):
-        del self.vm._cleanup_zs_tools_net
-        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=['running', 'running'])
-        self.vm.guest_exec.return_value = {'pid': 99}
-        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 1}
-        with self.assertRaises(Exception):
-            self.vm._cleanup_zs_tools_net(42)
-
-    def test_lost_exited_response_recovers_across_instances(self):
-        del self.vm._cleanup_zs_tools_net
-        # Exit response consumed the QGA record and was lost. During this
-        # first call the channel also prevents an independent OS query.
-        self.vm.guest_exec_status_with_timeout.side_effect = RuntimeError('PID record not found')
-        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=RuntimeError('channel lost'))
-        code, message = self.run_net()
-        self.assertEqual(1, code)
-        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a']['pid'])
-        # A new instance after channel recovery still cannot read the consumed
-        # PID record, but Windows confirms the entire old tree is absent.
-        other = self.qga.VmQga.__new__(self.qga.VmQga)
-        other.vm_uuid = 'vm-a'
-        other.guest_exec = mock.Mock(return_value={'pid': 99})
-        other.guest_exec_status_with_timeout = mock.Mock(return_value={'exited': True, 'exitcode': 0})
-        other._query_zs_tools_net_process_state = mock.Mock(return_value='absent')
-        other._net_task_control = mock.Mock(return_value={'phase': 'finished', 'pid': 42, 'wrapper_pid': 99})
-        self.assertEqual((0, ''), other.guest_exec_zs_tools('net', '{}', wait=1, retry=3))
-        self.assertEqual([mock.call(42), mock.call(42)], other._query_zs_tools_net_process_state.call_args_list)
-        other.guest_exec.assert_called_once()
-        self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
-
-    def test_taskkill_not_found_is_resolved_by_os_absence(self):
-        del self.vm._cleanup_zs_tools_net
-        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=['running', 'absent'])
-        self.vm.guest_exec.return_value = {'pid': 99}
-        self.vm.guest_exec_status_with_timeout.side_effect = [
-            {'exited': True, 'exitcode': 128}, RuntimeError('PID record not found')]
-        self.vm._cleanup_zs_tools_net(42)
-        self.assertEqual(2, self.vm._query_zs_tools_net_process_state.call_count)
-
-    def test_reused_pid_or_orphaned_tree_is_never_killed(self):
-        del self.vm._cleanup_zs_tools_net
-        for state in ('identity_mismatch', 'orphaned'):
-            self.vm._query_zs_tools_net_process_state = mock.Mock(return_value=state)
-            with self.assertRaises(Exception):
-                self.vm._cleanup_zs_tools_net(42)
-        self.vm.guest_exec.assert_not_called()
-
-    def test_lost_taskkill_response_requires_os_confirmation(self):
-        del self.vm._cleanup_zs_tools_net
-        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=['running', 'absent'])
-        self.vm.guest_exec.return_value = {'pid': 99}
-        self.vm.guest_exec_status_with_timeout.side_effect = RuntimeError('response lost')
-        self.vm._cleanup_zs_tools_net(42)
-
-    def test_os_query_parses_independent_process_state(self):
-        self.vm.ZS_TOOLS_PATN_WIN = r'C:\\Program Files\\GuestTools\\zs-tools\\zs-tools.exe'
-        self.vm.guest_exec.return_value = {'pid': 99}
-        self.vm.guest_exec_status_with_timeout.return_value = {
-            'exited': True, 'exitcode': 0,
-            'out-data': b'ZS_TOOLS_NET_STATE|absent|42|0\r\n'}
-        self.assertEqual('absent', self.vm._query_zs_tools_net_process_state(42))
-        self.assertTrue(self.vm.guest_exec.call_args[0][0]['path'].endswith('powershell.exe'))
-
-    def test_os_query_cannot_confirm_absence_with_descendants(self):
-        self.vm.ZS_TOOLS_PATN_WIN = r'C:\\Program Files\\GuestTools\\zs-tools\\zs-tools.exe'
-        self.vm.guest_exec.return_value = {'pid': 99}
-        self.vm.guest_exec_status_with_timeout.return_value = {
-            'exited': True, 'exitcode': 0,
-            'out-data': b'ZS_TOOLS_NET_STATE|absent|42|1\r\n'}
-        with self.assertRaises(Exception):
-            self.vm._query_zs_tools_net_process_state(42)
-
-    def test_pending_exited_parent_with_live_children_blocks_every_retry(self):
-        del self.vm._cleanup_zs_tools_net
-        self.qga._zs_tools_net_pending['vm-a'] = 41
-        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
-        self.vm._query_zs_tools_net_process_state = mock.Mock(return_value='orphaned')
-        for unused in range(3):
-            code, message = self.run_net()
-            self.assertEqual(1, code)
-            self.assertIn('new execution blocked', message)
-            self.assertEqual(41, self.qga._zs_tools_net_pending['vm-a'])
-        self.vm.guest_exec.assert_not_called()
-        self.assertEqual([mock.call(41)] * 3, self.vm._query_zs_tools_net_process_state.call_args_list)
         self.vm.guest_exec_status_with_timeout.assert_not_called()
 
-    def test_normal_parent_exit_with_live_children_also_retains_pending(self):
-        del self.vm._cleanup_zs_tools_net
-        self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0}
-        self.vm._query_zs_tools_net_process_state = mock.Mock(return_value='orphaned')
-        code, message = self.run_net()
-        self.assertEqual(1, code)
-        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a']['pid'])
-        self.assertIn('orphaned', message)
-
-    def test_ps2_query_and_lost_exit_record_allow_three_cross_instance_retries(self):
-        import base64
-        self.qga._zs_tools_net_pending['vm-a'] = 41
-        scripts = []
-        launches = []
-        for unused in range(3):
-            vm = self.qga.VmQga.__new__(self.qga.VmQga)
-            vm.vm_uuid = 'vm-a'
-            vm.ZS_TOOLS_PATN_WIN = r'C:\Program Files\GuestTools\zs-tools\zs-tools.exe'
-            def execute(args):
-                if args['path'].endswith('powershell.exe'):
-                    script = base64.b64decode(args['arg'][-1]).decode('utf-16le')
-                    # Model the PS2 compatibility failure rather than silently
-                    # returning a successful mocked response for a PS3 script.
-                    if 'ConvertTo-Json' in script or '[PSCustomObject]' in script:
-                        raise RuntimeError('PowerShell 2.0 unsupported command')
-                    scripts.append(script)
-                    return {'pid': 100}
-                launches.append(args)
-                return {'pid': 42}
-            def status(pid, timeout):
-                if pid == 41:
-                    raise RuntimeError('consumed exit record')
-                if pid == 100:
-                    target = 41 if len(scripts) == 1 else 42
-                    return {'exited': True, 'exitcode': 0,
-                            'out-data': ('ZS_TOOLS_NET_STATE|absent|%s|0' % target).encode('ascii')}
-                return {'exited': True, 'exitcode': 0}
-            vm._net_task_control = mock.Mock(return_value={'phase': 'finished', 'pid': 42, 'wrapper_pid': 42})
-            vm._net_task_launch_args = lambda task, config: {'path': vm.ZS_TOOLS_PATN_WIN, 'arg': ['net', '--config', config]}
-            vm.guest_exec = mock.Mock(side_effect=execute)
-            vm.guest_exec_status_with_timeout = mock.Mock(side_effect=status)
-            self.assertEqual((0, ''), vm.guest_exec_zs_tools('net', '{}', wait=1, retry=3))
-            self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
-        self.assertEqual(3, len(launches))
-        self.assertEqual(4, len(scripts))
-
-if __name__ == '__main__':
-    unittest.main()
+if __name__ == '__main__': unittest.main()

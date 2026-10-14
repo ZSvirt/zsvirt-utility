@@ -26,8 +26,6 @@ class SubmissionTest(unittest.TestCase):
         self.vm._net_task_control = mock.Mock(side_effect=self.control)
         self.vm.guest_exec = mock.Mock(side_effect=self.launch)
         self.vm.guest_exec_status_with_timeout = mock.Mock(side_effect=lambda pid, timeout: {'exited': self.finished, 'exitcode': 0})
-        self.vm._cleanup_zs_tools_net = mock.Mock()
-        self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=lambda pid: 'absent' if self.finished else 'running')
 
     def sleep(self, seconds): self.now += seconds
 
@@ -42,7 +40,13 @@ class SubmissionTest(unittest.TestCase):
         if action == 'prepare':
             self.records[token] = {'phase': 'reserved', 'wrapper_pid': 0, 'pid': 0}
         record = self.records[token]
-        if action == 'seal' or (action == 'cancel' and record['phase'] == 'reserved'):
+        if action == 'inspect' and self.finished: record['phase'] = 'finished'
+        if action == 'collect':
+            if not self.finished: raise RuntimeError('Job still active')
+            return dict(record, exitcode=0)
+        if action in ('seal', 'cancel') and record['phase'] != 'reserved' and not self.finished:
+            raise RuntimeError('Net task Job is still active')
+        if action == 'seal' or (action == 'cancel' and (record['phase'] == 'reserved' or self.finished)):
             record['phase'] = 'cancelled'
         return record.copy()
 
@@ -70,7 +74,6 @@ class SubmissionTest(unittest.TestCase):
             self.assertEqual(1, other.guest_exec_zs_tools('net', '{}', wait=1, retry=3)[0])
             self.assertIs(task, self.qga._zs_tools_net_pending['vm-a'])
         self.assertEqual(1, len(self.launches))
-        self.vm._cleanup_zs_tools_net.assert_not_called()
         self.finished = True
         self.records[task['task_id']]['phase'] = 'finished'
         self.drop_response = False
@@ -103,13 +106,11 @@ class SubmissionTest(unittest.TestCase):
         self.assertEqual(1, len(self.launches))
         self.assertIn('vm-a', self.qga._zs_tools_net_pending)
 
-    def test_acknowledged_launch_retries_existing_cleanup_policy(self):
+    def test_acknowledged_launch_keeps_pending_until_job_absence(self):
         self.drop_response = False
-        self.vm._cleanup_zs_tools_net.side_effect = RuntimeError('cleanup unavailable')
         self.assertEqual(1, self.run_net()[0])
         task = self.qga._zs_tools_net_pending['vm-a']
         self.assertEqual('submitted', task['phase'])
-        self.vm._cleanup_zs_tools_net.side_effect = None
         self.finished = True
         self.assertEqual((0, ''), self.run_net())
         self.assertEqual(2, len(self.launches))
