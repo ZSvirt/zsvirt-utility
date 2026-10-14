@@ -1056,6 +1056,111 @@ def check_missing_pv(vgUuid):
                 raise Exception("vg %s was missing pv[name:%s, uuid:%s] , unable to restore" % (vgUuid, pv_name, pv_uuid))
             restore_missing_pv(pv_name)
 
+def list_lvs_expected_devices(vgUuid):
+    cmd = ("%s --segments --reportformat json --config report/mark_hidden_devices=0 "
+           "-o vg_name,pv_name,pv_major,pv_minor,lv_name,segtype -S %s" %
+           (subcmd("pvs"), linux.shellquote("lv_active=active && vg_name=%s" % vgUuid)))
+    return_code, output, _ = bash.bash_roe(cmd)
+    if return_code != 0:
+        logger.warn("failed to query LVM PV segments for VG %s, return code: %s" % (vgUuid, return_code))
+        return
+
+    reports = simplejson.loads(output).get("report") or []
+    rows = reports[0].get("pvseg") or [] if reports else []
+    if not rows:
+        logger.warn("skip LVM device mismatch detection because the PV segment report for VG %s is empty" % vgUuid)
+        return
+
+    lvs = {}
+    for row in rows:
+        lv_name = str(row.get("lv_name") or "").strip()
+        if not lv_name:
+            continue
+        vg_name = str(row.get("vg_name") or "").strip()
+        if not vg_name:
+            logger.warn("skip incomplete LVM PV segment in VG %s" % vgUuid)
+            continue
+
+        dm_name = "%s-%s" % (vg_name.replace("-", "--"), lv_name.replace("-", "--"))
+        lv = lvs.setdefault(dm_name, {
+            "path": "%s/%s" % (vg_name, lv_name),
+            "expected_devices": {},
+            "segtypes": set(),
+            "incomplete": False,
+        })
+        lv["segtypes"].add(str(row.get("segtype") or "").strip())
+        pv_name = str(row.get("pv_name") or "").strip()
+        device = "%s:%s" % (str(row.get("pv_major") or "").strip(),
+                             str(row.get("pv_minor") or "").strip())
+        if pv_name and device != "0:0" and re.match(r"^\d+:\d+$", device):
+            lv["expected_devices"][device] = pv_name
+        else:
+            lv["incomplete"] = True
+    return lvs
+
+def list_dm_actual_devices():
+    return_code, output, _ = bash.bash_roe("timeout -s SIGKILL 30 dmsetup table --concise")
+    if return_code != 0:
+        logger.warn("failed to query device-mapper tables, return code: %s" % return_code)
+        return
+
+    dm_tables = {}
+    for entry in (output or "").split(";"):
+        fields = entry.strip().split(",", 4)
+        if len(fields) != 5:
+            continue
+        devices = set()
+        complete = True
+        for segment in fields[4].split(","):
+            tokens = segment.split()
+            if len(tokens) < 4 or tokens[2] != "linear" or not re.match(r"^\d+:\d+$", tokens[3]):
+                complete = False
+                continue
+            devices.add(tokens[3])
+        dm_tables[fields[0].strip()] = (devices, complete)
+    return dm_tables
+
+def find_mismatched_lvs(lvs, dm_tables):
+    mismatched_lvs = []
+    for dm_name, lv in lvs.items():
+        if lv["segtypes"] != {"linear"}:
+            continue
+        if lv["incomplete"] or not lv["expected_devices"]:
+            logger.warn("skip %s because its LVM PV device report is incomplete" % lv["path"])
+            continue
+        dm_table = dm_tables.get(dm_name)
+        if not dm_table or not dm_table[0] or not dm_table[1]:
+            logger.warn("skip %s because its device-mapper table is missing or incomplete" % lv["path"])
+            continue
+        if not dm_table[0].issubset(set(lv["expected_devices"])):
+            logger.warn("LVM device mismatch for %s, dm table devices: [%s], expected devices: [%s]" %
+                        (lv["path"], ", ".join(sorted(dm_table[0])),
+                         ", ".join("%s(%s)" % (pv_name, device) for device, pv_name
+                                   in sorted(lv["expected_devices"].items()))))
+            mismatched_lvs.append(lv["path"])
+    return sorted(mismatched_lvs)
+
+@linux.ignoreerror
+def refresh_mismatched_lvs(vgUuid):
+    lvs = list_lvs_expected_devices(vgUuid)
+    if not lvs:
+        return
+    dm_tables = list_dm_actual_devices()
+    if dm_tables is None:
+        return
+    mismatched_lvs = find_mismatched_lvs(lvs, dm_tables)
+    if not mismatched_lvs:
+        return
+
+    cmd = "%s --refresh %s" % (subcmd("lvchange"),
+                                " ".join(linux.shellquote(path) for path in mismatched_lvs))
+    logger.warn("refresh mismatched LVs with command: %s" % cmd)
+    return_code, stdout, stderr = bash.bash_roe(cmd)
+    if return_code != 0:
+        logger.warn("failed to refresh mismatched LVs %s: %s" %
+                    (", ".join(mismatched_lvs),
+                     (stderr or "").strip() or (stdout or "").strip() or return_code))
+
 def stop_vg_lock(vgUuid):
     @linux.retry(times=3, sleep_time=random.uniform(0.1, 1))
     def vg_lock_not_exists(vgUuid):
