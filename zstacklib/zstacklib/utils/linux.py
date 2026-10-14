@@ -4467,3 +4467,10 @@ def catch_bad_alloc_exception(return_code, error_detail):
         return True
     
     return False
+
+
+BLKSSZGET = 0x1268
+
+def get_dev_logical_sector_size(dev_path):
+    with open(dev_path, 'rb') as f:
+        return struct.unpack('I', fcntl.ioctl(f.fileno(), BLKSSZGET, b'    '))[0]
