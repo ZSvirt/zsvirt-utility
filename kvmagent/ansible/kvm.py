@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import external_plugin_layout
 import libvirt_control
+import lvm_package_transition
 from zstacklib import *
 
 # create log
@@ -317,6 +318,10 @@ def install_kvm_pkg():
             dep_list = ' '.join(_dep_list)
             if 'storcli' in _dep_list:
                 update_list += ' storcli'
+
+            lvm_package_transition.migrate_legacy_packages(
+                releasever, host_info.host_arch, zstack_repo, _skip_list,
+                host_post_info, run_remote_command)
 
             # name: install/update kvm related packages on RedHat based OS from user defined repo
             command = ("echo {1} >/var/lib/zstack/dependencies && yum --disablerepo=* --enablerepo={0} clean metadata >/dev/null && \
