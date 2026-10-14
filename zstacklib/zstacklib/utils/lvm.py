@@ -837,8 +837,8 @@ def start_lock_service(io_timeout=40):
     if restart_sanlock:
         stop_sanlock()
     if restart_lvmlockd:
-        write_lvmlockd_adopt_file()
         stop_lvmlockd()
+        write_lvmlockd_adopt_file()
         linux.rm_file_force(LVMLOCKD_SOCKET)
 
     r = bash.bash_r("systemctl status sanlock | grep '(running)'")
