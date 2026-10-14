@@ -86,6 +86,7 @@ class SanlockClientStatus(object):
     def __init__(self, status_lines):
         self.lockspace = status_lines[0].split()[1]
         self.is_adding = ':0 ADD' in status_lines[0]
+        self.space_dead = 0
 
         for line in status_lines[1:]:
             try:
@@ -498,6 +499,15 @@ def sector_size_to_align_size(sector_size):
 
 class RetryException(Exception):
     pass
+
+def read_monotonic_uptime():
+    try:
+        with open('/proc/uptime', 'r') as f:
+            return float(f.read().split()[0])
+    except (IOError, OSError, ValueError, IndexError) as e:
+        logger.warn("failed to read /proc/uptime: %s" % e)
+        return None
+
 
 def calc_id_renewal_fail_seconds(io_timeout):
     return 8 * int(io_timeout)

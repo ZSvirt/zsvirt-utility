@@ -541,14 +541,28 @@ class SblkHealthChecker(AbstractStorageFencer):
 
         renewal_failure_seconds = sanlock.calc_id_renewal_fail_seconds(r.get_io_timeout())
 
-        if r.get_renewal_last_result() != 1:
-            if (r.get_renewal_last_attempt() > r.get_renewal_last_success() and \
-                    r.get_renewal_last_attempt() - r.get_renewal_last_success() > renewal_failure_seconds) or \
-                    (r.get_renewal_last_attempt() < r.get_renewal_last_success() - renewal_failure_seconds < r.get_renewal_last_success()):
-                failure = "sanlock last renewal failed with %s and last attempt is %s, last success is %s, renewal failed for more than %s second" % \
-                        (r.get_renewal_last_result(), r.get_renewal_last_attempt(), r.get_renewal_last_success(), renewal_failure_seconds)
-                logger.warn(failure)
-                return self.inc_vg_failure_cnt(vg), failure
+        if r.is_space_dead():
+            now = sanlock.read_monotonic_uptime()
+            failure = "sanlock lockspace for vg %s is dead, space_dead=%s, uptime=%s, last success is %s, renewal failure threshold is %s second" % \
+                    (vg, r.space_dead, now, getattr(r, 'renewal_last_success', None), renewal_failure_seconds)
+            logger.warn(failure)
+            return self.inc_vg_failure_cnt(vg), failure
+
+        if r.get_renewal_last_result() == 1:
+            return 0, None
+
+        now = sanlock.read_monotonic_uptime()
+        if now is None:
+            logger.warn("failed to read monotonic uptime, skip renewal age check for vg %s" % vg)
+            return 0, None
+
+        last_success = r.get_renewal_last_success()
+        if (now > last_success and now - last_success > renewal_failure_seconds) or \
+                (now < last_success - renewal_failure_seconds < last_success):
+            failure = "sanlock last renewal failed with %s, space_dead=%s, uptime=%s, last attempt is %s, last success is %s, renewal failed for more than %s second" % \
+                    (r.get_renewal_last_result(), r.space_dead, now, r.get_renewal_last_attempt(), last_success, renewal_failure_seconds)
+            logger.warn(failure)
+            return self.inc_vg_failure_cnt(vg), failure
 
         return 0, None
 
