@@ -13020,7 +13020,7 @@ host side snapshot files chian:
 
             extend_size = lv_size + self.auto_extend_size
             try:
-                lvm.extend_lv(path, extend_size, skip_if_sufficient=True, extra_options="--lockopt shupdate,norefresh")
+                lvm.extend_lv(path, extend_size, skip_if_sufficient=True, lockopts=["shupdate", "norefresh"])
             except Exception as e:
                 logger.warn("extend lv[%s] to size[%s] failed" % (path, extend_size))
             else:
