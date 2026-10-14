@@ -190,8 +190,11 @@ class SanlockClientStatusParser(object):
 
 
 @bash.in_bash
-def direct_init_resource(resource):
+def direct_init_resource(resource, vg_name):
+    sector_size = get_sector_size(vg_name)
+    align_size = sector_size_to_align_size(sector_size)
     cmd = "sanlock direct init -r %s" % resource
+    cmd += " -A %sM -Z %s" % (sizeunit.Byte.toMegaByte(align_size), sector_size)
     return bash.bash_r(cmd)
 
 
@@ -232,7 +235,8 @@ def check_stuck_vglk_and_gllk():
                 continue
 
         logger.debug("find dirty %s on vg %s, init it directly" % (lck.resource_name, lck.vg_name))
-        direct_init_resource("{}:{}:/dev/mapper/{}-lvmlock:{}".format(lck.lockspace_name, lck.resource_name, lck.vg_name, lck.offset))
+        direct_init_resource("{}:{}:/dev/mapper/{}-lvmlock:{}".format(lck.lockspace_name, lck.resource_name, lck.vg_name, lck.offset),
+                             lck.vg_name)
 
 
 def read_lockspace_metadata_from_backup(vg_uuid):
@@ -461,14 +465,14 @@ def repair_vglk_metadata(vg_name):
                 if is_lease_corrupted(read_rv):
                     logger.debug("vglk lease corrupted, cmd {}, err:\n{}, reinit it.".format(cmd, o))
                     if "sanlock lease needs repair" in bash.bash_o("vgck {} --lockopt repairvg 2>&1".format(vg_name)):
-                        direct_init_resource("lvm_{0}:VGLK:/dev/mapper/{0}-lvmlock:{1}".format(vg_name, offset))
+                        direct_init_resource("lvm_{0}:VGLK:/dev/mapper/{0}-lvmlock:{1}".format(vg_name, offset), vg_name)
                     break
 
             if line.startswith("lvb "):
                 lvb = int(line.split()[-1], 16)
                 if is_vglk_lvb_invalid(lvb, vg_name):
                     logger.debug("vglk lvb invalid, cmd {}, err:\n{}, reinit it.".format(cmd, o))
-                    direct_init_resource("lvm_{0}:VGLK:/dev/mapper/{0}-lvmlock:{1}".format(vg_name, offset))
+                    direct_init_resource("lvm_{0}:VGLK:/dev/mapper/{0}-lvmlock:{1}".format(vg_name, offset), vg_name)
                     break
 
 
@@ -528,6 +532,26 @@ def get_lockspace(vg_uuid):
     return None
 
 
+def get_lockspace_sector_size(vg_uuid):
+    dev_path = "/dev/mapper/%s-lvmlock" % vg_uuid
+    try:
+        physical_block_size = linux.get_dev_physical_sector_size(dev_path)
+    except Exception:
+        physical_block_size = 0
+    try:
+        logical_block_size = linux.get_dev_logical_sector_size(dev_path)
+    except Exception:
+        logical_block_size = 0
+
+    if physical_block_size not in (SECTOR_SIZE_512, SECTOR_SIZE_4K):
+        physical_block_size = 0
+    if logical_block_size not in (SECTOR_SIZE_512, SECTOR_SIZE_4K):
+        logical_block_size = 0
+    if not physical_block_size and not logical_block_size:
+        raise Exception("cannot get block size for lockspace device %s" % dev_path)
+    if physical_block_size == SECTOR_SIZE_4K or logical_block_size == SECTOR_SIZE_4K:
+        return SECTOR_SIZE_4K
+    return SECTOR_SIZE_512
 
 
 def get_sector_size(vg_uuid):
@@ -541,10 +565,10 @@ def get_sector_size(vg_uuid):
         logger.debug("read sector size[{}] from lvm lockspace info for vg {}".format(sector_size, vg_uuid))
         return sector_size
 
-    sector_size = int(linux.get_dev_logical_sector_size("/dev/mapper/{}-lvmlock".format(vg_uuid)))
+    sector_size = get_lockspace_sector_size(vg_uuid)
     if sector_size in (SECTOR_SIZE_512, SECTOR_SIZE_4K):
         sector_size_cache[vg_uuid] = sector_size
-        logger.debug("get sector size[{0}] from dev for vg {1}".format(sector_size, vg_uuid))
+        logger.debug("read sector size[{0}] from lockspace for vg {1}".format(sector_size, vg_uuid))
         return sector_size
 
     raise Exception("sector size[{}] is invalid".format(sector_size))

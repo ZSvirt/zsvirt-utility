@@ -1727,7 +1727,7 @@ def _need_retry_active_lv(arg, exception):
     lock = get_lock_hold_by_us()
     if lock is not None:
         logger.debug("find lv lock hold by us on lockspace but not on client, directly init lv[path:%s]" % path)
-        return sanlock.direct_init_resource(lock) == 0
+        return sanlock.direct_init_resource(lock, get_vg_uuid(path)) == 0
 
     return False
 
