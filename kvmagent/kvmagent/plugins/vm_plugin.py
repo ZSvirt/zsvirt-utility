@@ -13020,16 +13020,9 @@ host side snapshot files chian:
 
             extend_size = lv_size + self.auto_extend_size
             try:
-                lvm.extend_lv(path, extend_size)
+                lvm.extend_lv(path, extend_size, skip_if_sufficient=True, extra_options="--lockopt shupdate,norefresh")
             except Exception as e:
                 logger.warn("extend lv[%s] to size[%s] failed" % (path, extend_size))
-                if "incompatible mode" not in e.message.lower():
-                    return
-                try:
-                    with lvm.OperateLv(path, shared=False, delete_when_exception=False):
-                        lvm.extend_lv(path, extend_size)
-                except Exception as e:
-                    logger.warn("extend lv[%s] to size[%s] with operate failed" % (path, extend_size))
             else:
                 logger.debug("lv %s extend to %s sucess" % (path, extend_size))
             return True

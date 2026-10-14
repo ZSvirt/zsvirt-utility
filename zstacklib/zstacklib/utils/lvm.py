@@ -1635,12 +1635,12 @@ def resize_lv(path, size, force=False):
 
 @bash.in_bash
 @linux.retry(times=15, sleep_time=random.uniform(0.1, 3))
-def extend_lv(path, extend_size, skip_if_sufficient=False):
+def extend_lv(path, extend_size, skip_if_sufficient=False, extra_options=""):
     final_size = calcLvReservedSize(extend_size)
     if skip_if_sufficient and int(get_lv_size(path)) >= final_size:
         return
 
-    r, o, e = bash.bash_roe("%s --size %sb %s" % (subcmd("lvextend"), final_size, path))
+    r, o, e = bash.bash_roe("%s --size %sb %s %s" % (subcmd("lvextend"), final_size, path, extra_options))
     if r == 0:
         logger.debug("successfully extend lv %s size to %s" % (path, extend_size))
         return
