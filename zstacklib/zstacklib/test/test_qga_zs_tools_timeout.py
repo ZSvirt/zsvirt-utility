@@ -15,6 +15,7 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         self.vm.guest_exec = mock.Mock(return_value={'pid': 42})
         self.vm.guest_exec_status_with_timeout = mock.Mock(return_value={'exited': False})
         self.vm._cleanup_zs_tools_net = mock.Mock()
+        self.vm._net_task_control = mock.Mock(return_value={'phase': 'finished', 'pid': 42, 'wrapper_pid': 42})
         self.now = 100.0
         def sleep(seconds):
             self.now += seconds
@@ -49,11 +50,12 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         other.guest_exec = mock.Mock()
         other.guest_exec_status_with_timeout = mock.Mock(side_effect=RuntimeError('QGA disconnected'))
         other._cleanup_zs_tools_net = mock.Mock(side_effect=RuntimeError('QGA disconnected'))
+        other._net_task_control = mock.Mock(side_effect=RuntimeError('QGA disconnected'))
         code, message = other.guest_exec_zs_tools('net', '{}', wait=1, retry=3)
         self.assertEqual(1, code)
         self.assertIn('new execution blocked', message)
         other.guest_exec.assert_not_called()
-        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a'])
+        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a']['pid'])
 
     def test_exited_previous_pid_allows_next_request(self):
         self.qga._zs_tools_net_pending['vm-a'] = 41
@@ -110,7 +112,7 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         self.vm._query_zs_tools_net_process_state = mock.Mock(side_effect=RuntimeError('channel lost'))
         code, message = self.run_net()
         self.assertEqual(1, code)
-        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a'])
+        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a']['pid'])
         # A new instance after channel recovery still cannot read the consumed
         # PID record, but Windows confirms the entire old tree is absent.
         other = self.qga.VmQga.__new__(self.qga.VmQga)
@@ -118,8 +120,9 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         other.guest_exec = mock.Mock(return_value={'pid': 99})
         other.guest_exec_status_with_timeout = mock.Mock(return_value={'exited': True, 'exitcode': 0})
         other._query_zs_tools_net_process_state = mock.Mock(return_value='absent')
+        other._net_task_control = mock.Mock(return_value={'phase': 'finished', 'pid': 42, 'wrapper_pid': 99})
         self.assertEqual((0, ''), other.guest_exec_zs_tools('net', '{}', wait=1, retry=3))
-        self.assertEqual([mock.call(42), mock.call(99)], other._query_zs_tools_net_process_state.call_args_list)
+        self.assertEqual([mock.call(42), mock.call(42)], other._query_zs_tools_net_process_state.call_args_list)
         other.guest_exec.assert_called_once()
         self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
 
@@ -185,7 +188,7 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         self.vm._query_zs_tools_net_process_state = mock.Mock(return_value='orphaned')
         code, message = self.run_net()
         self.assertEqual(1, code)
-        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a'])
+        self.assertEqual(42, self.qga._zs_tools_net_pending['vm-a']['pid'])
         self.assertIn('orphaned', message)
 
     def test_ps2_query_and_lost_exit_record_allow_three_cross_instance_retries(self):
@@ -216,6 +219,8 @@ class ZsToolsTimeoutTest(unittest.TestCase):
                     return {'exited': True, 'exitcode': 0,
                             'out-data': ('ZS_TOOLS_NET_STATE|absent|%s|0' % target).encode('ascii')}
                 return {'exited': True, 'exitcode': 0}
+            vm._net_task_control = mock.Mock(return_value={'phase': 'finished', 'pid': 42, 'wrapper_pid': 42})
+            vm._net_task_launch_args = lambda task, config: {'path': vm.ZS_TOOLS_PATN_WIN, 'arg': ['net', '--config', config]}
             vm.guest_exec = mock.Mock(side_effect=execute)
             vm.guest_exec_status_with_timeout = mock.Mock(side_effect=status)
             self.assertEqual((0, ''), vm.guest_exec_zs_tools('net', '{}', wait=1, retry=3))

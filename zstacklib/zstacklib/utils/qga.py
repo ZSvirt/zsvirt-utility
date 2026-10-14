@@ -2,6 +2,8 @@ import base64
 import json
 import time
 import threading
+import uuid
+import subprocess
 
 import libvirt
 import libvirt_qemu
@@ -429,7 +431,231 @@ if ($root.Count -gt 0) {
         except Exception:
             pass
 
+    def _net_task_script(self, task, action, config=None):
+        # The state file is the launch receipt for old zs-tools versions too.
+        # All state transitions and cancellation use the same exclusive lock.
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$taskId = '%s'
+$recordPath = 'C:\ProgramData\ZStack\zs-tools-net\' + $taskId + '.state'
+$lockPath = $recordPath + '.lock'
+function Lock-Record {
+    return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate,
+        [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+}
+function Read-Record {
+    $parts = [IO.File]::ReadAllText($recordPath).Trim().Split('|')
+    if ($parts.Length -ne 5 -or $parts[0] -ne 'ZSN1' -or
+        $parts[1] -ne $taskId -or
+        @('reserved','starting','running','finished','failed','cancelled') -notcontains $parts[2] -or
+        $parts[3] -notmatch '^\d+$' -or $parts[4] -notmatch '^\d+$') {
+        throw 'Invalid net task receipt'
+    }
+    return $parts
+}
+function Write-Record($state, $wrapperPid, $childPid) {
+    $text = 'ZSN1|{0}|{1}|{2}|{3}' -f $taskId,$state,$wrapperPid,$childPid
+    [IO.File]::WriteAllText($recordPath, $text, [Text.Encoding]::ASCII)
+}
+""" % task['task_id']
+        if action == 'launch':
+            arguments = subprocess.list2cmdline(['net', '--config', config])
+            script += r"""
+$started = $false
+$locked = $null
+try {
+    $locked = Lock-Record
+    $record = Read-Record
+    if ($record[2] -ne 'reserved') { throw 'Net task is sealed or already claimed' }
+    Write-Record 'starting' $PID 0
+    $stdoutPath = $recordPath + '.out'
+    $stderrPath = $recordPath + '.err'
+    $process = Start-Process -FilePath '%s' -ArgumentList '%s' -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $processHandle = $process.Handle
+    $started = $true
+    Write-Record 'running' $PID $process.Id
+    $locked.Dispose(); $locked = $null
+    $process.WaitForExit()
+    $code = $process.ExitCode
+    $locked = Lock-Record
+    $record = Read-Record
+    if ($record[2] -eq 'running') { Write-Record 'finished' $PID $process.Id }
+    $locked.Dispose(); $locked = $null
+    [Console]::Out.Write([IO.File]::ReadAllText($stdoutPath))
+    [Console]::Error.Write([IO.File]::ReadAllText($stderrPath))
+    exit $code
+} catch {
+    # A crash after Start but before recording the child retains 'starting';
+    # its wrapper PID and tree must be proven absent before cancellation.
+    if (!$started -and $locked -ne $null) {
+        $record = Read-Record
+        if ($record[2] -eq 'starting') { Write-Record 'failed' $PID 0 }
+    }
+    [Console]::Error.WriteLine('Net task launcher failed')
+    exit 1
+} finally {
+    if ($locked -ne $null) { $locked.Dispose() }
+}
+""" % (self.ZS_TOOLS_PATN_WIN.replace("'", "''"), arguments.replace("'", "''"))
+        else:
+            if action not in ('prepare', 'inspect', 'cancel', 'seal'):
+                raise ValueError('invalid net task action')
+            script += r"""
+$action = '%s'
+if ($action -eq 'prepare') { [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($recordPath)) | Out-Null }
+$locked = Lock-Record
+try {
+    if ($action -eq 'prepare') {
+        if ([IO.File]::Exists($recordPath)) { throw 'Duplicate net task ID' }
+        Write-Record 'reserved' 0 0
+    }
+    $record = Read-Record
+    if (($action -eq 'cancel' -and $record[2] -eq 'reserved') -or $action -eq 'seal') {
+        Write-Record 'cancelled' $record[3] $record[4]
+        $record = Read-Record
+    }
+    [Console]::Out.WriteLine(($record -join '|'))
+} finally { $locked.Dispose() }
+""" % action
+        return script
+
+    def _net_task_launch_args(self, task, config):
+        encoded = base64.b64encode(self._net_task_script(task, 'launch', config).encode('utf-16le'))
+        if not isinstance(encoded, str):
+            encoded = encoded.decode('ascii')
+        return {'path': r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+                'arg': ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                'capture-output': True}
+
+    def _net_task_control(self, task, action):
+        script = self._net_task_script(task, action)
+        encoded = base64.b64encode(script.encode('utf-16le'))
+        if not isinstance(encoded, str):
+            encoded = encoded.decode('ascii')
+        result = self.guest_exec({
+            'path': r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+            'arg': ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+            'capture-output': True})
+        if not result or 'pid' not in result:
+            raise Exception('net task control did not return a PID')
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            status = self.guest_exec_status_with_timeout(result['pid'], 2)
+            if status.get('exited'):
+                if status.get('exitcode') != 0:
+                    raise Exception('net task control failed or receipt is locked')
+                data = status.get('out-data', b'')
+                if not isinstance(data, str):
+                    data = data.decode('ascii')
+                fields = data.strip().split('|')
+                if (len(fields) != 5 or fields[:2] != ['ZSN1', task['task_id']] or
+                        fields[2] not in ('reserved', 'starting', 'running', 'finished', 'failed', 'cancelled') or
+                        not fields[3].isdigit() or not fields[4].isdigit()):
+                    raise Exception('invalid net task receipt response')
+                return {'phase': fields[2], 'wrapper_pid': int(fields[3]), 'pid': int(fields[4])}
+            time.sleep(0.2)
+        raise Exception('net task control response timed out')
+
+    def _recover_net_task(self, task):
+        if not isinstance(task, dict):
+            self._cleanup_zs_tools_net(task)  # pending from the previous implementation
+            return
+        # Cancel unclaimed requests under the Guest lock. A delayed launcher
+        # subsequently observes the seal and cannot start an old task.
+        record = self._net_task_control(task, 'cancel')
+        if record['phase'] in ('cancelled', 'failed'):
+            return
+        if task['phase'] != 'unknown' and record['pid']:
+            # Preserve the existing cleanup policy for acknowledged launches.
+            # Unknown submissions instead stay blocked until absence is proven.
+            self._cleanup_zs_tools_net(record['pid'])
+            self._net_task_control(task, 'seal')
+            return
+        target = record['pid'] or record['wrapper_pid']
+        if not target or self._query_zs_tools_net_process_state(target) != 'absent':
+            raise Exception('previous net task {} is still active or unconfirmed'.format(task['task_id']))
+        self._net_task_control(task, 'seal')
+
+    def _guest_exec_zs_tools_net(self, config, config_obj, output, wait, retry):
+        started = time.time()
+        task = None
+        with _zs_tools_net_lock:
+            try:
+                if self.vm_uuid in _zs_tools_net_pending:
+                    try:
+                        self._recover_net_task(_zs_tools_net_pending[self.vm_uuid])
+                        _zs_tools_net_pending.pop(self.vm_uuid)
+                    except Exception as error:
+                        raise Exception('new execution blocked: {}'.format(error))
+                task = {'task_id': uuid.uuid4().hex, 'phase': 'preparing', 'pid': None}
+                _zs_tools_net_pending[self.vm_uuid] = task
+                self._net_task_control(task, 'prepare')
+                # Everything after this point may have been accepted by QGA,
+                # even if the transport never delivers the wrapper PID.
+                task['phase'] = 'unknown'
+                execution_started = time.time()
+                result = self.guest_exec(self._net_task_launch_args(task, config))
+                if not result or 'pid' not in result:
+                    raise Exception('net launcher submission result is unknown')
+                task['wrapper_pid'] = result['pid']
+                task['phase'] = 'submitted'
+                deadline = execution_started + wait * retry
+                while time.time() < deadline:
+                    time.sleep(min(wait, max(0, deadline-time.time())))
+                    remaining = deadline-time.time()
+                    if remaining < 1:
+                        break
+                    try:
+                        record = self._net_task_control(task, 'inspect')
+                    except Exception:
+                        # A launch transition can briefly hold the receipt
+                        # lock. Retain the reservation and retry within budget.
+                        continue
+                    task['pid'] = record['pid'] or None
+                    remaining = deadline-time.time()
+                    if remaining < 1:
+                        break
+                    status = self.guest_exec_status_with_timeout(task['wrapper_pid'], min(15, max(1, int(remaining))))
+                    if status.get('exited'):
+                        if task['pid'] is not None:
+                            self._cleanup_zs_tools_net(task['pid'])
+                        elif record['phase'] not in ('failed', 'cancelled'):
+                            raise Exception('net child identity is unconfirmed')
+                        self._net_task_control(task, 'seal')
+                        _zs_tools_net_pending.pop(self.vm_uuid)
+                        data = []
+                        if output:
+                            for field in ('out-data', 'err-data'):
+                                if status.get(field):
+                                    data.append(decode_with_fallback(status[field]))
+                        return status.get('exitcode'), '\n'.join(data)
+                raise Exception('net task {} exceeded deadline {}s'.format(task['task_id'], wait*retry))
+            except Exception as error:
+                cleanup = ''
+                if task is not None:
+                    if task['phase'] == 'preparing':
+                        # No net launch has been sent; a lost prepare response
+                        # can leave an unused receipt but cannot start a task.
+                        _zs_tools_net_pending.pop(self.vm_uuid, None)
+                    elif task.get('pid') is not None:
+                        try:
+                            self._cleanup_zs_tools_net(task['pid'])
+                            self._net_task_control(task, 'seal')
+                            _zs_tools_net_pending.pop(self.vm_uuid, None)
+                            cleanup = '; guest process tree terminated'
+                        except Exception:
+                            cleanup = '; cleanup unconfirmed; subsequent net execution blocked'
+                    else:
+                        cleanup = '; submission result unknown; subsequent net execution blocked'
+                return 1, 'qga exec zs-tools operate net failed for vm {}, task={}, pid={}, elapsed={:.3f}s, config: {}, error: {}{}'.format(
+                    self.vm_uuid, task['task_id'] if task else None,
+                    task.get('pid') if task else None, time.time()-started,
+                    log.mask_sensitive_field(config_obj, config), error, cleanup)
+
     def guest_exec_zs_tools(self, operate, config, config_obj=None, output=True, wait=qga_exec_wait_interval, retry=zs_tools_wait_retry):
+        if operate == 'net':
+            return self._guest_exec_zs_tools_net(config, config_obj, output, wait, retry)
         def get_return_data(result):
             if not result:
                 return ""
@@ -442,32 +668,13 @@ if ($root.Count -gt 0) {
         started = time.time()
         pid = None
         ret = None
-        is_net = operate == 'net'
-        # Serializes direct callers as well as vm_config's decorated methods.
-        if is_net:
-            _zs_tools_net_lock.acquire()
         try:
-            if is_net and self.vm_uuid in _zs_tools_net_pending:
-                old_pid = _zs_tools_net_pending[self.vm_uuid]
-                # Re-check before starting a new task. Keep the record if QGA
-                # cannot confirm exit or cleanup, and retry on the next request.
-                try:
-                    # Parent exit is never evidence that its children exited.
-                    # This also works after the QGA PID record was consumed.
-                    self._cleanup_zs_tools_net(old_pid)
-                    _zs_tools_net_pending.pop(self.vm_uuid, None)
-                except Exception as old_error:
-                    raise Exception("previous guest net pid {} cleanup is unconfirmed; new execution blocked: {}".format(old_pid, old_error))
-
             execution_started = time.time()
             ret = self.guest_exec(
                 {"path": self.ZS_TOOLS_PATN_WIN, "arg": [operate, "--config", config], "capture-output": output})
             if not ret or "pid" not in ret:
                 raise Exception("guest-exec did not return a pid: {}".format(ret))
             pid = ret["pid"]
-            if is_net:
-                _zs_tools_net_pending[self.vm_uuid] = pid
-
             deadline = execution_started + wait * retry
             ret = None
             while time.time() < deadline:
@@ -477,28 +684,12 @@ if ($root.Count -gt 0) {
                     break
                 ret = self.guest_exec_status_with_timeout(pid, min(15, max(1, int(remaining))))
                 if ret.get('exited'):
-                    if is_net:
-                        # Apply the same full-tree invariant on the normal
-                        # exit path, including Guests without kill-on-close jobs.
-                        self._cleanup_zs_tools_net(pid)
-                        _zs_tools_net_pending.pop(self.vm_uuid, None)
                     return ret.get('exitcode'), get_return_data(ret)
             raise Exception("guest pid {} exceeded deadline {}s; last status={}".format(pid, wait * retry, ret))
         except Exception as e:
-            cleanup = ''
-            if is_net and pid is not None and self.vm_uuid in _zs_tools_net_pending:
-                try:
-                    self._cleanup_zs_tools_net(pid)
-                    _zs_tools_net_pending.pop(self.vm_uuid, None)
-                    cleanup = '; guest process tree terminated'
-                except Exception as cleanup_error:
-                    cleanup = '; cleanup unconfirmed: {}; subsequent net execution blocked'.format(cleanup_error)
-            return 1, 'qga exec zs-tools operate {} failed for vm {}, pid={}, elapsed={:.3f}s, config: {}, error: {}{}'.format(
-                operate, self.vm_uuid, pid, time.time() - started,
-                log.mask_sensitive_field(config_obj, config), e, cleanup)
-        finally:
-            if is_net:
-                _zs_tools_net_lock.release()
+            return 1, 'qga exec zs-tools operate {} failed for vm {}, pid={}, elapsed={:.3f}s, config: {}, error: {}'.format(
+                operate, self.vm_uuid, pid, time.time()-started,
+                log.mask_sensitive_field(config_obj, config), e)
 
     @staticmethod
     def _decode_zs_tools_data(data):
