@@ -3098,6 +3098,7 @@ def config_lvm(host_id, all_disk_paths, vg_uuid, host_uuid, default_sanlock_lv_s
         "sanlock_lv_extend": default_sanlock_lv_size,
         "lvmlockd_lock_retries": lvmlockd_lock_retries,
         "issue_discards": 0,
+        "notify_dbus": 0,
         "reserved_stack": 256,
         "reserved_memory": 131072,
         "use_lvmetad": 1 if enable_lvmetad else 0
