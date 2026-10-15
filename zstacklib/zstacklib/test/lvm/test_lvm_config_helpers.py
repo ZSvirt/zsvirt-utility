@@ -86,6 +86,33 @@ devices {
         for setting in ('notify_dbus=0', 'udev_rules=0', 'udev_sync=0', 'use_lvmetad=0'):
             self.assertIn(setting, rendered)
 
+    def test_devices_file_default_does_not_override_shared_lun_filter(self):
+        self.bash.bash_errorout.return_value = self.bash.bash_errorout.return_value.replace(
+            'devices {', 'devices {\n    use_devicesfile=1')
+        self.configure()
+        for path in ('/etc/lvm/lvm.conf', '/etc/lvm/lvmlocal.conf'):
+            rendered = self.files[path]
+            self.assertIn('use_devicesfile=0', rendered)
+            self.assertNotIn('use_devicesfile=1', rendered)
+            self.assertIn('filter=[ "a|/dev/mapper/mpatha|", "r|.*|" ]', rendered)
+
+    def test_reconnect_keeps_devices_file_disabled_without_rewriting_configs(self):
+        self.bash.bash_errorout.return_value = self.bash.bash_errorout.return_value.replace(
+            'devices {', 'devices {\n    use_devicesfile=1')
+        self.configure()
+        saved = dict(self.files)
+        self.changed.reset_mock()
+        self.configure()
+        self.assertEqual(saved, self.files)
+        self.assertIn('use_devicesfile=0', self.files['/etc/lvm/lvmlocal.conf'])
+        self.changed.assert_not_called()
+
+    def test_older_lvm_does_not_gain_an_unsupported_devices_file_setting(self):
+        self.configure()
+        for path in ('/etc/lvm/lvm.conf', '/etc/lvm/lvmlocal.conf'):
+            self.assertNotIn('use_devicesfile', self.files[path])
+            self.assertIn('use_lvmlockd=1', self.files[path])
+
 
 class LvmlockdOptionalSyslogTest(unittest.TestCase):
     def configure(self, directory, existing):
