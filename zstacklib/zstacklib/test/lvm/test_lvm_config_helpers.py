@@ -87,5 +87,54 @@ devices {
             self.assertIn(setting, rendered)
 
 
+class LvmlockdOptionalSyslogTest(unittest.TestCase):
+    def configure(self, directory, existing):
+        self.files = {}
+        self.calls = []
+        log_path = '/etc/rsyslog.d/lvmlockd.conf'
+        if existing:
+            self.files[log_path] = 'existing admin configuration'
+        fake_os = Mock()
+        fake_os.path.join = os.path.join
+        fake_os.path.exists.side_effect = lambda path: directory if path == '/etc/rsyslog.d' else path in self.files
+        owner = self
+        class Stream(object):
+            def __init__(self, path): self.path = path
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def write(self, content): owner.files[self.path] = content
+            def flush(self): pass
+            def fileno(self): return 123
+        def open_file(path, mode):
+            self.calls.append(path)
+            if path == log_path and not directory:
+                raise IOError('rsyslog is not installed')
+            return Stream(path)
+        self.shell = Mock()
+        ns = load_definitions('lvm.py', {'config_lvmlockd'}, dict(
+            os=fake_os, shell=self.shell, open=open_file,
+            get_lvmlockd_service_name=lambda: 'lvmlockd.service',
+            LVMLOCKD_LOG_RSYSLOG_PATH=log_path,
+            LVMLOCKD_LOG_FILE_PATH='/var/log/lvmlockd/lvmlockd.log'))
+        ns['config_lvmlockd'](40)
+        self.shell.ShellCmd.assert_called_once_with('systemctl daemon-reload')
+
+    def test_missing_optional_rsyslog_directory_still_prepares_lvmlockd(self):
+        self.configure(False, False)
+        self.assertEqual([os.path.join('/lib/systemd/system', 'lvmlockd.service')], self.calls)
+        self.shell.call.assert_not_called()
+
+    def test_installed_rsyslog_gets_its_configuration(self):
+        self.configure(True, False)
+        self.assertIn('/etc/rsyslog.d/lvmlockd.conf', self.calls)
+        self.assertIn("$programname == 'lvmlockd'", self.files['/etc/rsyslog.d/lvmlockd.conf'])
+        self.shell.call.assert_called_once_with('systemctl restart rsyslog', exception=False)
+
+    def test_existing_syslog_configuration_is_preserved(self):
+        self.configure(True, True)
+        self.assertEqual('existing admin configuration', self.files['/etc/rsyslog.d/lvmlockd.conf'])
+        self.shell.call.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

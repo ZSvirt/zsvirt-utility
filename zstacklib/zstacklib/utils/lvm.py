@@ -749,7 +749,7 @@ WantedBy=multi-user.target
         os.fsync(f.fileno())
     os.chmod(lvmlockd_service_path, 0o644)
 
-    if not os.path.exists(LVMLOCKD_LOG_RSYSLOG_PATH):
+    if os.path.exists("/etc/rsyslog.d") and not os.path.exists(LVMLOCKD_LOG_RSYSLOG_PATH):
         content = """if $programname == 'lvmlockd' then %s 
 & stop
 """ % LVMLOCKD_LOG_FILE_PATH
