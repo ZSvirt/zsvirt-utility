@@ -13063,8 +13063,13 @@ host side snapshot files chian:
         def handle_event(dom, event_str):
             # type: (libvirt.virDomain, str) -> object
             vm_uuid = dom.name()
-            syslog.syslog("got suspend event from libvirt, %s %s %s" %
-                         (vm_uuid, event_str, LibvirtEventManager.suspend_event_to_string(detail)))
+            suspend_event = LibvirtEventManager.suspend_event_to_string(detail)
+            syslog.syslog("got suspend event from libvirt, %s %s %s" % (vm_uuid, event_str, suspend_event))
+
+            is_io_error_suspend = suspend_event == "VIR_DOMAIN_EVENT_SUSPENDED_IOERROR"
+            if not is_io_error_suspend:
+                return
+
             disk_errors = dom.diskErrors()  # type: dict
             vm = get_vm_by_uuid_no_retry(vm_uuid, False)
 
