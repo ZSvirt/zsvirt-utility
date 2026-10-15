@@ -316,6 +316,9 @@ class CheckDisk(object):
             return self.identifier == other.identifier
         return False
 
+    def __hash__(self):
+        return hash(self.identifier)
+
     def get_path(self, raise_exception=True):
         o = self.check_disk_by_wwid()
         if o is not None:
