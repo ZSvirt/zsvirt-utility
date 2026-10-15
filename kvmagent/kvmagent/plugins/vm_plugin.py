@@ -4,6 +4,8 @@
 import contextlib
 import copy
 import difflib
+import functools
+import struct
 import os.path
 import glob
 import string
@@ -2873,6 +2875,15 @@ def transform_to_tf_uuid(src):
     tmp = [src[:8], src[8:12], src[12:16], src[16:20], src[20:]]
     return '-'.join(tmp)
 
+def _adapt_memory_snapshot_restore(restore):
+    @functools.wraps(restore)
+    def wrapped(vm, path):
+        vm._patch_system_serial_from_saved_image(path)
+        with vm._memory_snapshot_with_target_identity(path) as restore_path:
+            return restore(vm, restore_path)
+    return wrapped
+
+
 class Vm(object):
     VIR_DOMAIN_NOSTATE = 0
     VIR_DOMAIN_RUNNING = 1
@@ -3164,6 +3175,7 @@ class Vm(object):
 
         self.start(cmd.timeout)
 
+    @_adapt_memory_snapshot_restore
     def restore(self, path):
         self._patch_cpu_xml_from_saved_image(path)
 
@@ -3180,6 +3192,103 @@ class Vm(object):
         logger.debug('restoring vm:\n%s' % self.domain_xml)
         define_xml()
         restore_from_file()
+
+    def _patch_system_serial_from_saved_image(self, path):
+        """Keep the saved SMBIOS serial when registration regenerated its tag."""
+        try:
+            @LibvirtAutoReconnect
+            def get_saved_xml(conn):
+                return conn.saveImageGetXMLDesc(path, 0)
+
+            saved_tree = etree.fromstring(get_saved_xml())
+            saved_serial = saved_tree.find("./sysinfo[@type='smbios']/system/entry[@name='serial']")
+            if saved_serial is None or not saved_serial.text:
+                return
+
+            current_tree = etree.fromstring(self.domain_xml)
+            sysinfo = current_tree.find("./sysinfo[@type='smbios']")
+            if sysinfo is None:
+                sysinfo = etree.SubElement(current_tree, 'sysinfo', {'type': 'smbios'})
+            system = sysinfo.find('system')
+            if system is None:
+                system = etree.SubElement(sysinfo, 'system')
+            serial = system.find("entry[@name='serial']")
+            if serial is not None and serial.text == saved_serial.text:
+                return
+            if serial is None:
+                serial = etree.SubElement(system, 'entry', {'name': 'serial'})
+            serial.text = saved_serial.text
+            self.domain_xml = etree.tostring(current_tree, encoding='utf-8').decode('utf-8')
+        except Exception as ex:
+            logger.warn('failed to patch system serial from saved image, '
+                        'falling back to original xml: %s' % str(ex))
+
+    @contextlib.contextmanager
+    def _memory_snapshot_with_target_identity(self, path):
+        """Adapt saved libvirt identity without writing to the original image."""
+        @LibvirtAutoReconnect
+        def get_saved_xml(conn):
+            return conn.saveImageGetXMLDesc(path, 0)
+
+        saved_tree = etree.fromstring(get_saved_xml())
+        current_tree = etree.fromstring(self.domain_xml)
+        old_identity = tuple(saved_tree.findtext(tag) for tag in ('name', 'uuid'))
+        new_identity = tuple(current_tree.findtext(tag) for tag in ('name', 'uuid'))
+        if (old_identity == new_identity or
+                (old_identity[0] == new_identity[0] and
+                 uuid.UUID(old_identity[1]) == uuid.UUID(new_identity[1]))):
+            yield path
+            return
+
+        # ZStack uses a 32-character VM UUID as its libvirt domain name. Equal
+        # length replacements keep the cookie and memory-stream offsets intact.
+        for name, identity_uuid in (old_identity, new_identity):
+            if not name or len(name) != 32 or uuid.UUID(name) != uuid.UUID(identity_uuid):
+                raise ValueError('unsupported memory snapshot domain identity')
+        new_identity = (new_identity[0], str(uuid.UUID(new_identity[1])))
+        with open(path, 'rb') as source:
+            header = source.read(92)
+            if len(header) != 92 or header[:16] != b'LibvirtQemudSave':
+                raise ValueError('incomplete libvirt memory snapshot header')
+            fields = struct.unpack('<19I', header[16:])
+            if fields[0] != 2:
+                raise ValueError('memory snapshot identity reset requires little-endian version 2')
+            capacity, cookie_offset = fields[1], fields[4]
+            if not 0 < capacity <= 16 * 1024 * 1024 or cookie_offset > capacity:
+                raise ValueError('invalid memory snapshot metadata capacity')
+            if os.fstat(source.fileno()).st_size <= 92 + capacity:
+                raise ValueError('memory snapshot has no QEMU stream')
+            xml_capacity = cookie_offset or capacity
+            raw_xml = source.read(xml_capacity)
+            if len(raw_xml) != xml_capacity or b'\0' not in raw_xml:
+                raise ValueError('incomplete memory snapshot domain XML')
+            xml = raw_xml.split(b'\0', 1)[0]
+            raw_tree = etree.fromstring(xml)
+            if raw_tree.tag != 'domain' or tuple(raw_tree.findtext(tag) for tag in ('name', 'uuid')) != old_identity:
+                raise ValueError('memory snapshot identity changed while preparing restore')
+            for tag, old, new in zip(('name', 'uuid'), old_identity, new_identity):
+                original = ('<%s>%s</%s>' % (tag, old, tag)).encode('utf-8')
+                replacement = ('<%s>%s</%s>' % (tag, new, tag)).encode('utf-8')
+                if xml.count(original) != 1 or len(original) != len(replacement):
+                    raise ValueError('unsupported memory snapshot identity XML layout')
+                xml = xml.replace(original, replacement, 1)
+
+            # Use the host temporary filesystem, not the snapshot filesystem:
+            # a mounted SharedBlock memory LV may have no room for another copy.
+            descriptor, temporary = tempfile.mkstemp(prefix='zstack-memory-restore-')
+            try:
+                with os.fdopen(descriptor, 'w+b') as target:
+                    target.write(header)
+                    target.write(xml + raw_xml[len(xml):])
+                    shutil.copyfileobj(source, target, 1024 * 1024)
+                    target.flush()
+                    os.fsync(target.fileno())
+                yield temporary
+            finally:
+                try:
+                    os.unlink(temporary)
+                except OSError as ex:
+                    logger.warn('failed to remove temporary memory snapshot %s: %s' % (temporary, ex))
 
     def _patch_cpu_xml_from_saved_image(self, path):
         """Patch CPU XML for host-model VMs restoring from memory snapshot.
