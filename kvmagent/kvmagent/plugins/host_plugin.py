@@ -3364,6 +3364,7 @@ done
             if ret in (shell.TIMEOUT_EXIT_CODE, shell.SIGKILL_EXIT_CODE):
                 break
 
+    @kvmagent.replyerror
     def identify_host(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = kvmagent.AgentResponse()
