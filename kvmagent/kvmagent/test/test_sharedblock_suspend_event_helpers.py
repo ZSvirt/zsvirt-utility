@@ -51,6 +51,34 @@ class SharedBlockSuspendEventTest(unittest.TestCase):
         self.vm.resume.assert_not_called()
         self.dom.resume.assert_not_called()
 
+    def test_running_vm_skips_stale_event_before_reading_errors(self):
+        self.vm.state = 'running'
+        self.handler(self.dom, 'suspended')
+        self.dom.diskErrors.assert_not_called()
+        self.extend.assert_not_called()
+
+    def test_disappeared_vm_skips_stale_event(self):
+        self.lookup.return_value = None
+        self.handler(self.dom, 'suspended')
+        self.dom.diskErrors.assert_not_called()
+        self.extend.assert_not_called()
+
+    def test_resume_is_one_domain_call_without_retry_loop(self):
+        self.handler(self.dom, 'suspended')
+        self.vm.resume.assert_not_called()
+        self.dom.resume.assert_called_once_with()
+
+    def test_current_domain_supplies_errors_and_skipped_extension_keeps_throttle(self):
+        stale_domain = Mock()
+        stale_domain.name.return_value = 'vm'
+        stale_domain.diskErrors.return_value = DiskErrors()
+        self.extend.return_value = False
+        self.handler(stale_domain, 'suspended')
+        stale_domain.diskErrors.assert_not_called()
+        self.dom.diskErrors.assert_called_once_with()
+        self.dom.resume.assert_called_once_with()
+        self.clock.sleep.assert_called_once_with(5)
+
 
 if __name__ == '__main__':
     unittest.main()
