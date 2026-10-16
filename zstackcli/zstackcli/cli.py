@@ -39,6 +39,7 @@ import zstacklib.utils.filedb as filedb
 import zstackcli.parse_config as parse_config
 import zstackcli.deploy_config as deploy_config
 import zstackcli.read_config as read_config
+import zstackcli.api_timeout as api_timeout
 
 cld = termcolor.colored
 cprint = termcolor.cprint
@@ -619,7 +620,8 @@ Parse command parameters error:
                     setattr(msg, 'sessionUuid', self.session_uuid)
 
             start_time = time.time()
-            (name, event) = self.api.async_call_wait_for_complete(msg, apievent=event, fail_soon=True)
+            (name, event) = api_timeout.call_with_timeout(
+                self.api, msg, apievent=event, skip_config=apiname in self.no_session_message)
             end_time = time.time()
 
             if apiname in [self.LOGIN_MESSAGE_NAME, self.LOGIN_BY_USER_NAME, self.LOGIN_BY_LDAP_MESSAGE_NAME, self.LOGIN_NAME,
