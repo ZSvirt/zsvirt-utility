@@ -18,6 +18,7 @@ from zstacklib.utils import thread
 import os.path
 import re
 import email
+import json
 import tempfile
 import cStringIO as c
 from email.mime.multipart import MIMEMultipart
@@ -1877,14 +1878,10 @@ mimetype.assign = (
 
         conf_folder = os.path.join(self.USERDATA_ROOT, to.namespaceName)
         http_root = os.path.join(conf_folder, 'html')
-        meta_data_json = '''\
-{
-    "uuid": "{{vmInstanceUuid}}"
-}'''
-        tmpt = Template(meta_data_json)
-        conf = tmpt.render({
-            'vmInstanceUuid': to.metadata.vmUuid
-        })
+        metadata = {'uuid': to.metadata.vmUuid}
+        if to.metadata.vmHostname:
+            metadata['hostname'] = to.metadata.vmHostname
+        conf = json.dumps(metadata)
 
         root = os.path.join(http_root, to.vmIp)
         meta_root = os.path.join(root, 'meta-data')
