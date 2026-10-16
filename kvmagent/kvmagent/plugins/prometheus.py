@@ -37,7 +37,45 @@ asyncDataCollectorLock = threading.RLock()
 QEMU_CMD = os.path.basename(kvmagent.get_qemu_path())
 ALARM_CONFIG = None
 PAGE_SIZE = None
-disk_list_record = None
+DISK_LIST_MISMATCH_THRESHOLD = 3
+
+
+class DiskListChangeTracker(object):
+    def __init__(self, mismatch_threshold):
+        self.mismatch_threshold = mismatch_threshold
+        self.disk_list = None
+        self.pending_disk_list = None
+        self.pending_count = 0
+
+    def update(self, disk_list):
+        disk_list = dict(disk_list)
+        if self.disk_list is None:
+            self.disk_list = disk_list
+            return None
+
+        if cmp(self.disk_list, disk_list) == 0:
+            self.pending_disk_list = None
+            self.pending_count = 0
+            return None
+
+        if self.pending_disk_list is not None and cmp(self.pending_disk_list, disk_list) == 0:
+            self.pending_count += 1
+        else:
+            self.pending_disk_list = disk_list
+            self.pending_count = 1
+
+        if self.pending_count < self.mismatch_threshold:
+            return None
+
+        change = (self.disk_list, disk_list)
+        self.disk_list = disk_list
+        self.pending_disk_list = None
+        self.pending_count = 0
+        return change
+
+
+disk_list_tracker = DiskListChangeTracker(DISK_LIST_MISMATCH_THRESHOLD)
+disk_list_tracker_lock = threading.RLock()
 block_devices_record = None
 hba_port_state_list_record_map = {}
 dump_stack_and_objects = True
@@ -282,25 +320,25 @@ def collect_memory_locator():
 
 @thread.AsyncThread
 def check_disk_insert_and_remove(disk_list):
-    global disk_list_record
-    if disk_list_record is None:
-        disk_list_record = disk_list
+    if not disk_list:
+        logger.warn("skip disk insert/remove check because the disk list is empty")
         return
-    
-    if cmp(disk_list_record, disk_list) == 0:
+
+    with disk_list_tracker_lock:
+        change = disk_list_tracker.update(disk_list)
+    if change is None:
         return
-    
+
+    old_disk_list, new_disk_list = change
     # check disk insert
-    for sn in disk_list.keys():
-        if sn not in disk_list_record.keys():
-            send_physical_disk_insert_alarm_to_mn(sn, disk_list[sn])
+    for sn in new_disk_list.keys():
+        if sn not in old_disk_list.keys():
+            send_physical_disk_insert_alarm_to_mn(sn, new_disk_list[sn])
     
     # check disk remove
-    for sn in disk_list_record.keys():
-        if sn not in disk_list.keys():
-            send_physical_disk_remove_alarm_to_mn(sn, disk_list_record[sn])
-            
-    disk_list_record = disk_list
+    for sn in old_disk_list.keys():
+        if sn not in new_disk_list.keys():
+            send_physical_disk_remove_alarm_to_mn(sn, old_disk_list[sn])
 
 # use lazy loading to avoid re-registering global configuration when other modules are initialized
 host_network_interface_service_type_map = None
@@ -729,11 +767,39 @@ def collect_mega_raid_state(metrics, infos):
             handle_raid_state(disk_group, converted_vd_state, vd_state)
 
     # collect disk state
-    o = bash_o("/opt/MegaRAID/storcli/storcli64 /call/eall/sall show all J").strip()
-    pd_infos = jsonobject.loads(o.strip())
-    for controller in pd_infos["Controllers"]:
+    r, o, e = bash_roe("/opt/MegaRAID/storcli/storcli64 /call/eall/sall show all J")
+    if r != 0 or not o.strip():
+        logger.warn("skip physical disk change check because storcli query failed, "
+                    "return code[%s], stderr[%s]" % (r, e))
+        return metrics.values()
+
+    try:
+        pd_infos = jsonobject.loads(o.strip())
+        controllers = pd_infos["Controllers"]
+        for controller in controllers:
+            command_status = controller["Command Status"]
+            status_data = command_status.to_dict()
+            status = status_data.get("Status")
+            if status != "Success":
+                description = status_data.get("Description", "")
+                logger.warn("skip physical disk change check because storcli query failed, "
+                            "controller[%s], status[%s], description[%s]" %
+                            (status_data.get("Controller", ""), status, description))
+                return metrics.values()
+    except Exception as ex:
+        logger.warn("skip physical disk change check because storcli response is invalid: %s" % ex)
+        return metrics.values()
+
+    for controller in controllers:
         controller_id = controller["Command Status"]["Controller"]
-        data = controller["Response Data"]
+        try:
+            data = controller["Response Data"]
+        except Exception:
+            logger.warn("skip physical disk change check because storcli response data is missing")
+            return metrics.values()
+        if data is None:
+            logger.warn("skip physical disk change check because storcli response data is empty")
+            return metrics.values()
         for attr in dir(data):
             match = re.match(r"^Drive /c%s/e(\d+)/s(\d+)$" % controller_id, attr)
             if not match:
