@@ -1359,6 +1359,7 @@ upgrade_zstack(){
     show_spinner is_enable_chronyd
     show_spinner uz_stop_zstack
     show_spinner prepare_zops_user_and_db
+    uz_install_trial_license
     show_spinner uz_upgrade_zstack
     show_spinner upgrade_tomcat_security
     if [[ $REDHAT_OS =~ $OS ]]; then
@@ -2551,6 +2552,33 @@ sp_setup_install_param(){
             zstack-ctl configure $normalized_line
         done < "/opt/zstack-dvd/$BASEARCH/$ZSTACK_RELEASE/zs_init_config/global_properties"
     fi
+}
+
+uz_has_installed_trial_license(){
+    local license_file
+    for license_file in "$LICENSE_FOLDER"/license_*; do
+        if cmp -s "$ZSTACK_TRIAL_LICENSE" "$license_file"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+uz_install_trial_license(){
+    local source_config_dir="$ZSTACK_INSTALL_ROOT/$CATALINA_ZSTACK_CLASSES/springConfigXml"
+    if [ ! -d "$upgrade_folder/zstack/WEB-INF/classes/springConfigXml/ee" ] ||
+        [ -d "$source_config_dir/ee" ] ||
+        [ -f "$source_config_dir/license.xml" ]; then
+        return
+    fi
+
+    if uz_has_installed_trial_license; then
+        return
+    fi
+
+    local LICENSE_PATH=''
+    install_license
+    uz_has_installed_trial_license || fail "Failed to verify the installed enterprise trial license"
 }
 
 install_license(){
