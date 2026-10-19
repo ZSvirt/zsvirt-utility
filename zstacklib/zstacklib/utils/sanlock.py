@@ -509,6 +509,14 @@ def read_monotonic_uptime():
         return None
 
 
+SANLK_EIO = -5
+SANLK_AIO_TIMEOUT = -202
+
+
+def io_failed(result):
+    return result == SANLK_EIO or result == SANLK_AIO_TIMEOUT
+
+
 def calc_id_renewal_fail_seconds(io_timeout):
     return 8 * int(io_timeout)
 

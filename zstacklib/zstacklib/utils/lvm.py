@@ -2765,12 +2765,8 @@ def is_bad_vm_root_volume(vm_root_volume):
     return has_not_running_disk or not has_running_disk
 
 @bash.in_bash
-def get_running_vm_root_volume_on_pv(vgUuid, pvUuids, checkIo=True):
-    # type: (str, list[str], bool) -> list[VmStruct]
-    # 1. get root volume from live vm xml
-    # 2. make sure io has error
-    # 3. filter for pv
-
+def get_running_vm_root_volume_on_vg(vgUuid):
+    # type: (str) -> list[VmStruct]
     vms = []
     for file_name in linux.listdir(LIVE_LIBVIRT_XML_DIR):
         xs = file_name.split(".")
@@ -2789,9 +2785,20 @@ def get_running_vm_root_volume_on_pv(vgUuid, pvUuids, checkIo=True):
             logger.warn("found strange vm[pid: %s, uuid: %s], can not find boot volume" % (vm.pid, vm.uuid))
             continue
 
-        if not vm.root_volume.startswith("/dev/" + vgUuid):
-            continue
+        if vm.root_volume.startswith("/dev/" + vgUuid):
+            vms.append(vm)
+    return vms
 
+
+@bash.in_bash
+def get_running_vm_root_volume_on_pv(vgUuid, pvUuids, checkIo=True):
+    # type: (str, list[str], bool) -> list[VmStruct]
+    # 1. get root volume from live vm xml
+    # 2. make sure io has error
+    # 3. filter for pv
+
+    vms = []
+    for vm in get_running_vm_root_volume_on_vg(vgUuid):
         bad_vm_root_volume_condition = False
         r = bash.bash_r("blockdev --flushbufs %s" % vm.root_volume)
         if is_bad_vm_root_volume(vm.root_volume) is True:
