@@ -532,42 +532,58 @@ class SblkHealthChecker(AbstractStorageFencer):
     def get_created_time(self, vg_uuid):
         return self.fencer_created_time.get(vg_uuid)
 
+    # Shared-block renewal judgment. Age is /proc/uptime minus last_success, never last_attempt. First match wins.
+    # An exception in the checker kills this round and is not a row below.
+    #
+    # condition                                                              | count              | kill VM
+    # no lockspace record, or not in sanlock client gets                     | count failure      | kill at max_failure
+    # lockspace is adding                                                    | reset              | do not kill
+    # renewal_last_result == 1                                               | reset              | do not kill
+    # space_dead is set                                                      | do not accumulate  | kill this round
+    # result is -5 or -202, and uptime - last_success exceeds 8 * io_timeout | do not accumulate  | kill this round
+    # result is -5 or -202, but the age has not reached the threshold        | reset              | do not kill
+    # any other result code                                                  | leave unchanged    | do not kill
+    # result is already -5 or -202, but uptime cannot be read                | leave unchanged    | do not kill
     def _do_health_check_vg(self, vg, lockspaces, r):
         if not r or r.get_lockspace() not in lockspaces:
             failure = "lockspace for vg %s not found" % vg
             logger.warn(failure)
-            return self.inc_vg_failure_cnt(vg), failure
+            return 'count', failure
 
         if r.is_adding:
             logger.warn("lockspace for vg %s is adding, skip run fencer" % vg)
-            return 0, None
+            return 'reset', None
+
+        if r.get_renewal_last_result() == 1:
+            return 'reset', None
 
         renewal_failure_seconds = sanlock.calc_id_renewal_fail_seconds(r.get_io_timeout())
-
         if r.is_space_dead():
             now = sanlock.read_monotonic_uptime()
             failure = "sanlock lockspace for vg %s is dead, space_dead=%s, uptime=%s, last success is %s, renewal failure threshold is %s second" % \
                     (vg, r.space_dead, now, getattr(r, 'renewal_last_success', None), renewal_failure_seconds)
             logger.warn(failure)
-            return self.inc_vg_failure_cnt(vg), failure
+            return 'kill', failure
 
-        if r.get_renewal_last_result() == 1:
-            return 0, None
+        result = r.get_renewal_last_result()
+        if not sanlock.io_failed(result):
+            logger.warn("sanlock renewal result %s for vg %s is not an IO error, leave failure count unchanged" % (result, vg))
+            return 'hold', None
 
         now = sanlock.read_monotonic_uptime()
         if now is None:
-            logger.warn("failed to read monotonic uptime, skip renewal age check for vg %s" % vg)
-            return 0, None
+            logger.warn("failed to read monotonic uptime, leave failure count unchanged for vg %s" % vg)
+            return 'hold', None
 
         last_success = r.get_renewal_last_success()
         if (now > last_success and now - last_success > renewal_failure_seconds) or \
                 (now < last_success - renewal_failure_seconds < last_success):
-            failure = "sanlock last renewal failed with %s, space_dead=%s, uptime=%s, last attempt is %s, last success is %s, renewal failed for more than %s second" % \
-                    (r.get_renewal_last_result(), r.space_dead, now, r.get_renewal_last_attempt(), last_success, renewal_failure_seconds)
+            failure = "sanlock last renewal failed with %s, space_dead=%s, uptime=%s, last success is %s, renewal failed for more than %s second" % \
+                    (result, r.space_dead, now, last_success, renewal_failure_seconds)
             logger.warn(failure)
-            return self.inc_vg_failure_cnt(vg), failure
+            return 'kill', failure
 
-        return 0, None
+        return 'reset', None
 
     def _do_health_check(self, storage_timeout, max_failure):
         # sanlock client command may fail to execute and succeed after retry
@@ -583,10 +599,15 @@ class SblkHealthChecker(AbstractStorageFencer):
         for vg in self.all_vgs:
             r = p.get_lockspace_record(vg)
             try:
-                cnt, failure = self._do_health_check_vg(vg, lockspaces, r)
-                if cnt == 0:
+                action, failure = self._do_health_check_vg(vg, lockspaces, r)
+                if action == 'reset':
                     self.reset_vg_failure_cnt(vg)
+                elif action == 'hold':
+                    pass
+                elif action == 'kill':
+                    victims[vg] = failure
                 else:
+                    cnt = self.inc_vg_failure_cnt(vg)
                     logger.info("vg %s failure count: %d" % (vg, cnt))
                     if cnt >= max_failure:
                         victims[vg] = failure
