@@ -15,7 +15,10 @@ from zstacklib.utils import xmlobject
 from zstacklib.utils import jsonobject
 from zstacklib.utils import iscsi
 import math
+import os
 import os.path
+import errno
+import signal
 import time
 import traceback
 import threading
@@ -1454,6 +1457,88 @@ def not_exec_kill_vm(strategy, vm_uuid, fencer_name):
     return strategy == 'Permissive' and not is_allow_fencer(fencer_name, vm_uuid)
 
 
+def _pid_cmdline_has_uuid(pid, vm_uuid):
+    try:
+        with open('/proc/%s/cmdline' % pid, 'rb') as fd:
+            raw = fd.read()
+    except (IOError, OSError):
+        return False
+    if not raw or not vm_uuid:
+        return False
+    if isinstance(raw, str):
+        fields = raw.split('\0')
+        needle = vm_uuid
+    else:
+        fields = raw.split(b'\0')
+        needle = vm_uuid.encode('utf-8')
+    for field in fields:
+        if field and needle in field:
+            return True
+    return False
+
+
+# Signal every selected VM before waiting. One shared deadline, not a wait per VM.
+def signal_sharedblock_vms(vms, strategy, timeout=5):
+    killed_vm_uuids = []
+    vms_to_clean = []
+    waiting = []
+    for vm in vms:
+        try:
+            if not_exec_kill_vm(strategy, vm.uuid, host_storage_name):
+                continue
+
+            pid = '' if vm.pid is None else str(vm.pid).strip()
+            if not pid or not _pid_cmdline_has_uuid(pid, vm.uuid):
+                logger.warn("skip vm[uuid:%s, pid:%s], pid cmdline does not contain uuid" % (vm.uuid, vm.pid))
+                continue
+
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError as e:
+                if e.errno == errno.ESRCH:
+                    logger.warn(
+                        'kill the vm[uuid:%s, pid:%s] because we lost connection to the storage.' % (vm.uuid, pid))
+                    killed_vm_uuids.append(vm.uuid)
+                    vms_to_clean.append(vm)
+                else:
+                    logger.warn(
+                        'failed to signal the vm[uuid:%s, pid:%s] %s' % (vm.uuid, pid, e))
+                continue
+            except Exception as e:
+                logger.warn(
+                    'failed to signal the vm[uuid:%s, pid:%s] %s' % (vm.uuid, pid, e))
+                continue
+
+            logger.debug("kill -9 process[pid %s]" % pid)
+            vms_to_clean.append(vm)
+            waiting.append((vm, pid))
+        except Exception as e:
+            logger.warn(
+                'failed to signal the vm[uuid:%s, pid:%s] %s\n%s' % (
+                    getattr(vm, 'uuid', None), getattr(vm, 'pid', None), e, traceback.format_exc()))
+
+    deadline = time.time() + timeout
+    while waiting:
+        still_waiting = []
+        for vm, pid in waiting:
+            if os.path.exists('/proc/%s' % pid):
+                still_waiting.append((vm, pid))
+            else:
+                logger.warn(
+                    'kill the vm[uuid:%s, pid:%s] because we lost connection to the storage.' % (vm.uuid, pid))
+                killed_vm_uuids.append(vm.uuid)
+        waiting = still_waiting
+        if not waiting or time.time() >= deadline:
+            break
+        time.sleep(1)
+
+    for vm, pid in waiting:
+        logger.warn(
+            'failed to kill the vm[uuid:%s, pid:%s], process still exists after %s seconds' % (vm.uuid, pid, timeout))
+
+    return killed_vm_uuids, vms_to_clean
+
+
 def kill_vm_by_xml(fencer_name, strategy, mountPath, isFlushbufs = True):
     vm_pids_dict, on_storage_vm_uuids = get_runnning_vm_root_volume_on_ps(strategy, mountPath, isFlushbufs)
     vms_killed = kill_vm_use_pid(vm_pids_dict, fencer_name)
@@ -2100,25 +2185,10 @@ class HaPlugin(kvmagent.KvmAgent):
 
             cmd = self.sblk_health_checker.get_vg_fencer_cmd(vg)
 
-            # we will check one io to determine volumes on pv should be kill
-            invalid_pv_uuids, _ = lvm.get_invalid_pv_uuids(vg, cmd.checkIo)
-            logger.debug("got invalid pv uuids: %s" % invalid_pv_uuids)
-            vms = lvm.get_running_vm_root_volume_on_pv(vg, invalid_pv_uuids, True)
-            killed_vm_uuids = []
-            for vm in vms:
-                try:
-                    if not_exec_kill_vm(cmd.strategy, vm.uuid, host_storage_name):
-                        continue
+            vms = lvm.get_running_vm_root_volume_on_vg(vg)
+            killed_vm_uuids, vms_to_clean = signal_sharedblock_vms(vms, cmd.strategy)
 
-                    linux.kill_process(vm.pid)
-                    logger.warn(
-                        'kill the vm[uuid:%s, pid:%s] because we lost connection to the storage.' % (vm.uuid, vm.pid))
-                    killed_vm_uuids.append(vm.uuid)
-
-                except Exception as e:
-                    logger.warn(
-                        'failed to kill the vm[uuid:%s, pid:%s] %s\n%s' % (vm.uuid, vm.pid, e, traceback.format_exc()))
-
+            for vm in vms_to_clean:
                 for volume in vm.volumes:
                     used_process = linux.linux_lsof(volume)
                     if len(used_process) == 0:
