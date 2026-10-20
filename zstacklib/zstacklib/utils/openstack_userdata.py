@@ -24,6 +24,29 @@ _WINDOWS_SECTIONS = re.compile(
     r'\A\s*(?:(?:<script>.*?</script>|<powershell>.*?</powershell>)\s*)+',
     re.I | re.S)
 
+# Conversion is optional. Bound the parser work without restricting the
+# original userdata passed through to cloud-init.
+_MAX_YAML_SIZE = 64 * 1024
+_MAX_YAML_DEPTH = 32
+
+
+def _load_config(content):
+    if len(content) > _MAX_YAML_SIZE:
+        return None
+    try:
+        depth = 0
+        for event in yaml.parse(content, Loader=yaml.SafeLoader):
+            if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
+                depth += 1
+                if depth > _MAX_YAML_DEPTH:
+                    return None
+            elif isinstance(event, (yaml.MappingEndEvent, yaml.SequenceEndEvent)):
+                depth -= 1
+        return yaml.safe_load(content)
+    except (yaml.YAMLError, RuntimeError, MemoryError, OverflowError):
+        # RuntimeError also covers Python 2's recursion-limit exception.
+        return None
+
 
 def _root_password(config):
     change = config.get('chpasswd')
@@ -53,10 +76,7 @@ def _translate_content(content):
         config_text = textwrap.dedent(content[match.end():]).strip()
         if config_text.startswith('#cloud-config'):
             config_text = config_text[len('#cloud-config'):]
-    try:
-        config = yaml.safe_load(config_text)
-    except yaml.YAMLError:
-        return None, None
+    config = _load_config(config_text)
     if not isinstance(config, dict):
         return None, None
     password = _root_password(config)
@@ -103,8 +123,12 @@ def prepare(userdata_list):
             value, translated = _translate_content(body)
             if value is not None:
                 password = value
-                changed = True
-                parts.extend(translated)
+                if part.keys():
+                    # Explicit MIME parts retain all headers and their payload.
+                    parts.append(part)
+                else:
+                    changed = True
+                    parts.extend(translated)
                 continue
             content_type = part.get_content_type()
             if content_type == 'text/plain':
@@ -117,7 +141,7 @@ def prepare(userdata_list):
             else:
                 parts.append((content_type, body))
     if len(userdata_list) == 1 and not changed:
-        return None, userdata_list[0]
+        return password, userdata_list[0]
     if not parts:
         return password, ''
     if len(parts) == 1 and isinstance(parts[0], tuple) and parts[0][0] in ('text/x-shellscript', 'text/cloud-config'):

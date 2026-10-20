@@ -79,6 +79,38 @@ class TestUserdataMetadata(unittest.TestCase):
     def test_batch_apply(self):
         self._check('batch_apply_userdata')
 
+    def test_deep_yaml_single_and_batch_rebuild(self):
+        deep = '#cloud-config\nx: ' + '[' * 600 + '0' + ']' * 600 + '\n'
+        config = '#cloud-config\nchpasswd:\n  list: "root:Expected!"\n'
+        def data(ip, content):
+            return dict(namespaceName='ns', vmIp=ip,
+                        metadata=dict(vmUuid=ip, vmHostname='CBQA01'),
+                        userdataList=[content], agentConfig=None, l3NetworkUuid='l3',
+                        dhcpServerIp='192.0.2.254', bridgeName='br-test', port=80)
+        restarted = []
+        self.agent._apply_userdata_restart_httpd = lambda to: restarted.append(to.namespaceName)
+        first = data('192.0.2.1', deep)
+        response = json.loads(self.agent.apply_userdata(
+            {http.REQUEST_BODY: json.dumps(dict(userdata=first))}))
+        self.assertTrue(response['success'], response)
+        restarted[:] = []
+        original = mevoco.shell.call
+        stopped = []
+        try:
+            mevoco.shell.call = lambda cmd: stopped.append(cmd)
+            response = json.loads(self.agent.batch_apply_userdata({http.REQUEST_BODY: json.dumps(
+                dict(rebuild=True, userdata=[first, data('192.0.2.2', config)]))}))
+        finally:
+            mevoco.shell.call = original
+        self.assertTrue(response['success'], response)
+        self.assertEqual(1, len(stopped))
+        self.assertEqual(['ns'], restarted)
+        root = os.path.join(self.root, 'ns', 'html')
+        with open(os.path.join(root, '192.0.2.1', 'user_data')) as stream:
+            self.assertEqual(deep.strip(), stream.read().strip())
+        with open(os.path.join(root, '192.0.2.2', 'meta_data.json')) as stream:
+            self.assertEqual('Expected!', json.load(stream)['admin_pass'])
+
 
 if __name__ == '__main__':
     unittest.main()

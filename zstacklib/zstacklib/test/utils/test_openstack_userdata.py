@@ -79,7 +79,41 @@ class TestOpenStackUserdata(unittest.TestCase):
         raw = 'Content-Type: multipart/mixed; boundary="boundary"\n\n--boundary\nContent-Type: text/cloud-config\n\n' + self.password_config + '\n--boundary--\n'
         password, body = openstack_userdata.prepare([raw])
         self.assertEqual('Test:pass!', password)
-        self.assertEqual(self.password_config.strip(), body.strip())
+        self.assertEqual(raw, body)
+
+    def test_explicit_cloud_config_headers_are_preserved(self):
+        raw = ('Content-Type: text/cloud-config; charset="utf-8"\n'
+               'Content-Disposition: attachment; filename="custom.yaml"\n'
+               'X-Merge-Type: dict(recurse_array)+list(append)\n'
+               'X-Custom: keep\n\n' + self.password_config)
+        self.assertEqual(('Test:pass!', raw), openstack_userdata.prepare([raw]))
+        password, body = openstack_userdata.prepare([self.xml, raw])
+        self.assertEqual('Test:pass!', password)
+        part = email.message_from_string(body).get_payload()[1]
+        original = email.message_from_string(raw)
+        self.assertEqual(original.items(), part.items())
+        self.assertEqual(original.get_payload(), part.get_payload())
+
+    def test_deep_and_large_yaml_falls_back_without_blocking_next_entry(self):
+        deep = '#cloud-config\nx: ' + '[' * 600 + '0' + ']' * 600 + '\n'
+        large = self.password_config + '# ' + 'x' * openstack_userdata._MAX_YAML_SIZE
+        for raw in (deep, large):
+            self.assertEqual((None, raw), openstack_userdata.prepare([raw]))
+            password, body = openstack_userdata.prepare([raw, self.password_config])
+            self.assertEqual('Test:pass!', password)
+            self.assertEqual(raw.encode(), email.message_from_string(body).get_payload()[0].get_payload(decode=True))
+
+    def test_parser_resource_errors_fall_back(self):
+        original = openstack_userdata.yaml.safe_load
+        try:
+            for error in (RuntimeError, MemoryError, OverflowError):
+                def fail(content):
+                    raise error('resource limit')
+                openstack_userdata.yaml.safe_load = fail
+                self.assertEqual((None, self.password_config),
+                                 openstack_userdata.prepare([self.password_config]))
+        finally:
+            openstack_userdata.yaml.safe_load = original
 
     def test_empty_and_non_string_password_lists(self):
         for body in ('#cloud-config\nchpasswd:\n  list: "root:"\n', '#cloud-config\nchpasswd:\n  list: []\n'):
