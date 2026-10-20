@@ -11449,8 +11449,25 @@ host side snapshot files chian:
 
         version = base64.b64decode(simplejson.loads(o)['return']['buf-b64']).strip()
         rsp.version = version
-        rsp.status = VmPlugin.GUESTTOOLS_STATE_RUNNING
         _close_version_file()
+
+        cmd = "try { (Get-Service -Name zstack_zwatch_agent -ErrorAction Stop).Status.ToString() } " \
+              "catch { if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'NotInstalled' } else { throw } }"
+        try:
+            r, o = VmQga(vm.domain).guest_exec_powershell(cmd, raw=True)
+        except Exception as e:
+            rsp.success = False
+            rsp.error = 'failed to query ZWatch service for vm[uuid:%s]: %s' % (vm_uuid, e)
+            return
+
+        state = o.strip() if o else None
+        if r != 0 or state not in ('NotInstalled', 'Stopped', 'StartPending', 'StopPending',
+                                   'Running', 'ContinuePending', 'PausePending', 'Paused'):
+            rsp.success = False
+            rsp.error = 'failed to query ZWatch service for vm[uuid:%s], exitcode[%s]: %s' % (vm_uuid, r, o)
+            return
+
+        rsp.status = VmPlugin.GUESTTOOLS_STATE_RUNNING if state == 'Running' else VmPlugin.GUESTTOOLS_STATE_NOT_RUNNING
 
     @kvmagent.replyerror
     def get_vm_metrics_routing_status(self, req):

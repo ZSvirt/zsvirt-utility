@@ -117,6 +117,24 @@ class TestGuestExecProgram(unittest.TestCase):
     def setUp(self):
         self.qga = _make_qga()
 
+    def test_powershell_preserves_legacy_arguments_and_raw_command(self):
+        self.qga.guest_exec = mock.Mock(return_value={'pid': 7})
+        self.qga.guest_exec_status = mock.Mock(
+            return_value={'exited': True, 'exitcode': 0, 'out-data': b'Running'}
+        )
+        raw_command = '(Get-Service -Name zstack_zwatch_agent).Status.ToString()'
+        cases = [
+            ('Restart-Service|zstack_zwatch_agent', {}, "& 'Restart-Service' 'zstack_zwatch_agent'"),
+            (raw_command, {'raw': True}, raw_command),
+        ]
+        for command, kwargs, expected in cases:
+            code, data = self.qga.guest_exec_powershell(command, wait=0, retry=1, **kwargs)
+            self.assertEqual(0, code)
+            self.assertEqual(b'Running', data)
+            request = self.qga.guest_exec.call_args[0][0]
+            self.assertEqual('powershell.exe', request['path'])
+            self.assertEqual(expected, request['arg'][-1])
+
     def test_guest_exec_program_success(self):
         self.qga.guest_exec = mock.Mock(return_value={'pid': 7})
         self.qga.guest_exec_status = mock.Mock(

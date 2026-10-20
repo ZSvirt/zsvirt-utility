@@ -388,9 +388,10 @@ class VmQga(object):
 
         return exit_code, ret_data
 
-    def guest_exec_powershell(self, cmd, output=True, wait=qga_exec_wait_interval, retry=qga_exec_wait_retry):
-        cmd_parts = cmd.split('|')
-        cmd = "& '{}'".format("' '".join([part for part in cmd_parts]))
+    def guest_exec_powershell(self, cmd, output=True, wait=qga_exec_wait_interval, retry=qga_exec_wait_retry, raw=False):
+        if not raw:
+            cmd_parts = cmd.split('|')
+            cmd = "& '{}'".format("' '".join([part for part in cmd_parts]))
 
         ret = self.guest_exec(
             {"path": "powershell.exe", "arg": ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", cmd], "capture-output": output})
