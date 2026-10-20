@@ -115,6 +115,27 @@ class TestOpenStackUserdata(unittest.TestCase):
         finally:
             openstack_userdata.yaml.safe_load = original
 
+    def test_shallow_merge_alias_chain_never_reaches_constructor(self):
+        raw = '#cloud-config\na0: &a0 {value: 1}\n'
+        for index in range(1, 21):
+            raw += 'a%d: &a%d {<<: [*a%d, *a%d]}\n' % (index, index, index-1, index-1)
+        raw += self.password_config[len('#cloud-config\n'):]
+        original = openstack_userdata.yaml.safe_load
+        try:
+            def fail(content):
+                self.fail('aliased input must not reach YAML construction')
+            openstack_userdata.yaml.safe_load = fail
+            self.assertEqual((None, raw), openstack_userdata.prepare([raw]))
+        finally:
+            openstack_userdata.yaml.safe_load = original
+        password, body = openstack_userdata.prepare([raw, self.password_config])
+        self.assertEqual('Test:pass!', password)
+        self.assertEqual(raw.encode(), email.message_from_string(body).get_payload()[0].get_payload(decode=True))
+        # Ordinary and recursive aliases must also remain untouched.
+        for alias in ('value: &v secret\ncopy: *v\n', 'value: &v [*v]\n'):
+            content = self.password_config + alias
+            self.assertEqual((None, content), openstack_userdata.prepare([content]))
+
     def test_empty_and_non_string_password_lists(self):
         for body in ('#cloud-config\nchpasswd:\n  list: "root:"\n', '#cloud-config\nchpasswd:\n  list: []\n'):
             self.assertEqual((None, body), openstack_userdata.prepare([body]))

@@ -36,6 +36,10 @@ def _load_config(content):
     try:
         depth = 0
         for event in yaml.parse(content, Loader=yaml.SafeLoader):
+            if isinstance(event, yaml.AliasEvent):
+                # Even shallow merge aliases can expand exponentially during
+                # construction. Leave aliased userdata to its original consumer.
+                return None
             if isinstance(event, (yaml.MappingStartEvent, yaml.SequenceStartEvent)):
                 depth += 1
                 if depth > _MAX_YAML_DEPTH:

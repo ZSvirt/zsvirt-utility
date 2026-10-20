@@ -81,6 +81,16 @@ class TestUserdataMetadata(unittest.TestCase):
 
     def test_deep_yaml_single_and_batch_rebuild(self):
         deep = '#cloud-config\nx: ' + '[' * 600 + '0' + ']' * 600 + '\n'
+        self._check_unconverted_single_and_batch(deep)
+
+    def test_merge_alias_chain_single_and_batch_rebuild(self):
+        raw = '#cloud-config\na0: &a0 {value: 1}\n'
+        for index in range(1, 21):
+            raw += 'a%d: &a%d {<<: [*a%d, *a%d]}\n' % (index, index, index-1, index-1)
+        raw += 'chpasswd:\n  list: "root:DoNotExtract!"\n'
+        self._check_unconverted_single_and_batch(raw)
+
+    def _check_unconverted_single_and_batch(self, deep):
         config = '#cloud-config\nchpasswd:\n  list: "root:Expected!"\n'
         def data(ip, content):
             return dict(namespaceName='ns', vmIp=ip,
@@ -93,6 +103,10 @@ class TestUserdataMetadata(unittest.TestCase):
         response = json.loads(self.agent.apply_userdata(
             {http.REQUEST_BODY: json.dumps(dict(userdata=first))}))
         self.assertTrue(response['success'], response)
+        with open(os.path.join(self.root, 'ns', 'html', first['vmIp'], 'user_data')) as stream:
+            self.assertEqual(deep.strip(), stream.read().strip())
+        with open(os.path.join(self.root, 'ns', 'html', first['vmIp'], 'meta_data.json')) as stream:
+            self.assertNotIn('admin_pass', json.load(stream))
         restarted[:] = []
         original = mevoco.shell.call
         stopped = []
