@@ -316,6 +316,9 @@ class CheckDisk(object):
             return self.identifier == other.identifier
         return False
 
+    def __hash__(self):
+        return hash(self.identifier)
+
     def get_path(self, raise_exception=True):
         o = self.check_disk_by_wwid()
         if o is not None:
@@ -611,7 +614,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
                 lvm.wipe_fs(diskPaths, vgUuid)
                 lvm.config_lvm_filter(["lvm.conf", "lvmlocal.conf"], preserve_disks=self.get_disk_paths(allDisks))
 
-            lvm.check_gl_lock()
+            lvm.fix_global_lock()
             try:
                 create_vg(hostUuid, vgUuid, self.get_disk_paths(disks))
                 find_vg(vgUuid)
@@ -656,6 +659,8 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
                 self.lun_capacities[cmd.vgUuid]['currentTimestamp'] = long(linux.get_current_timestamp())
             finally:
                 self.pvs_in_progress.remove(cmd.vgUuid)
+
+        sanlock.repair_vglk_metadata(cmd.vgUuid)
 
         ## lvm.refresh_lv_uuid_cache_if_need()
         return jsonobject.dumps(rsp)
@@ -937,7 +942,7 @@ class SharedBlockPlugin(kvmagent.KvmAgent):
         else:
             if cmd.forceWipe is True:
                 lvm.wipe_fs([disk.get_path()], cmd.vgUuid)
-            lvm.check_gl_lock()
+            lvm.fix_global_lock()
             lvm.add_pv(cmd.vgUuid, disk.get_path(), DEFAULT_VG_METADATA_SIZE)
 
         rsp = AgentRsp()

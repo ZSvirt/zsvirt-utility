@@ -38,6 +38,26 @@ class NamedLock(object):
         #logger.debug('%s released lock %s' % (threading.current_thread().name, self.name))
 
 
+class NonBlockNamedLock(object):
+    def __init__(self, name):
+        self.name = name
+        self.acquired = False
+        self.lock = None
+
+    def __enter__(self):
+        self.lock = _get_lock(self.name)
+        self.acquired = self.lock.acquire(False)
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if not self.acquired:
+            return
+        try:
+            self.lock.release()
+        except Exception as e:
+            logger.debug('%s released lock %s error: %s' % (threading.current_thread().name, self.name, str(e)))
+
+
 def lock(name='defaultLock'):
     def wrap(f):
         @functools.wraps(f)

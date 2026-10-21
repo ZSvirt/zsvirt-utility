@@ -2751,6 +2751,22 @@ def get_running_vms():
     return vms
 
 
+def sync_vm_persistent_definitions():
+    for vm in get_running_vms():
+        try:
+            live_xml = vm.domain_xml
+
+            @LibvirtAutoReconnect
+            def define_vm(conn):
+                return conn.defineXML(live_xml)
+
+            define_vm()
+            logger.info('updated persistent definition for vm %s' % vm.uuid)
+        except Exception:
+            logger.warn('failed to update persistent definition for vm %s: %s' %
+                        (vm.uuid, traceback.format_exc()))
+
+
 def get_cpu_memory_used_by_running_vms():
     runnings = get_running_vms()
     used_cpu = 0
@@ -3890,6 +3906,13 @@ class Vm(object):
                     if not wait_for_attach(None):
                         raise
 
+                try:
+                    if self.domain.isPersistent():
+                        self.domain.attachDeviceFlags(xml, libvirt.VIR_DOMAIN_AFFECT_CONFIG)
+                except Exception:
+                    logger.warn('failed to persist attached volume[uuid:%s] for vm[uuid:%s]: %s' %
+                                (volume.volumeUuid, self.uuid, traceback.format_exc()))
+
             attach()
 
         except libvirt.libvirtError as ex:
@@ -3994,6 +4017,13 @@ class Vm(object):
                         self._record_volume_detach_timeout(volume)
                         logger.debug("detach timeout, record volume install path: %s" % volume.installPath)
                         raise
+
+                try:
+                    if self.domain.isPersistent():
+                        self.domain.detachDeviceFlags(xmlstr, libvirt.VIR_DOMAIN_AFFECT_CONFIG)
+                except Exception:
+                    logger.warn('failed to remove detached volume[uuid:%s] from persistent definition of vm[uuid:%s]: %s' %
+                                (volume.volumeUuid, self.uuid, traceback.format_exc()))
 
             detach()
 
@@ -12682,6 +12712,7 @@ host side snapshot files chian:
         http_server.register_async_uri(self.VTPM_RESOLVE_LIBVIRT_SECRET_UUID_PATH, self.resolve_vtpm_libvirt_secret_uuid)
         http_server.register_async_uri(self.VOLUME_RESOLVE_LIBVIRT_SECRET_UUID_PATH, self.resolve_volume_libvirt_secret_uuid)
         self.clean_old_sshfs_mount_points()
+        sync_vm_persistent_definitions()
         self.register_libvirt_event()
         self.register_qemu_log_cleaner()
         self.register_vm_console_logrotate_conf()
@@ -13020,16 +13051,9 @@ host side snapshot files chian:
 
             extend_size = lv_size + self.auto_extend_size
             try:
-                lvm.extend_lv(path, extend_size)
+                lvm.extend_lv(path, extend_size, skip_if_sufficient=True, lockopts=["shupdate", "norefresh"])
             except Exception as e:
                 logger.warn("extend lv[%s] to size[%s] failed" % (path, extend_size))
-                if "incompatible mode" not in e.message.lower():
-                    return
-                try:
-                    with lvm.OperateLv(path, shared=False, delete_when_exception=False):
-                        lvm.extend_lv(path, extend_size)
-                except Exception as e:
-                    logger.warn("extend lv[%s] to size[%s] with operate failed" % (path, extend_size))
             else:
                 logger.debug("lv %s extend to %s sucess" % (path, extend_size))
             return True
@@ -13039,11 +13063,20 @@ host side snapshot files chian:
         def handle_event(dom, event_str):
             # type: (libvirt.virDomain, str) -> object
             vm_uuid = dom.name()
-            syslog.syslog("got suspend event from libvirt, %s %s %s" %
-                         (vm_uuid, event_str, LibvirtEventManager.suspend_event_to_string(detail)))
-            disk_errors = dom.diskErrors()  # type: dict
+            suspend_event = LibvirtEventManager.suspend_event_to_string(detail)
+            syslog.syslog("got suspend event from libvirt, %s %s %s" % (vm_uuid, event_str, suspend_event))
+
+            is_io_error_suspend = suspend_event == "VIR_DOMAIN_EVENT_SUSPENDED_IOERROR"
+            if not is_io_error_suspend:
+                return
+
             vm = get_vm_by_uuid_no_retry(vm_uuid, False)
 
+            if not vm or vm.state != Vm.VM_STATE_PAUSED:
+                logger.debug("vm %s state is %s, skip to extend volume" % (vm_uuid, vm.state if vm else None))
+                return
+
+            disk_errors = vm.domain.diskErrors()  # type: dict
             if len(disk_errors) == 0:
                 syslog.syslog("no error in vm %s. skip to check and extend volume" % vm_uuid)
                 return
@@ -13071,7 +13104,7 @@ host side snapshot files chian:
 
             if fixed:
                 syslog.syslog("resume vm %s" % vm_uuid)
-                vm.resume()
+                vm.domain.resume()
                 touchQmpSocketWhenExists(vm_uuid)
                 if not extend_attempted:
                     # Hold the VM lock to throttle repeated ENOSPC suspend handling.

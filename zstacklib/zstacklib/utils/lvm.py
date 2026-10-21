@@ -1,4 +1,5 @@
 import difflib
+import errno
 import functools
 import random
 import os
@@ -23,7 +24,6 @@ from zstacklib.utils import linux
 from zstacklib.utils import thread
 from zstacklib.utils import sanlock
 from zstacklib.utils import remoteStorage
-from cachetools import TTLCache
 from distutils.version import LooseVersion
 
 from zstacklib.utils.linux import get_fs_type
@@ -56,9 +56,10 @@ LVMLOCKD_VERSION = None
 thinProvisioningInitializeSize = "thinProvisioningInitializeSize"
 PV_DISCARD_MIN_SIZE_IN_BYTES = 1*1024**3
 PV_DISCARD_MAX_SIZE_IN_BYTES = 100*1024**3
-ONE_HOUR_IN_SEC = 60 * 60
 LV_UUID_REFRESH_INTERVAL_IN_SEC = 60 * 30
 LVM_CONFIG_CHANGED_FILE = "/var/run/zstack/lvmConfigChanged"
+LVM_LOCKSPACE_BACKUP_PATH = "/var/lib/lvm/"
+
 '''
 If the lvm command with locking is hung, it will always occupy the lock and cannot be released.
 And in scenarios where storage IO is slow and lock contention occurs, it may take longer to execute, 
@@ -66,8 +67,6 @@ so we need to set a timeout that can tolerate this scenario.
 '''
 lvm_cmd_timeout_with_locking = 210
 
-lv_offset = TTLCache(maxsize=100, ttl=ONE_HOUR_IN_SEC)
-continue_lockspace_track = {}  # type: dict[str, bool]
 lv_uuid_cache = {}  # type: dict[str, str]
 lv_uuid_cache_last_refresh_time = 0
 
@@ -447,7 +446,7 @@ def get_multipath_dmname(dev_name):
     r = bash.bash_r("multipath /dev/%s -l | grep policy" % dev_name)
     if r != 0:
         return None
-    return bash.bash_o("multipath -l /dev/%s | head -n1 | grep -Eo 'dm-[[:digits:]]+'" % dev_name).strip()
+    return bash.bash_o("multipath -l /dev/%s | head -n1 | grep -Eo 'dm-[[:digit:]]+'" % dev_name).strip()
 
 
 def get_multipath_name(dev_name):
@@ -462,7 +461,7 @@ def get_lvmlockd_service_name():
 def get_lvmlockd_version():
     global LVMLOCKD_VERSION
     if LVMLOCKD_VERSION is None:
-        LVMLOCKD_VERSION = shell.call("""lvmlockd --version | awk '{print $3}' | awk -F'.' '{print $1"."$2}'""").strip()
+        LVMLOCKD_VERSION = shell.call("""lvmlockd --version | awk '{print $3}'""").strip()
     return LVMLOCKD_VERSION
 
 def get_sanlock_patch_version():
@@ -481,7 +480,7 @@ def get_running_lvmlockd_version():
     pid = get_lvmlockd_pid()
     if pid:
         exe = "/proc/%s/exe" % pid
-        return shell.call("""%s --version | awk '{print $3}' | awk -F'.' '{print $1"."$2}'""" % exe).strip()
+        return shell.call("""%s --version | awk '{print $3}'""" % exe).strip()
 
 def get_lvmlockd_pid():
     return linux.find_process_by_command('lvmlockd')
@@ -750,7 +749,7 @@ WantedBy=multi-user.target
         os.fsync(f.fileno())
     os.chmod(lvmlockd_service_path, 0o644)
 
-    if not os.path.exists(LVMLOCKD_LOG_RSYSLOG_PATH):
+    if os.path.exists("/etc/rsyslog.d") and not os.path.exists(LVMLOCKD_LOG_RSYSLOG_PATH):
         content = """if $programname == 'lvmlockd' then %s 
 & stop
 """ % LVMLOCKD_LOG_FILE_PATH
@@ -810,9 +809,14 @@ def start_lock_service(io_timeout=40):
     logger.info("get lvm version info:\n %s" % get_lvm_version())
     config_lvmlockd(io_timeout)
 
-    def is_lvmlockd_upgraded():
+    def need_restart_lvmlockd():
         running_lockd_version = get_running_lvmlockd_version()
-        return running_lockd_version is not None and LooseVersion(running_lockd_version) < LooseVersion(get_lvmlockd_version())
+        local_lockd_version = get_lvmlockd_version()
+        if not running_lockd_version:
+            return False
+        elif LvmlockdStatus().failed and LooseVersion(local_lockd_version) >= LooseVersion("2.03"):
+            return True
+        return LooseVersion(running_lockd_version) != LooseVersion(local_lockd_version)
 
     def need_restart_sanlock():
         running_patch_version = get_running_sanlock_patch_version()
@@ -832,13 +836,12 @@ def start_lock_service(io_timeout=40):
 
 
     restart_sanlock = need_restart_sanlock()
-    restart_lvmlockd = restart_sanlock or is_lvmlockd_upgraded() or \
-                       (LooseVersion(get_lvmlockd_version()) >= LooseVersion("2.03") and LvmlockdStatus().failed)
+    restart_lvmlockd = restart_sanlock or need_restart_lvmlockd()
     if restart_sanlock:
         stop_sanlock()
     if restart_lvmlockd:
-        write_lvmlockd_adopt_file()
         stop_lvmlockd()
+        write_lvmlockd_adopt_file()
         linux.rm_file_force(LVMLOCKD_SOCKET)
 
     r = bash.bash_r("systemctl status sanlock | grep '(running)'")
@@ -996,25 +999,13 @@ def start_vg_lock(vgUuid, hostId, retry_times_for_checking_vg_lockspace):
         elif vg_lock_is_adding(vgUuid) is True:
             raise RetryException("lock space for vg %s is adding" % vgUuid)
         else:
-            continue_lockspace_track.update({vgUuid: True})
             return True
-
-    def check_lockspace():
-        r = sanlock.dd_check_lockspace("/dev/mapper/%s-lvmlock" % vgUuid)
-        if r != 0:
-            bash.bash_roe("dmsetup remove %s-lvmlock" % vgUuid)
-            return
-        elif continue_lockspace_track.get(vgUuid) is False:
-            logger.debug("direct init lockspace[%s] has already been executed but the lockspace has not been restored, skip it" % vgUuid)
-            return
-        sanlock.check_delta_lease(vgUuid, hostId)
-        continue_lockspace_track.update({vgUuid: False})
 
     @linux.retry(times=5, sleep_time=random.uniform(0.1, 10))
     def start_lock(vgUuid):
         modify_sanlock_config("use_zstack_vglock_timeout", 1)
         modify_sanlock_config("use_zstack_vglock_large_delay", 1)
-        r, o, e = bash.bash_roe("vgchange --lock-start %s" % vgUuid)
+        r, o, e = bash.bash_roe("{} --lock-start {}".format(subcmd("vgchange"), vgUuid))
         modify_sanlock_config("use_zstack_vglock_timeout", 0)
         modify_sanlock_config("use_zstack_vglock_large_delay", 0)
 
@@ -1023,8 +1014,7 @@ def start_vg_lock(vgUuid, hostId, retry_times_for_checking_vg_lockspace):
                 raise Exception("vgchange --lock-start failed: return code: %s, stdout: %s, stderr: %s" % (r, o, e))
             vg_lock_exists(vgUuid)
         except Exception:
-            check_lockspace()
-            sanlock.init_gllk_if_need(vgUuid)
+            shell.run("lvchange --refresh %s/lvmlock" % vgUuid)
             raise
     try:
         vg_lock_exists(vgUuid)
@@ -1047,7 +1037,7 @@ def check_missing_pv(vgUuid):
             raise Exception("unable to restore missing pv %s for vg %s, stdout:%s, stderr:%s" % (pv_name, vgUuid, str(o), str(e)))
         logger.debug("restore missing pv[name:%s, uuid:%s] for vg %s successfully" % (pv_name, pv_uuid, vgUuid))
 
-    check_gl_lock()
+    fix_global_lock()
     for pvs_out in pvs_outs:
         pv_uuid = pvs_out.strip().split(" ")[0]
         pv_name = pvs_out.strip().split(" ")[1]
@@ -1634,12 +1624,12 @@ def resize_lv(path, size, force=False):
 
 @bash.in_bash
 @linux.retry(times=15, sleep_time=random.uniform(0.1, 3))
-def extend_lv(path, extend_size, skip_if_sufficient=False):
+def extend_lv(path, extend_size, skip_if_sufficient=False, lockopts=None):
     final_size = calcLvReservedSize(extend_size)
     if skip_if_sufficient and int(get_lv_size(path)) >= final_size:
         return
 
-    r, o, e = bash.bash_roe("%s --size %sb %s" % (subcmd("lvextend"), final_size, path))
+    r, o, e = bash.bash_roe("%s --size %sb %s" % (subcmd("lvextend", lockopts=lockopts), final_size, path))
     if r == 0:
         logger.debug("successfully extend lv %s size to %s" % (path, extend_size))
         return
@@ -1685,57 +1675,68 @@ def active_lv(path, shared=False):
 
 def _need_retry_active_lv(arg, exception):
     path = arg[0]
-    def check_lv_lock_on_client():
-        LV_UUID = lv_uuid(path)
-        if not LV_UUID:
-            raise Exception("cannot get lv uuid of path[%s]" % path)
-
-        cmd = "sanlock client status | grep %s" % LV_UUID
-        return bash.bash_r(cmd) == 0
-
-    def get_lock_hold_by_us():
-        LV_UUID = lv_uuid(path)
-        if not LV_UUID:
-            logger.warn("cannot get lv uuid of path[%s]" % path)
-            return None
-
-        VG_UUID = get_vg_uuid(path)
-        lockspace = get_lockspace(VG_UUID)
-        if not lockspace:
-            logger.warn("cannot find lockspace of %s" % VG_UUID)
-            return None
-
-        LOCKSPACE_NAME = lockspace.split(":")[0]
-        HOST_ID = lockspace.split(":")[1]
-        LVMLOCK_PATH = lockspace.split(":")[2]
-        LV_START = lv_offset.get(path) if lv_offset.get(path) is not None else "0"
-        LV_END = "1048576" if lv_offset.get(path) is not None else get_lv_size("/dev/%s/lvmlock" % VG_UUID)
-
-        cmd = "sanlock direct dump %s:%s:%s | grep %s -m1 | awk '{print $1,$4,$5}'" % (LVMLOCK_PATH, LV_START, LV_END, LV_UUID)
-        r, o, e = bash.bash_roe(cmd)
-        if r == 0 and o is not None and o.strip() != "":
-            res = o.strip().split()
-            offset = int(res[0])
-            timestamp = int(res[1])
-            host_id = int(res[2])
-            lv_offset.update({path:str(offset)})
-            if timestamp != 0 and host_id == int(HOST_ID):
-                lock = "{}:{}:{}:{}".format(LOCKSPACE_NAME, LV_UUID, LVMLOCK_PATH, offset)
-                return lock
-            else:
-                logger.debug("lv[path:%s] lockd by other host" % path)
-
-        return None
-
-    if "LV locked by other host" not in str(exception) or check_lv_lock_on_client():
+    if "LV locked by other host" not in str(exception):
         return False
 
-    lock = get_lock_hold_by_us()
-    if lock is not None:
-        logger.debug("find lv lock hold by us on lockspace but not on client, directly init lv[path:%s]" % path)
-        return sanlock.direct_init_resource(lock) == 0
+    try:
+        # lv_lockargs records the exact byte offset of this LV lease in lvmlock.
+        lv_attr = get_lv_attr(path, "lv_uuid", "lv_lockargs")
+        lv_uuid = lv_attr.get("lv_uuid")
+        lock_offset = int(lv_attr.get("lv_lockargs").rsplit(":", 1)[-1])
+        vg_uuid = get_vg_uuid(path)
+        lockspace = get_lockspace(vg_uuid)
+        lockspace_name, local_host_id, lvmlock_path = lockspace.split(":")[:3]
+        # The lease is 1 MiB with 512-byte sectors and 8 MiB with 4K sectors.
+        lease_size = sanlock.sector_size_to_align_size(sanlock.get_sector_size(vg_uuid))
+    except Exception as e:
+        logger.warn("cannot get lv[path:%s] lock info: %s" % (path, e))
+        return False
 
-    return False
+    if not lv_uuid:
+        return False
+
+    r, o, e = sanlock.direct_dump_resource(lvmlock_path, lock_offset, size=lease_size)
+    if r != 0 or not o or not o.strip():
+        return False
+    try:
+        # Resource combines the exclusive leader owner and all shared mode-block owners.
+        resource = sanlock.Resource(o, local_host_id, align_size=lease_size)
+    except Exception as e:
+        logger.warn("cannot parse lv[path:%s] lock resource: %s" % (path, e))
+        return False
+    # Never repair a lock still tracked by the local sanlock client.
+    if getattr(resource, "resource_name", None) != lv_uuid or resource.in_use():
+        return False
+
+    owners = set(resource.owners)
+    if not owners:
+        return True
+    if len(owners) > 1:
+        # A one-shot retry cannot safely recover a shared lease held by multiple hosts.
+        logger.debug("skip retrying active lv[path:%s] held by multiple hosts[%s]" %
+                     (path, ",".join(sorted(owners))))
+        return False
+
+    owner_host_id = int(owners.pop())
+    if owner_host_id == int(local_host_id):
+        logger.debug("find lv lock hold by us on lockspace but not on client, directly init lv[path:%s]" % path)
+        lock = "{}:{}:{}:{}".format(lockspace_name, lv_uuid, lvmlock_path, lock_offset)
+        return sanlock.direct_init_resource(lock, vg_uuid) == 0
+
+    try:
+        host_status = sanlock.get_host_status(lockspace_name, owner_host_id)
+        if not host_status:
+            return False
+        # Allow one full renewal interval before waiting for the sole remote owner to become dead.
+        renewal_interval = 2 * host_status.get_io_timeout()
+        if host_status.get_last_check() - host_status.get_last_live() <= renewal_interval:
+            return False
+        logger.info("wait lv[path:%s] lock owner[hostId:%s] heartbeat from last live[%s]" %
+                    (path, owner_host_id, host_status.get_last_live()))
+        return not sanlock.check_host_liveness(vg_uuid, owner_host_id)
+    except Exception as e:
+        logger.warn("stop waiting lv[path:%s] lock owner: %s" % (path, e))
+        return False
 
 @linux.retry_with_check(handler=_need_retry_active_lv)
 def active_lv_with_check(path, shared=False):
@@ -2043,25 +2044,6 @@ def list_local_active_lvs(vgUuid):
         if i.strip() != "":
             result.append(i.strip())
     return result
-
-
-@bash.in_bash
-def check_gl_lock():
-    r, o = bash.bash_ro("lvmlockctl -i | grep 'LK GL' -B 5")
-    if r == 0:
-        return
-
-    # NOTE(weiw): if lockspace exists, choose one as gl lock
-    r, o = bash.bash_ro("lvmlockctl -i | grep 'lock_type=sanlock' | awk '{print $2}'")
-    if r == 0:
-        o = o.strip()
-        if len(o.splitlines()) != 0:
-            for i in o.splitlines():
-                i = i.strip()
-                if i == "":
-                    continue
-                bash.bash_roe("lvmlockctl --gl-enable %s" % i)
-                return
 
 
 def do_active_lv(absolutePath, lockType, recursive):
@@ -2421,23 +2403,23 @@ def check_stuck_vglk_and_gllk():
 
 @bash.in_bash
 def fix_global_lock():
-    if not ENABLE_DUP_GLOBAL_CHECK:
-        return
-    vg_names = bash.bash_o("lvmlockctl -i | awk '/lock_type=sanlock/{print $2}'").strip().splitlines()  # type: list
-    vg_names.sort()
-    if len(vg_names) < 2:
-        return
-    for vg_name in vg_names[1:]:
-        bash.bash_roe("lvmlockctl --gl-disable %s" % vg_name)
-    bash.bash_roe("lvmlockctl --gl-enable %s" % vg_names[0])
+    with lock.NonBlockNamedLock("fix-gllk") as lck:
+        if not lck.acquired:
+            return
 
-def fix_vglk(vg_uuid):
-    vglk = sanlock.get_vglk(vg_uuid)
-    if not vglk:
-        return
-    hosts_state = sanlock.get_hosts_state("lvm_" + vg_uuid)
-    if hosts_state is not None and hosts_state.get_live_min_hostid() == int(get_running_host_id(vg_uuid)):
-        sanlock.direct_init_resource("{}:{}:/dev/mapper/{}-lvmlock:{}".format(vglk.lockspace_name, vglk.resource_name, vglk.vg_name, vglk.offset))
+        # disable held gllk if exists and enable gllk on an available VG
+        lockspaces = LvmlockdStatus().ls_status
+        if not lockspaces:
+            return
+
+        for vg_name, lockspace in lockspaces.items():
+            if lockspace.gl_enabled:
+                bash.bash_r("lvmlockctl --gl-disable %s" % vg_name)
+
+        avail_vgs = {vg_name for vg_name, ls in lockspaces.items() if not ls.killed and not ls.dropped}
+        if avail_vgs:
+            avail_vgs = sorted(list(avail_vgs))
+            bash.bash_r("lvmlockctl --gl-enable %s" % avail_vgs[0])
 
 
 def list_pvs(vgUuid, timeout=10):
@@ -2524,13 +2506,6 @@ def lvm_vgck(vgUuid, timeout):
                 continue
             if es.strip() == "":
                 continue
-            # fix ZSTAC-61116
-            if es.strip().endswith("lock skipped: error -22") and lvmlockd_log_search("S lvm_%s R VGLK res_lock invalid val_blk" % vgUuid,
-                                                                                      start_time, end_time):
-                fix_vglk(vgUuid)
-            elif es.strip().endswith("lock failed: removed"):
-            # fix ZSTAC-57545
-                fix_vglk(vgUuid)
             s = "vgck %s failed, details: [return_code: %s, stdout: %s, stderr: %s]" % (vgUuid, health, o, e)
             logger.warn(s)
             return False, s
@@ -3010,12 +2985,32 @@ def report_config_changed():
     shell.run("touch %s" % LVM_CONFIG_CHANGED_FILE)
 
 
-def subcmd(cmd, timeout=lvm_cmd_timeout_with_locking):
-    if cmd in ["lvs", "pvs", "vgs"]:
-        return "%s --nolocking -t" % cmd
-    elif cmd in ["lvchange", "lvcreate", "lvrename", "lvresize", "lvextend", "lvremove"]:
-        return "timeout -s SIGKILL %s %s"% (timeout, cmd)
-    return cmd
+NOLOCK_CMDS = {"lvs", "pvs", "vgs"}
+TIMEOUT_CMDS = {"lvchange", "lvcreate", "lvrename", "lvresize", "lvextend", "lvremove"}
+REPAIR_LV_CMDS = TIMEOUT_CMDS - {"lvcreate"}
+REPAIR_VG_CMDS = {"vgchange"}
+
+
+def subcmd(cmd, timeout=lvm_cmd_timeout_with_locking, lockopts=None):
+    argv = [cmd]
+    lockopts = list(lockopts) if lockopts is not None else []
+    if cmd in NOLOCK_CMDS:
+        argv += ["--nolocking", "-t"]
+    else:
+        if cmd in TIMEOUT_CMDS:
+            argv = ["timeout", "-s", "SIGKILL", str(timeout)] + argv
+        if cmd in REPAIR_LV_CMDS:
+            lockopts.append("repairlv")
+        if cmd in REPAIR_VG_CMDS:
+            lockopts.append("repair")
+    # Keep the caller's option order on Python 2 as well as Python 3.
+    unique_lockopts = []
+    for option in lockopts:
+        if option not in unique_lockopts:
+            unique_lockopts.append(option)
+    if unique_lockopts:
+        argv += ["--lockopt", ",".join(unique_lockopts)]
+    return " ".join(argv)
 
 class LvmlockdStatus(object):
     def __init__(self):
@@ -3034,6 +3029,7 @@ class LvmlockdStatus(object):
             self.killed = bool(int(ls.get("kill_vg")))
             self.dropped = bool(int(ls.get("drop_vg")))
             self.vg_name = ls.get("vg_name")
+            self.gl_enabled = bool(int(ls.get("sanlock_gl_enabled")))
 
     def _init(self):
         @linux.retry(3, 1)
@@ -3041,6 +3037,18 @@ class LvmlockdStatus(object):
             r, status_line, e = bash.bash_roe("timeout 10 lvmlockctl -i -d")
             if r != 0:
                 raise Exception("dump lvmlockd info failed: retcode %s, error %s" % (r, e))
+
+            if status_line.strip() == "":
+                return
+
+            result_line = status_line.strip().splitlines()[0]
+            if result_line.startswith("result "):
+                rv = int(result_line.split()[-1])
+                if rv == -errno.ENOSPC:
+                    self.failed = True
+                    logger.warn("lvmlockctl dump buffer overflow")
+                    return
+
             for line in filter(lambda l: 'ls_name=lvm_' in l, status_line.splitlines()):
                 ls = self.LockspaceStatus(line)
                 self.ls_status.update({ls.vg_name: ls})
@@ -3090,8 +3098,10 @@ def config_lvm(host_id, all_disk_paths, vg_uuid, host_uuid, default_sanlock_lv_s
         "sanlock_lv_extend": default_sanlock_lv_size,
         "lvmlockd_lock_retries": lvmlockd_lock_retries,
         "issue_discards": 0,
+        "notify_dbus": 0,
         "reserved_stack": 256,
         "reserved_memory": 131072,
+        "use_devicesfile": 0,
         "use_lvmetad": 1 if enable_lvmetad else 0
     })
 

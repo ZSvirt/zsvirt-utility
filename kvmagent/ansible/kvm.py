@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import external_plugin_layout
 import libvirt_control
+import lvm_package_transition
 from zstacklib import *
 
 # create log
@@ -318,6 +319,10 @@ def install_kvm_pkg():
             if 'storcli' in _dep_list:
                 update_list += ' storcli'
 
+            lvm_package_transition.migrate_legacy_packages(
+                releasever, host_info.host_arch, zstack_repo, _skip_list,
+                host_post_info, run_remote_command)
+
             # name: install/update kvm related packages on RedHat based OS from user defined repo
             command = ("echo {1} >/var/lib/zstack/dependencies && yum --disablerepo=* --enablerepo={0} clean metadata >/dev/null && \
                     pkg_list=`rpm -q {1} | grep \"not installed\" | awk '{{ print $2 }}'`' {2}' && \
@@ -478,6 +483,8 @@ def install_kvm_pkg():
         # new-add host
         if releasever in ['c76', 'c79', 'h76c', 'h79c', 'c74'] and "qemu-kvm" not in skip_packages:
             rpm_deprecated_list += " qemu-img-ev qemu-kvm-ev qemu-kvm-common-ev"
+
+        rpm_deprecated_list += " lvm2-help device-mapper-devel device-mapper-event-devel"
 
         for rpm in rpm_deprecated_list.split():
             yum_remove_package(rpm, host_post_info)
