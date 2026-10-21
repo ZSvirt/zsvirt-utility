@@ -321,15 +321,9 @@ class VmQga(object):
 
     def guest_exec_zs_tools(self, operate, config, config_obj=None, output=True, wait=qga_exec_wait_interval, retry=zs_tools_wait_retry):
         def get_return_data(result):
-            if not result:
-                return ""
-            ret_data = ""
-            if 'out-data' in result:
-                ret_data = decode_with_fallback(result['out-data'])
-            elif 'err-data' in result:
-                ret_data = decode_with_fallback(result['err-data'])
-            return ret_data.replace('\r\n', '')
+            return self._get_zs_tools_output(result)
 
+        ret = None
         try:
             ret = self.guest_exec(
                 {"path": self.ZS_TOOLS_PATN_WIN, "arg": [operate, "--config", config], "capture-output": output})
@@ -337,7 +331,8 @@ class VmQga(object):
             if ret and "pid" in ret:
                 pid = ret["pid"]
             else:
-                raise Exception(get_return_data(ret))
+                raise Exception('guest-exec did not return pid, ret={}'.format(
+                    json.dumps(ret, default=repr)))
 
             ret = None
             for i in range(retry):
@@ -347,12 +342,71 @@ class VmQga(object):
                     break
 
             if not ret or not ret.get('exited'):
-                raise Exception(get_return_data(ret))
+                raise Exception('zs-tools pid {} not exited after {} retries, ret={}, {}'.format(
+                    pid, retry, json.dumps(ret, default=repr), get_return_data(ret)))
 
-            return ret.get('exitcode'), get_return_data(ret)
+            exitcode = ret.get('exitcode')
+            if exitcode is None:
+                raise Exception('zs-tools pid {} exited without exitcode, ret={}, {}'.format(
+                    pid, json.dumps(ret, default=repr), get_return_data(ret)))
+            result = get_return_data(ret)
+            if exitcode != 0:
+                result = 'zs-tools pid {} exitcode {}, {}'.format(pid, exitcode, result)
+                tail = self._try_read_zs_tools_log_tail()
+                if tail:
+                    result += '\nzs-tools.log tail:\n' + tail
+            return exitcode, result
         except Exception as e:
+            detail = str(e) or type(e).__name__
+            partial_output = get_return_data(ret)
+            if partial_output and partial_output not in detail:
+                detail += '\n' + partial_output
+            tail = self._try_read_zs_tools_log_tail()
+            if tail:
+                detail += '\nzs-tools.log tail:\n' + tail
             return 1, 'qga exec zs-tools operate {} failed for vm {}, config: {}, error: {}'.format(
-                    operate, self.vm_uuid, log.mask_sensitive_field(config_obj, config), e)
+                    operate, self.vm_uuid, log.mask_sensitive_field(config_obj, config), detail)
+
+    @staticmethod
+    def _decode_zs_tools_data(data):
+        decoded = decode_with_fallback(data)
+        if not isinstance(decoded, str):
+            decoded = decoded.decode('utf-8')
+        return decoded.replace('\r\n', '\n')
+
+    def _get_zs_tools_output(self, result):
+        if not result:
+            return ''
+        return '\n'.join(label + ': ' + self._decode_zs_tools_data(result[key])
+                         for key, label in [('out-data', 'stdout'), ('err-data', 'stderr')]
+                         if result.get(key) is not None)
+
+    def _try_read_zs_tools_log_tail(self, n_bytes=4096):
+        # Each attempt uses only bounded QGA file operations, never guest-exec.
+        paths = [r'C:\Program Files\GuestTools\zs-tools\log\zs-tools.log',
+                 r'C:\Program Files\zstack\zs-tools\log\zs-tools.log']
+        for path in paths:
+            handle = None
+            try:
+                handle = self.call_qga_command('guest-file-open',
+                                               {'path': path, 'mode': 'rb'}, timeout=1)
+                end = self.call_qga_command('guest-file-seek',
+                                           {'handle': handle, 'offset': 0, 'whence': 2}, timeout=1)
+                self.call_qga_command('guest-file-seek',
+                                      {'handle': handle, 'offset': max(0, end['position'] - n_bytes),
+                                       'whence': 0}, timeout=1)
+                data = self.call_qga_command('guest-file-read',
+                                             {'handle': handle, 'count': n_bytes}, timeout=1)
+                return self._decode_zs_tools_data(data.get('buf-b64', b''))
+            except Exception:
+                pass
+            finally:
+                if handle is not None:
+                    try:
+                        self.call_qga_command('guest-file-close', {'handle': handle}, timeout=1)
+                    except Exception:
+                        pass
+        return ''
 
     def guest_exec_wmic(self, cmd, output=True, wait=qga_exec_wait_interval, retry=qga_exec_wait_retry):
         cmd_parts = cmd.split('|')
