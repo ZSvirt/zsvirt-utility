@@ -5579,15 +5579,25 @@ class Vm(object):
             raise kvmagent.KvmError("vm qga channel is not connected")
 
         # before set-user-password, we must check if os ready in the guest
-        self._wait_until_qemuga_ready(timeout, uuid)
+        guest_info = self._wait_until_qemuga_ready(timeout, uuid)
+        password_disabled_error = (
+            "Changing the VM password through QGA is disabled in this guest. "
+            "Change the password inside the guest OS, or enable "
+            "guest-set-user-password in VMTools/QGA and retry.")
+        for command in guest_info.get('supported_commands', []):
+            if command.get('name') == 'guest-set-user-password' and command.get('enabled') is False:
+                raise kvmagent.KvmError(password_disabled_error)
         try:
             escape_password = self._escape_char_password(cmd.accountPerference.accountPassword)
             shell.call('virsh set-user-password %s %s %s' % (self.uuid,
                                                                  cmd.accountPerference.userAccount,
                                                                  escape_password))
         except Exception as e:
-            logger.warn(e.message)
-            if e.message.find("child process has failed to set user password") < 0:
+            error = str(e)
+            if 'guest-set-user-password' in error and 'has been disabled' in error:
+                raise kvmagent.KvmError(password_disabled_error)
+            logger.warn(error)
+            if error.find("child process has failed to set user password") < 0:
                 raise e
 
             raise kvmagent.KvmError('unable to execute "chpasswd" in guest[uuid:%s], check if user[%s] existing or guest system log.'
