@@ -1138,6 +1138,11 @@ class GetVmGuestToolsInfoRsp(kvmagent.AgentResponse):
         self.status = None
         self.features = {}
 
+class GetVmZWatchStatusRsp(kvmagent.AgentResponse):
+    def __init__(self):
+        super(GetVmZWatchStatusRsp, self).__init__()
+        self.status = None
+
 class GetVmMetricsRoutingStatusRsp(kvmagent.AgentResponse):
     def __init__(self):
         super(GetVmMetricsRoutingStatusRsp, self).__init__()
@@ -7947,6 +7952,7 @@ class VmPlugin(kvmagent.KvmAgent):
     ATTACH_GUEST_TOOLS_ISO_TO_VM_PATH = "/vm/guesttools/attachiso"
     DETACH_GUEST_TOOLS_ISO_FROM_VM_PATH = "/vm/guesttools/detachiso"
     GET_VM_GUEST_TOOLS_INFO_PATH = "/vm/guesttools/getinfo"
+    GET_VM_ZWATCH_STATUS_PATH = "/vm/zwatch/getstatus"
     GET_VM_METRICS_ROUTING_STATUS_PATH = "/vm/guesttools/getroutingstatus"
     KVM_GET_VM_FIRST_BOOT_DEVICE_PATH = "/vm/getfirstbootdevice"
     KVM_CONFIG_PRIMARY_VM_PATH = "/primary/vm/config"
@@ -11479,25 +11485,40 @@ host side snapshot files chian:
 
         version = base64.b64decode(simplejson.loads(o)['return']['buf-b64']).strip()
         rsp.version = version
+        rsp.status = VmPlugin.GUESTTOOLS_STATE_RUNNING
         _close_version_file()
 
-        cmd = "try { (Get-Service -Name zstack_zwatch_agent -ErrorAction Stop).Status.ToString() } " \
-              "catch { if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { 'NotInstalled' } else { throw } }"
+    @kvmagent.replyerror
+    def get_vm_zwatch_status(self, req):
+        rsp = GetVmZWatchStatusRsp()
+        cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        vm_uuid = cmd.vmInstanceUuid
+        vm = get_vm_by_uuid_no_retry(vm_uuid, True)
+        if vm.state != Vm.VM_STATE_RUNNING:
+            rsp.success = False
+            rsp.error = 'vm[uuid:%s] is not in running state' % vm_uuid
+            return jsonobject.dumps(rsp)
+
+        if not is_qga_connected(vm.domain):
+            rsp.success = False
+            rsp.error = 'vm[uuid:%s] qga channel is not connected' % vm_uuid
+            return jsonobject.dumps(rsp)
+
+        rsp.status = VmPlugin.GUESTTOOLS_STATE_NOT_RUNNING
         try:
-            r, o = VmQga(vm.domain).guest_exec_powershell(cmd, raw=True)
+            r, o = VmQga(vm.domain).guest_exec_program('sc.exe', ['query', 'zstack_zwatch_agent'])
         except Exception as e:
-            rsp.success = False
-            rsp.error = 'failed to query ZWatch service for vm[uuid:%s]: %s' % (vm_uuid, e)
-            return
+            logger.warn('failed to query ZWatch service for vm[uuid:%s]: %s' % (vm_uuid, e))
+            return jsonobject.dumps(rsp)
 
-        state = o.strip() if o else None
-        if r != 0 or state not in ('NotInstalled', 'Stopped', 'StartPending', 'StopPending',
-                                   'Running', 'ContinuePending', 'PausePending', 'Paused'):
-            rsp.success = False
-            rsp.error = 'failed to query ZWatch service for vm[uuid:%s], exitcode[%s]: %s' % (vm_uuid, r, o)
-            return
+        state = re.search(r'(?m)^\s*STATE\s*:\s*([1-7])\b', o or '')
+        if r != 0 or state is None:
+            logger.warn('failed to query ZWatch service for vm[uuid:%s], exitcode[%s]: %s' % (vm_uuid, r, o))
+            return jsonobject.dumps(rsp)
 
-        rsp.status = VmPlugin.GUESTTOOLS_STATE_RUNNING if state == 'Running' else VmPlugin.GUESTTOOLS_STATE_NOT_RUNNING
+        if int(state.group(1)) == shell.WINDOWS_SERVICE_RUNNING:
+            rsp.status = VmPlugin.GUESTTOOLS_STATE_RUNNING
+        return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
     def get_vm_metrics_routing_status(self, req):
@@ -12676,6 +12697,7 @@ host side snapshot files chian:
         http_server.register_async_uri(self.ATTACH_GUEST_TOOLS_ISO_TO_VM_PATH, self.attach_guest_tools_iso_to_vm)
         http_server.register_async_uri(self.DETACH_GUEST_TOOLS_ISO_FROM_VM_PATH, self.detach_guest_tools_iso_from_vm)
         http_server.register_async_uri(self.GET_VM_GUEST_TOOLS_INFO_PATH, self.get_vm_guest_tools_info)
+        http_server.register_async_uri(self.GET_VM_ZWATCH_STATUS_PATH, self.get_vm_zwatch_status)
         http_server.register_async_uri(self.GET_VM_METRICS_ROUTING_STATUS_PATH, self.get_vm_metrics_routing_status)
         http_server.register_async_uri(self.KVM_GET_VM_FIRST_BOOT_DEVICE_PATH, self.get_vm_first_boot_device)
         http_server.register_async_uri(self.KVM_CONFIG_PRIMARY_VM_PATH, self.config_primary_vm)
