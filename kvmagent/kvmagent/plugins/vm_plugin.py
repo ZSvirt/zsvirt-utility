@@ -4761,6 +4761,7 @@ class Vm(object):
             parameter_map[libvirt.VIR_MIGRATE_PARAM_MIGRATE_DISKS] = disks
             parameter_map[libvirt.VIR_MIGRATE_PARAM_URI] = tcpUri
             parameter_map[libvirt.VIR_MIGRATE_PARAM_DEST_XML] = destXml
+            parameter_map[libvirt.VIR_MIGRATE_PARAM_PERSIST_XML] = destXml
             if bandwidth != 0:
                 parameter_map[libvirt.VIR_MIGRATE_PARAM_BANDWIDTH] = bandwidth
         else:
