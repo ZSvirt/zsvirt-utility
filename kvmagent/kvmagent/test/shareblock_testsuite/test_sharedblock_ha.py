@@ -5,7 +5,7 @@ import mock
 
 from kvmagent.test.shareblock_testsuite.shared_block_plugin_teststub import SharedBlockPluginTestStub
 from kvmagent.test.utils import sharedblock_utils,pytest_utils,storage_device_utils,ha_utils
-from zstacklib.utils import bash, http, jsonobject, linux, sanlock, lvm
+from zstacklib.utils import bash, http, jsonobject, linux, sanlock, lvm, shell
 from unittest import TestCase
 from zstacklib.test.utils import misc,env
 from kvmagent.plugins.ha_plugin import HaPlugin
@@ -43,7 +43,7 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
         cls.zsblk_agent_heart_result = "success"
         cls.zsblk_agent_heart_code = 0
 
-        cls.origin_json_dump_get = staticmethod(http.json_dump_get)
+        cls.origin_shell_call = staticmethod(shell.call)
         cls.origin_json_dump_post = staticmethod(http.json_dump_post)
         # 1 means storage is good, 2 means storage is failed, -1 means no way to check.
         cls.condition_dict = {1: "success", 0: "fail", -1:"no_way"}
@@ -56,8 +56,8 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
         cls.disk1_dev = None
 
     def mock_zsblk_agent(self):
-        def mock_func(uri, body=None, headers={}, fail_soon=False, print_curl=False):
-            if "zsblk-agent/vg/heartbeat/status" in uri:
+        def mock_func(command, *args, **kwargs):
+            if command.startswith("curl ") and "zsblk-agent/vg/heartbeat/status" in command:
                 if self.zsblk_agent_heart_result == "success":
                     result = {vgUuid: {"lastCheck": linux.get_current_timestamp(), "lastSuccess": linux.get_current_timestamp(), "code": 0, "error": ""}}
                 elif self.zsblk_agent_heart_result == "fail":
@@ -65,8 +65,10 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
                 else:
                     result = {}
                 return jsonobject.dumps(result)
-            return self.origin_json_dump_get(uri, body, headers, fail_soon, print_curl)
-        http.json_dump_get = mock.Mock(side_effect=mock_func)
+            return self.origin_shell_call(command, *args, **kwargs)
+        patcher = mock.patch.object(shell, 'call', side_effect=mock_func)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
     def mock_management_work(self):
@@ -81,14 +83,18 @@ class TestSharedBlockPlugin(TestCase, SharedBlockPluginTestStub):
                     raise Exception("cannot report self fencer state changed.")
 
             return self.origin_json_dump_post(uri, body, headers, fail_soon, print_curl)
-        http.json_dump_post = mock.Mock(side_effect=mock_func)
+        patcher = mock.patch.object(http, 'json_dump_post', side_effect=mock_func)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
     def mock_fencer_fire(self):
         def mock_func(vgUuid):
             self.fencer_triggered = 1
             return []
-        lvm.get_running_vm_root_volume_on_vg = mock.Mock(side_effect=mock_func)
+        patcher = mock.patch.object(lvm, 'get_running_vm_root_volume_on_vg', side_effect=mock_func)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
     def connnect_storage(self):
