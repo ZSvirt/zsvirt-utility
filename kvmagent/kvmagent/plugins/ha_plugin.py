@@ -543,18 +543,46 @@ class SblkHealthChecker(AbstractStorageFencer):
     def get_created_time(self, vg_uuid):
         return self.fencer_created_time.get(vg_uuid)
 
-    # Shared-block renewal judgment. Age is /proc/uptime minus last_success, never last_attempt. First match wins.
-    # count/hold and checker errors are unknown; the Go heartbeat resolves them.
+    # Sanlock VG check. Age is /proc/uptime minus last_success, never last_attempt. First match wins.
+    # reset and kill stop here. count, hold, and checker errors hand the VG to zsblk-agent.
     #
-    # condition                                                              | count              | kill VM
-    # no lockspace record, or not in sanlock client gets                     | unknown            | use Go heartbeat
-    # lockspace is adding                                                    | reset              | do not kill
-    # renewal_last_result == 1                                               | reset              | do not kill
-    # space_dead is set                                                      | do not accumulate  | kill this round
-    # result is -5 or -202, and uptime - last_success exceeds 8 * io_timeout | do not accumulate  | kill this round
-    # result is -5 or -202, but the age has not reached the threshold        | reset              | do not kill
-    # any other result code                                                  | unknown            | use Go heartbeat
-    # result is already -5 or -202, but uptime cannot be read                | unknown            | use Go heartbeat
+    # condition                                                              | result
+    # no lockspace record, or not in sanlock client gets                     | hand to zsblk-agent
+    # lockspace is adding                                                    | reset, stop
+    # renewal_last_result == 1                                               | reset, stop
+    # space_dead is set                                                      | kill, stop
+    # result is -5 or -202, and uptime - last_success exceeds 8 * io_timeout | kill, stop
+    # result is -5 or -202, but the age has not reached the threshold        | reset, stop
+    # any other result code                                                  | hand to zsblk-agent
+    # result is -5 or -202, but uptime cannot be read                        | hand to zsblk-agent
+    # sanlock read or this check raises                                      | hand to zsblk-agent
+    #
+    # zsblk-agent check. Used only after the VG check hands the VG over. First match wins.
+    # The limit is max_failure * (health_check_interval + storage_timeout).
+    #
+    # condition                                                      | result
+    # no record, no lastCheck, or lastCheck is older than the limit  | no_way
+    # code == 0                                                       | healthy
+    # code != 0, and lastCheck - lastSuccess exceeds the limit        | failed
+    # code != 0, but lastCheck - lastSuccess is within the limit      | not failed
+    #
+    # Combined result after the VG check and, when handed over, the zsblk-agent check.
+    #
+    # result                               | kill VM
+    # failed is True, and no_way is False  | kill this round
+    # failed is False                      | do not kill
+    # no_way is still True                 | do not kill; report to the MN, pause the VMs if the report fails
+    def _do_health_check(self, storage_timeout, max_failure):
+        # Step 1: Check all vgs by sanlock
+        final_results = self._do_health_check_vg_by_sanlock(list(self.all_vgs.keys()))
+
+        # Step 2: If needed, do zsblkagent check and update results
+        vgs_needing_zsblk_check = [vg for vg, r in final_results.items() if r.no_way]
+        if vgs_needing_zsblk_check:
+            final_results.update(self._do_health_check_vg_by_zsblkagent(vgs_needing_zsblk_check))
+
+        return final_results
+
     def _do_health_check_vg(self, vg, lockspaces, r):
         if not r or r.get_lockspace() not in lockspaces:
             failure = "lockspace for vg %s not found" % vg
@@ -681,20 +709,6 @@ class SblkHealthChecker(AbstractStorageFencer):
             res.no_way = True
             res.error = str(e)
         return res
-
-    def _do_health_check(self, storage_timeout, max_failure):
-        # Step 1: Check all vgs by sanlock
-        final_results = self._do_health_check_vg_by_sanlock(list(self.all_vgs.keys()))
-
-        # Step 2: Identify vgs that need additional check by zsblk-agent
-        vgs_needing_zsblk_check = [vg for vg, r in final_results.items() if r.no_way]
-
-        # Step 3: If needed, do zsblkagent check and update results
-        if vgs_needing_zsblk_check:
-            zsblk_results = self._do_health_check_vg_by_zsblkagent(vgs_needing_zsblk_check)
-            final_results.update(zsblk_results)
-
-        return final_results
 
     def get_record_vm_lun(self, vg_uuid, host_uuid):
         return '/dev/%s/host_%s' % (vg_uuid, host_uuid)
