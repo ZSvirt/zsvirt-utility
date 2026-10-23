@@ -659,7 +659,16 @@ class SblkHealthChecker(AbstractStorageFencer):
             res.failed = False
             return res
 
-        res.failed = last.lastCheck - last.lastSuccess > max_renewal_failure_seconds
+        last_success = last.lastSuccess
+        if not last_success:
+            # Keep the startup grace separate from a real successful write.
+            first_check = getattr(last, 'firstCheck', None)
+            if not first_check:
+                res.no_way = True
+                res.error = "no successful heartbeat or startup timestamp for vg %s" % vg_uuid
+                return res
+            last_success = first_check
+        res.failed = last.lastCheck - last_success > max_renewal_failure_seconds
         if res.failed:
             res.io_timeout = last.code == -2
             res.error = ("vg %s heartbeat failed, details: zsblk-agent last renewal failed with %s and last check is %s, "
