@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Task-bound cancellation must never turn stale PIDs into kill targets."""
 import base64
+import re
 import unittest
 import test_qga_guest_exec_program as loader
 mock = loader.mock
@@ -24,7 +25,7 @@ class ZsToolsTimeoutTest(unittest.TestCase):
                         mock.patch.object(self.qga.time, 'sleep', side_effect=self.sleep)]
         for patch in self.patches: patch.start()
 
-    def control(self, task, action):
+    def control(self, task, action, deadline=None):
         if action in ('cancel', 'seal'):
             if self.active: raise RuntimeError('Job still active or cannot be observed')
             return dict(self.record, phase='cancelled')
@@ -176,12 +177,84 @@ class ZsToolsTimeoutTest(unittest.TestCase):
         self.vm.guest_exec_status_with_timeout.return_value = {'exited': True, 'exitcode': 0, 'out-data': b'stale'}
         with self.assertRaises(Exception): self.vm._net_task_control({'task_id': 'f'*32}, 'cancel')
 
-    def test_wall_clock_budget_includes_slow_status_calls(self):
-        def status(pid, timeout):
-            self.now += 2
-            return {'exited': False}
-        self.vm.guest_exec_status_with_timeout.side_effect = status
-        self.run_net()
-        self.vm.guest_exec_status_with_timeout.assert_not_called()
+    def install_real_slow_control(self, slow_action, cancel_exits=True):
+        # Exercise production guest_exec, status and _net_task_control. Only
+        # the QGA transport/clock are simulated, including per-request nonces.
+        del self.vm._net_task_control
+        del self.vm.guest_exec
+        del self.vm.guest_exec_status_with_timeout
+        requests = {}
+        events = []
+        def transport(command, args=None, timeout=None):
+            if command == 'guest-exec':
+                script = base64.b64decode(args['arg'][-1]).decode('utf-16le')
+                action = re.search(r"\$action = '(\w+)'", script)
+                action = action.group(1) if action else 'launch'
+                events.append((action, 'submit', self.now, timeout))
+                if slow_action == 'launch' and action == 'launch':
+                    self.now += timeout
+                    raise RuntimeError('submission timed out after being accepted')
+                token = re.search(r"\$taskId = '([a-f0-9]+)'", script).group(1)
+                nonce = re.search(r"\$reply = .*?\+ '\|([a-f0-9]+)'", script)
+                pid = len(requests) + 100
+                requests[pid] = (action, token, nonce.group(1) if nonce else '')
+                return {'pid': pid}
+            self.assertEqual('guest-exec-status', command)
+            action, token, nonce = requests[args['pid']]
+            events.append((action, 'status', self.now, timeout))
+            if action == slow_action or (action == 'cancel' and not cancel_exits):
+                self.now += timeout
+                return {'exited': False}
+            if action == 'cancel': self.now += 2  # separate cleanup budget
+            phase = {'prepare': 'reserved', 'inspect': 'finished', 'cancel': 'cancelled'}[action]
+            return {'exited': True, 'exitcode': 0, 'out-data':
+                    ('ZSN2|%s|%s|43|42|%s' % (token, phase, nonce)).encode('ascii')}
+        self.vm.call_qga_command = mock.Mock(side_effect=transport)
+        return events
+
+    def test_wall_clock_budget_includes_real_slow_inspect_status(self):
+        events = self.install_real_slow_control('inspect')
+        code, message = self.run_net()
+        polls = [e for e in events if e[:2] == ('inspect', 'status')]
+        self.assertEqual(1, code)
+        self.assertGreater(len(polls), 0)
+        self.assertLessEqual(self.now - 100, 3)
+        self.assertTrue(all(start + timeout <= 103 for _, _, start, timeout in polls))
+        self.assertIn('execution_elapsed=3.000s', message)
+        self.assertIn('cleanup_elapsed=0.000s', message)
+        self.assertIn('vm-a', self.qga._zs_tools_net_pending)
+        self.assertFalse(any(e[0] == 'cancel' for e in events))
+
+    def test_real_slow_collect_uses_parent_deadline_and_separate_cleanup(self):
+        events = self.install_real_slow_control('collect')
+        code, message = self.run_net()
+        polls = [e for e in events if e[:2] == ('collect', 'status')]
+        self.assertEqual(1, code)
+        self.assertGreater(len(polls), 0)
+        self.assertTrue(all(start + timeout <= 103 for _, _, start, timeout in polls))
+        self.assertIn('execution_elapsed=3.000s', message)
+        self.assertIn('cleanup_elapsed=2.000s', message)
+        self.assertEqual(5, self.now - 100)
+        self.assertNotIn('vm-a', self.qga._zs_tools_net_pending)
+        self.assertTrue(any(e[0] == 'cancel' and e[2] >= 103 for e in events))
+
+    def test_unconfirmed_cleanup_retains_pending_after_execution_deadline(self):
+        events = self.install_real_slow_control('collect', cancel_exits=False)
+        code, message = self.run_net()
+        self.assertEqual(1, code)
+        self.assertIn('execution_elapsed=3.000s', message)
+        self.assertIn('cleanup_elapsed=10.000s', message)
+        self.assertIn('vm-a', self.qga._zs_tools_net_pending)
+        self.assertLessEqual(self.now - 100, 13)
+        self.assertTrue(any(e[:2] == ('cancel', 'status') for e in events))
+
+    def test_slow_launch_submission_is_part_of_execution_budget(self):
+        events = self.install_real_slow_control('launch')
+        code, message = self.run_net()
+        self.assertEqual(1, code)
+        self.assertEqual(3, self.now - 100)
+        self.assertIn('execution_elapsed=3.000s', message)
+        self.assertEqual('unknown', self.qga._zs_tools_net_pending['vm-a']['phase'])
+        self.assertFalse(any(e[0] == 'inspect' for e in events))
 
 if __name__ == '__main__': unittest.main()

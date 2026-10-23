@@ -194,8 +194,10 @@ class VmQga(object):
             raise Exception('guest-exec-status exception')
         return ret
 
-    def guest_exec(self, args):
-        return self.call_qga_command("guest-exec", args=args)
+    def guest_exec(self, args, timeout=None):
+        if timeout is None:
+            return self.call_qga_command("guest-exec", args=args)
+        return self.call_qga_command("guest-exec", args=args, timeout=timeout)
 
     def guest_exec_program(self, path, args=None, output=True, wait=qga_exec_wait_interval, retry=qga_exec_wait_retry):
         if args is None:
@@ -533,7 +535,20 @@ try {
                 'arg': ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
                 'capture-output': True}
 
-    def _net_task_control(self, task, action):
+    @staticmethod
+    def _net_task_timeout(deadline, limit):
+        # libvirt takes whole seconds. Never round a fractional remainder up
+        # or pass zero (which has special timeout semantics).
+        remaining = int(deadline - time.time())
+        if remaining < 1:
+            raise Exception('net task deadline exhausted')
+        return min(limit, remaining)
+
+    def _net_task_control(self, task, action, deadline=None):
+        # Prepare/cancel have their own bounded control budget. Execution
+        # inspect/collect inherit the caller's absolute deadline unchanged.
+        if deadline is None:
+            deadline = time.time() + 10
         request = dict(task, control_id=uuid.uuid4().hex)
         script = self._net_task_script(request, action)
         encoded = base64.b64encode(script.encode('utf-16le'))
@@ -542,16 +557,18 @@ try {
         result = self.guest_exec({
             'path': r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
             'arg': ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-            'capture-output': True})
+            'capture-output': True}, timeout=self._net_task_timeout(deadline, 3))
         if not result or 'pid' not in result:
             raise Exception('net task control did not return a PID')
-        deadline = time.time() + 10
         while time.time() < deadline:
             try:
-                status = self.guest_exec_status_with_timeout(result['pid'], 2)
+                status = self.guest_exec_status_with_timeout(
+                    result['pid'], self._net_task_timeout(deadline, 2))
             except Exception:
-                time.sleep(0.2)
+                time.sleep(min(0.2, max(0, deadline - time.time())))
                 continue
+            if time.time() >= deadline:
+                break
             if status.get('exited'):
                 data = status.get('out-data', b'')
                 if not isinstance(data, str):
@@ -578,7 +595,7 @@ try {
                     elif len(fields) != 6:
                         raise Exception('invalid net task control response')
                     return record
-            time.sleep(0.2)
+            time.sleep(min(0.2, max(0, deadline - time.time())))
         raise Exception('net task control response timed out')
 
     def _recover_net_task(self, task):
@@ -593,6 +610,7 @@ try {
     def _guest_exec_zs_tools_net(self, config, config_obj, output, wait, retry):
         started = time.time()
         task = None
+        execution_started = None
         with _zs_tools_net_lock:
             try:
                 if self.vm_uuid in _zs_tools_net_pending:
@@ -609,19 +627,20 @@ try {
                 # even if the transport never delivers the wrapper PID.
                 task['phase'] = 'unknown'
                 execution_started = time.time()
-                result = self.guest_exec(self._net_task_launch_args(task, config))
+                deadline = execution_started + wait * retry
+                result = self.guest_exec(self._net_task_launch_args(task, config),
+                                         timeout=self._net_task_timeout(deadline, 3))
                 if not result or 'pid' not in result:
                     raise Exception('net launcher submission result is unknown')
                 task['wrapper_pid'] = result['pid']
                 task['phase'] = 'submitted'
-                deadline = execution_started + wait * retry
                 while time.time() < deadline:
                     time.sleep(min(wait, max(0, deadline-time.time())))
                     remaining = deadline-time.time()
                     if remaining < 1:
                         break
                     try:
-                        record = self._net_task_control(task, 'inspect')
+                        record = self._net_task_control(task, 'inspect', deadline=deadline)
                     except Exception:
                         # A launch transition can briefly hold the receipt
                         # lock. Retain the reservation and retry within budget.
@@ -632,7 +651,7 @@ try {
                         break
                     if record['phase'] == 'finished':
                         try:
-                            completed = self._net_task_control(task, 'collect')
+                            completed = self._net_task_control(task, 'collect', deadline=deadline)
                         except Exception:
                             # The wrapper can still be flushing its own output.
                             # Only collect confirms Job absence and binds output
@@ -648,7 +667,8 @@ try {
                         # lost PID status never supplies the task result or
                         # proves tree termination.
                         try:
-                            self.guest_exec_status_with_timeout(task['wrapper_pid'], 1)
+                            self.guest_exec_status_with_timeout(
+                                task['wrapper_pid'], self._net_task_timeout(deadline, 1))
                         except Exception:
                             pass
                         code = completed['exitcode']
@@ -663,6 +683,8 @@ try {
                             task['task_id'], task.get('pid'))
                 raise Exception('net task {} exceeded deadline {}s'.format(task['task_id'], wait*retry))
             except Exception as error:
+                cleanup_started = time.time()
+                execution_elapsed = cleanup_started - execution_started if execution_started is not None else 0
                 cleanup = ''
                 if task is not None:
                     if task['phase'] == 'preparing':
@@ -678,10 +700,10 @@ try {
                             cleanup = '; cleanup unconfirmed; subsequent net execution blocked'
                     else:
                         cleanup = '; submission result unknown; subsequent net execution blocked'
-                return 1, 'qga exec zs-tools operate net failed for vm {}, task={}, pid={}, elapsed={:.3f}s, config: {}, error: {}{}'.format(
+                return 1, 'qga exec zs-tools operate net failed for vm {}, task={}, pid={}, elapsed={:.3f}s, execution_elapsed={:.3f}s, cleanup_elapsed={:.3f}s, config: {}, error: {}{}'.format(
                     self.vm_uuid, task['task_id'] if task else None,
                     task.get('pid') if task else None, time.time()-started,
-                    log.mask_sensitive_field(config_obj, config), error, cleanup)
+                    execution_elapsed, time.time()-cleanup_started, log.mask_sensitive_field(config_obj, config), error, cleanup)
 
     def guest_exec_zs_tools(self, operate, config, config_obj=None, output=True, wait=qga_exec_wait_interval, retry=zs_tools_wait_retry):
         if operate == 'net':

@@ -33,7 +33,7 @@ class SubmissionTest(unittest.TestCase):
         for patch in reversed(self.patches): patch.stop()
         loader._restore_sys_modules(self.before)
 
-    def control(self, task, action):
+    def control(self, task, action, deadline=None):
         if self.control_failed or (action == 'prepare' and self.prepare_failed):
             raise RuntimeError('channel unavailable')
         token = task['task_id']
@@ -50,7 +50,7 @@ class SubmissionTest(unittest.TestCase):
             record['phase'] = 'cancelled'
         return record.copy()
 
-    def launch(self, args):
+    def launch(self, args, timeout=None):
         task = self.qga._zs_tools_net_pending['vm-a']
         self.assertEqual('unknown', task['phase'])
         token = task['task_id']
@@ -118,7 +118,7 @@ class SubmissionTest(unittest.TestCase):
 
     def test_accepted_response_without_pid_still_retains_unknown(self):
         self.drop_response = False
-        def no_pid(args):
+        def no_pid(args, timeout=None):
             self.launch(args)
             return {}
         self.vm.guest_exec.side_effect = no_pid
