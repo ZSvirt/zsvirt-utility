@@ -16,7 +16,7 @@ class SharedBlockPluginTestStub(pytest_utils.PytestExtension):
     def disconnect(self, vgUuid, hostUuid):
         return sharedblock_utils.shareblock_disconnect(vgUuid=vgUuid,hostUuid=hostUuid)
 
-    def connect(self, sharedBlockUuids, allSharedBlockUuids, vgUuid, hostUuid, hostId, forceWipe=False, isFirst=True):
+    def connect(self, sharedBlockUuids, allSharedBlockUuids, vgUuid, hostUuid, hostId, forceWipe=False, isFirst=True, ioTimeout=5):
         return sharedblock_utils.shareblock_connect(
             sharedBlockUuids=sharedBlockUuids,
             allSharedBlockUuids=allSharedBlockUuids,
@@ -24,7 +24,8 @@ class SharedBlockPluginTestStub(pytest_utils.PytestExtension):
             hostId=hostId,
             hostUuid=hostUuid,
             forceWipe=forceWipe,
-            isFirst=isFirst
+            isFirst=isFirst,
+            ioTimeout=ioTimeout
         )
 
     def logout(self, vgUuid, hostUuid):
@@ -53,13 +54,14 @@ class SharedBlockPluginTestStub(pytest_utils.PytestExtension):
 
     def connect2(self, hostUuid, vgUuid):
         # get block uuid
-        r, o = bash.bash_ro("ls /dev/disk/by-id | grep scsi|awk -F '-' '{print $2}'")
+        r, o = bash.bash_ro("ls /dev/disk/by-id | grep scsi-3|awk -F '-' '{print $2}'")
         blockUuid = o.strip().replace(' ', '').replace('\n', '').replace('\r', '')
         rsp = sharedblock_utils.shareblock_connect(
             sharedBlockUuids=[blockUuid],
             allSharedBlockUuids=[blockUuid],
             vgUuid=vgUuid,
             hostId=50,
-            hostUuid=hostUuid
+            hostUuid=hostUuid,
+            ioTimeout=5
         )
         return rsp, blockUuid
