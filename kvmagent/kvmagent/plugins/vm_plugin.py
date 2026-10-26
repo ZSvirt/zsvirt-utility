@@ -5626,21 +5626,30 @@ class Vm(object):
         for command in guest_info.get('supported_commands', []):
             if command.get('name') == 'guest-set-user-password' and command.get('enabled') is False:
                 raise kvmagent.KvmError(password_disabled_error)
+        password = cmd.accountPerference.accountPassword
+        escape_password = None
         try:
-            escape_password = self._escape_char_password(cmd.accountPerference.accountPassword)
-            shell.call('virsh set-user-password %s %s %s' % (self.uuid,
-                                                                 cmd.accountPerference.userAccount,
-                                                                 escape_password))
+            escape_password = self._escape_char_password(password)
+            command = shell.ShellCmd('virsh set-user-password %s %s %s' % (
+                uuid, cmd.accountPerference.userAccount, escape_password))
+            command(is_exception=False, logcmd=False)
+            if command.return_code == 0:
+                return
+            error = ('failed to execute shell command: virsh\nreturn code: %s\nstdout: %s\nstderr: %s'
+                     % (command.return_code, command.stdout, command.stderr))
         except Exception as e:
             error = str(e)
-            if 'guest-set-user-password' in error and 'has been disabled' in error:
-                raise kvmagent.KvmError(password_disabled_error)
-            logger.warn(error)
-            if error.find("child process has failed to set user password") < 0:
-                raise e
 
-            raise kvmagent.KvmError('unable to execute "chpasswd" in guest[uuid:%s], check if user[%s] existing or guest system log.'
-                                    % (uuid, cmd.accountPerference.userAccount))
+        if 'guest-set-user-password' in error and 'has been disabled' in error:
+            error = password_disabled_error
+        elif 'child process has failed to set user password' in error:
+            error = ('unable to execute "chpasswd" in guest[uuid:%s], check if user[%s] existing or guest system log.'
+                     % (uuid, cmd.accountPerference.userAccount))
+        for secret in (escape_password, password):
+            if secret:
+                error = error.replace(secret, '******')
+        logger.warn(error)
+        raise kvmagent.KvmError(error)
 
     def _check_snapshot_can_livemerge(self, base, top, fullrebase):
         """Check live mrege/block stream can be processed
