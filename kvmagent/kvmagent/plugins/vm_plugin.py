@@ -4763,7 +4763,7 @@ class Vm(object):
             parameter_map[libvirt.VIR_MIGRATE_PARAM_DEST_XML] = destXml
             parameter_map[libvirt.VIR_MIGRATE_PARAM_PERSIST_XML] = destXml
             if bandwidth != 0:
-                parameter_map[libvirt.VIR_MIGRATE_PARAM_BANDWIDTH] = bandwidth
+                parameter_map[libvirt.VIR_MIGRATE_PARAM_BANDWIDTH] = (bandwidth + len(disks) - 1) // len(disks)
         else:
             disks, destXml = self._build_domain_new_xml({})
         logger.debug("migrate dest xml:%s" % destXml)
@@ -4841,9 +4841,46 @@ class Vm(object):
                 self.domain = domain
                 self.uuid = uuid
                 self.progress_status =deque(maxlen=60)
+                self.to_migrate_disks = disks
+                self.ready_disks = []
+                self.bandwidth = bandwidth  # in MiB/s
+
+            def check_bandwidth_mismatch(self):
+                ready_blocks = []
+                for disk in disks:
+                    # {'end': 21474836480L, 'bandwidth': 5L, 'type': 2, 'cur': 21474836480L}
+                    blkjob = self.domain.blockJobInfo(disk)  # type: dict
+                    end = blkjob.get('end', 1)
+                    if blkjob and end and end - blkjob.get("cur", 0) == 0:
+                        ready_blocks.append(disk)
+
+                ready_blocks.sort()
+                mismatch = ready_blocks != self.ready_disks
+                if mismatch:
+                    logger.debug('now ready devices: %s, before ready disks: %s' % (ready_blocks, self.ready_disks))
+                    self.ready_disks = ready_blocks
+                return mismatch
+
+            def reset_bandwidth(self):
+                block_jobs = qmp.query_block_jobs_by_device(self.uuid)
+                to_set_bw_devices = []
+                for device, job in list(block_jobs.items()):
+                    if job.get('status') != 'ready':
+                        to_set_bw_devices.append(device)
+                if not to_set_bw_devices:
+                    qmp.migrate_set_speed(self.uuid, self.bandwidth * 1024 * 1024)
+                    return
+
+                bw = (self.bandwidth + len(to_set_bw_devices) - 1) // len(to_set_bw_devices)
+                for device in to_set_bw_devices:
+                    qmp.block_job_set_speed(self.uuid, device, bw * 1024 * 1024)
 
             def _get_percent(self):
                 try:
+                    if self.to_migrate_disks and self.check_bandwidth_mismatch():
+                        logger.debug('bandwitdh mismatch, reset other device bandwidth')
+                        self.reset_bandwidth()
+
                     stats = self.domain.jobStats()
                     if libvirt.VIR_DOMAIN_JOB_DATA_REMAINING in stats and libvirt.VIR_DOMAIN_JOB_DATA_TOTAL in stats:
                         remain = stats[libvirt.VIR_DOMAIN_JOB_DATA_REMAINING]
