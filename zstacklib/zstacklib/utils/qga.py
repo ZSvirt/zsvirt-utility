@@ -660,9 +660,9 @@ try {
                         _zs_tools_net_pending.pop(self.vm_uuid)
                         data = []
                         if output:
-                            for field in ('out-data', 'err-data'):
-                                if completed.get(field):
-                                    data.append(decode_with_fallback(completed[field]))
+                            formatted = self._get_zs_tools_output(completed)
+                            if formatted:
+                                data.append(formatted)
                         # Best-effort QGA record reclamation only. A stale or
                         # lost PID status never supplies the task result or
                         # proves tree termination.
@@ -675,12 +675,20 @@ try {
                         if code != 0 and not data:
                             data.append('net task {} pid={} exited with code={}'.format(
                                 task['task_id'], task.get('pid'), code))
+                        if code != 0:
+                            tail = self._try_read_zs_tools_log_tail(deadline=deadline)
+                            if tail:
+                                data.append('zs-tools.log tail:\n' + tail)
                         return code, '\n'.join(data)
                     if record['phase'] in ('failed', 'cancelled'):
                         self._recover_net_task(task)
                         _zs_tools_net_pending.pop(self.vm_uuid)
-                        return 1, 'net task {} pid={} ended without a confirmed result'.format(
+                        detail = 'net task {} pid={} ended without a confirmed result'.format(
                             task['task_id'], task.get('pid'))
+                        tail = self._try_read_zs_tools_log_tail(deadline=deadline)
+                        if tail:
+                            detail += '\nzs-tools.log tail:\n' + tail
+                        return 1, detail
                 raise Exception('net task {} exceeded deadline {}s'.format(task['task_id'], wait*retry))
             except Exception as error:
                 cleanup_started = time.time()
@@ -700,6 +708,9 @@ try {
                             cleanup = '; cleanup unconfirmed; subsequent net execution blocked'
                     else:
                         cleanup = '; submission result unknown; subsequent net execution blocked'
+                tail = self._try_read_zs_tools_log_tail(deadline=cleanup_started + 10)
+                if tail:
+                    error = '{}\nzs-tools.log tail:\n{}'.format(error, tail)
                 return 1, 'qga exec zs-tools operate net failed for vm {}, task={}, pid={}, elapsed={:.3f}s, execution_elapsed={:.3f}s, cleanup_elapsed={:.3f}s, config: {}, error: {}{}'.format(
                     self.vm_uuid, task['task_id'] if task else None,
                     task.get('pid') if task else None, time.time()-started,
@@ -709,39 +720,56 @@ try {
         if operate == 'net':
             return self._guest_exec_zs_tools_net(config, config_obj, output, wait, retry)
         def get_return_data(result):
-            if not result:
-                return ""
-            parts = []
-            for field in ('out-data', 'err-data'):
-                if result.get(field):
-                    parts.append(decode_with_fallback(result[field]))
-            return '\n'.join(parts).replace('\r\n', '\n')
+            return self._get_zs_tools_output(result)
 
-        started = time.time()
-        pid = None
         ret = None
         try:
             execution_started = time.time()
             ret = self.guest_exec(
                 {"path": self.ZS_TOOLS_PATN_WIN, "arg": [operate, "--config", config], "capture-output": output})
-            if not ret or "pid" not in ret:
-                raise Exception("guest-exec did not return a pid: {}".format(ret))
-            pid = ret["pid"]
-            deadline = execution_started + wait * retry
+
+            if ret and "pid" in ret:
+                pid = ret["pid"]
+            else:
+                raise Exception('guest-exec did not return pid, ret={}'.format(
+                    json.dumps(ret, default=repr)))
+
             ret = None
+            deadline = execution_started + wait * retry
             while time.time() < deadline:
                 time.sleep(min(wait, max(0, deadline - time.time())))
                 remaining = deadline - time.time()
                 if remaining < 1:
                     break
-                ret = self.guest_exec_status_with_timeout(pid, min(15, max(1, int(remaining))))
-                if ret.get('exited'):
-                    return ret.get('exitcode'), get_return_data(ret)
-            raise Exception("guest pid {} exceeded deadline {}s; last status={}".format(pid, wait * retry, ret))
+                ret = self.guest_exec_status_with_timeout(pid, min(15, int(remaining)))
+                if ret['exited']:
+                    break
+
+            if not ret or not ret.get('exited'):
+                raise Exception('zs-tools pid {} not exited after {} retries, ret={}, {}'.format(
+                    pid, retry, json.dumps(ret, default=repr), get_return_data(ret)))
+
+            exitcode = ret.get('exitcode')
+            if exitcode is None:
+                raise Exception('zs-tools pid {} exited without exitcode, ret={}, {}'.format(
+                    pid, json.dumps(ret, default=repr), get_return_data(ret)))
+            result = get_return_data(ret)
+            if exitcode != 0:
+                result = 'zs-tools pid {} exitcode {}, {}'.format(pid, exitcode, result)
+                tail = self._try_read_zs_tools_log_tail()
+                if tail:
+                    result += '\nzs-tools.log tail:\n' + tail
+            return exitcode, result
         except Exception as e:
-            return 1, 'qga exec zs-tools operate {} failed for vm {}, pid={}, elapsed={:.3f}s, config: {}, error: {}'.format(
-                operate, self.vm_uuid, pid, time.time()-started,
-                log.mask_sensitive_field(config_obj, config), e)
+            detail = str(e) or type(e).__name__
+            partial_output = get_return_data(ret)
+            if partial_output and partial_output not in detail:
+                detail += '\n' + partial_output
+            tail = self._try_read_zs_tools_log_tail()
+            if tail:
+                detail += '\nzs-tools.log tail:\n' + tail
+            return 1, 'qga exec zs-tools operate {} failed for vm {}, config: {}, error: {}'.format(
+                    operate, self.vm_uuid, log.mask_sensitive_field(config_obj, config), detail)
 
     @staticmethod
     def _decode_zs_tools_data(data):
@@ -757,29 +785,38 @@ try {
                          for key, label in [('out-data', 'stdout'), ('err-data', 'stderr')]
                          if result.get(key) is not None)
 
-    def _try_read_zs_tools_log_tail(self, n_bytes=4096):
+    def _try_read_zs_tools_log_tail(self, n_bytes=4096, deadline=None):
         # Each attempt uses only bounded QGA file operations, never guest-exec.
+        def file_command(command, args):
+            timeout = 1
+            if deadline is not None:
+                # Reserve two seconds before non-close calls so an acquired
+                # handle can be closed even with whole-second QGA timeouts.
+                reserve = 0 if command == 'guest-file-close' else 2
+                timeout = self._net_task_timeout(deadline - reserve, 1)
+            return self.call_qga_command(command, args, timeout=timeout)
+
         paths = [r'C:\Program Files\GuestTools\zs-tools\log\zs-tools.log',
                  r'C:\Program Files\zstack\zs-tools\log\zs-tools.log']
         for path in paths:
             handle = None
             try:
-                handle = self.call_qga_command('guest-file-open',
-                                               {'path': path, 'mode': 'rb'}, timeout=1)
-                end = self.call_qga_command('guest-file-seek',
-                                           {'handle': handle, 'offset': 0, 'whence': 2}, timeout=1)
-                self.call_qga_command('guest-file-seek',
-                                      {'handle': handle, 'offset': max(0, end['position'] - n_bytes),
-                                       'whence': 0}, timeout=1)
-                data = self.call_qga_command('guest-file-read',
-                                             {'handle': handle, 'count': n_bytes}, timeout=1)
+                handle = file_command('guest-file-open',
+                                      {'path': path, 'mode': 'rb'})
+                end = file_command('guest-file-seek',
+                                   {'handle': handle, 'offset': 0, 'whence': 2})
+                file_command('guest-file-seek',
+                             {'handle': handle, 'offset': max(0, end['position'] - n_bytes),
+                              'whence': 0})
+                data = file_command('guest-file-read',
+                                    {'handle': handle, 'count': n_bytes})
                 return self._decode_zs_tools_data(data.get('buf-b64', b''))
             except Exception:
                 pass
             finally:
                 if handle is not None:
                     try:
-                        self.call_qga_command('guest-file-close', {'handle': handle}, timeout=1)
+                        file_command('guest-file-close', {'handle': handle})
                     except Exception:
                         pass
         return ''
