@@ -7,6 +7,7 @@ Compatible with Python 2 and Python 3 unittest discovery.
 from __future__ import absolute_import
 
 import os
+import ast
 import json
 import sys
 import threading
@@ -104,6 +105,31 @@ def _load_qga_zwatch():
 
     lock_mod.lock = _lock_decorator
 
+    # Real per-name exclusion for configuration/collection race tests.
+    named_locks = {}
+    named_locks_guard = threading.Lock()
+
+    class NamedLock(object):
+        def __init__(self, name):
+            with named_locks_guard:
+                self.lock = named_locks.setdefault(name, threading.RLock())
+
+        def __enter__(self):
+            self.acquired = self.lock.acquire(True)
+            return self
+
+        def __exit__(self, *_args):
+            if self.acquired:
+                self.lock.release()
+
+    class NonBlockNamedLock(NamedLock):
+        def __enter__(self):
+            self.acquired = self.lock.acquire(False)
+            return self
+
+    lock_mod.NamedLock = NamedLock
+    lock_mod.NonBlockNamedLock = NonBlockNamedLock
+
     kvmagent_mod = _ensure_module('kvmagent.kvmagent')
 
     class KvmAgent(object):
@@ -168,6 +194,8 @@ class TestQgaGetVmNic(unittest.TestCase):
         self.qga._zwatch_file_legacy_until = 0
         self.qga.os = 'mswindows'
         self.qga.os_version = '10'  # not 2008r2
+        self.qga.state = 'running'
+        self.qga.guest_exec_zs_tools.return_value = (0, '')
         self.exe = self.monitor.WIN_ZWATCH_GET_NIC_INFO_EXE_PATH
         self.ps1 = self.monitor.WIN_ZWATCH_GET_NIC_INFO_PATH
 
@@ -175,6 +203,123 @@ class TestQgaGetVmNic(unittest.TestCase):
         def _exist(path):
             return bool(mapping.get(path))
         return _exist
+
+    def _configure_ports(self):
+        # Execute the actual Windows configuration method with QGA mocked.
+        # Avoid importing the unrelated libvirt/storage plugin dependencies.
+        path = os.path.join(os.path.dirname(__file__), '..', 'plugins', 'vm_config.py')
+        with open(path) as source:
+            tree = ast.parse(source.read(), path)
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'VmConfigPlugin')
+        method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'config_vm_ports_by_qga')
+        method.decorator_list = []
+        module = ast.parse('')
+        module.body = [method]
+        qga_factory = mock.Mock(return_value=self.qga)
+        qga_factory.QGA_STATE_RUNNING = 'running'
+        qga_factory.VM_OS_WINDOWS = 'mswindows'
+        namespace = {'VmQga': qga_factory, 'lock': qga_zwatch.lock,
+                     'jsonobject': mock.Mock(), 'logger': mock.Mock()}
+        exec(compile(module, path, 'exec'), namespace)
+        domain = mock.Mock()
+        domain.name.return_value = self.uuid
+        return namespace['config_vm_ports_by_qga'](object(), domain, mock.Mock())
+
+    def test_configuration_skips_collection_without_cache_or_fallback(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def net_command(**_kwargs):
+            started.set()
+            release.wait(3)
+            return 0, ''
+
+        self.qga.guest_exec_zs_tools.side_effect = net_command
+
+        self.monitor.vm_nic_info[self.uuid] = NIC_JSON
+        worker = threading.Thread(target=self._configure_ports)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            self.monitor.qga_get_vm_nic(self.uuid, self.qga)
+            self.qga.guest_file_is_exist.assert_not_called()
+            self.qga.guest_exec_cmd_no_exitcode.assert_not_called()
+            self.monitor.send_nic_info_to_mn.assert_not_called()
+            self.assertEqual(self.monitor.vm_nic_info[self.uuid], NIC_JSON)
+        finally:
+            release.set()
+            worker.join(3)
+
+    def test_configuration_waits_until_snapshot_is_published(self):
+        started = threading.Event()
+        release = threading.Event()
+        configured = threading.Event()
+        self.qga.guest_file_is_exist.return_value = True
+        self.qga.guest_exec_program_no_exitcode.return_value = NIC_JSON
+
+        def publish(*_args):
+            started.set()
+            release.wait(3)
+
+        def configure():
+            self._configure_ports()
+            configured.set()
+
+        self.monitor.send_nic_info_to_mn.side_effect = publish
+        collector = threading.Thread(target=self.monitor.qga_get_vm_nic, args=(self.uuid, self.qga))
+        collector.start()
+        worker = threading.Thread(target=configure)
+        try:
+            self.assertTrue(started.wait(2))
+            worker.start()
+            self.assertFalse(configured.wait(.1))
+        finally:
+            release.set()
+            collector.join(3)
+            if worker.ident is not None:
+                worker.join(3)
+        self.assertTrue(configured.is_set())
+
+    def test_configuration_of_another_vm_does_not_block_collection(self):
+        self.qga.guest_file_is_exist.return_value = True
+        self.qga.guest_exec_program_no_exitcode.return_value = NIC_JSON
+        with qga_zwatch.lock.NamedLock('qga-network-another-vm'):
+            self.monitor.qga_get_vm_nic(self.uuid, self.qga)
+        self.monitor.send_nic_info_to_mn.assert_called_once_with(self.uuid, NIC_JSON)
+
+    def test_legacy_exe_empty_output_preserves_cache_without_fallback(self):
+        self.monitor.vm_nic_info[self.uuid] = NIC_JSON
+        self.qga.guest_file_is_exist.return_value = True
+        self.qga.guest_exec_program_no_exitcode.return_value = '\r\n '
+        self.monitor.qga_get_vm_nic(self.uuid, self.qga)
+        self.assertEqual(self.monitor.vm_nic_info[self.uuid], NIC_JSON)
+        self.qga.guest_exec_cmd_no_exitcode.assert_not_called()
+        self.monitor.send_nic_info_to_mn.assert_not_called()
+
+    def test_legacy_powershell_empty_output_preserves_cache(self):
+        for output in ('', '\r\n ', None):
+            self.monitor.vm_nic_info[self.uuid] = NIC_JSON
+            self.qga.guest_file_is_exist.side_effect = self._exist_map({self.ps1: True, self.exe: False})
+            self.qga.guest_exec_cmd_no_exitcode.return_value = output
+            self.monitor.qga_get_vm_nic(self.uuid, self.qga)
+            self.assertEqual(self.monitor.vm_nic_info[self.uuid], NIC_JSON)
+            self.monitor.send_nic_info_to_mn.assert_not_called()
+
+    def test_collection_failure_releases_network_lock(self):
+        self.qga.guest_file_is_exist.side_effect = RuntimeError('QGA unavailable')
+        self.monitor.qga_get_vm_nic(self.uuid, self.qga)
+        acquired = threading.Event()
+
+        def configure():
+            with qga_zwatch.lock.NonBlockNamedLock('qga-network-%s' % self.uuid) as guard:
+                if guard.acquired:
+                    acquired.set()
+
+        worker = threading.Thread(target=configure)
+        worker.start()
+        worker.join(2)
+        self.assertTrue(acquired.is_set())
+        self.assertNotIn(self.uuid, self.monitor.vm_nic_inflight)
 
     def test_exe_success_does_not_fallback_to_powershell(self):
         self.qga.guest_file_is_exist.side_effect = self._exist_map({
