@@ -93,8 +93,14 @@ class Test(unittest.TestCase):
 
         plugin = vm_plugin.VmPlugin()
         vm = mock.Mock(state=vm_plugin.Vm.VM_STATE_RUNNING)
+
+        def read_tools_info(vm_uuid, rsp):
+            rsp.version = '1.5.8'
+            rsp.status = 'Running'
+
         with mock.patch.object(vm_plugin, 'get_vm_by_uuid_no_retry', return_value=vm), \
                 mock.patch.object(vm_plugin, 'is_qga_connected', return_value=True), \
+                mock.patch.object(plugin, 'get_vm_guest_tools_info_for_windows_guest', side_effect=read_tools_info), \
                 mock.patch.object(vm_plugin, 'VmQga') as qga:
             cases = [
                 (0, 'STATE : 4 RUNNING\r\n', 'Running'),
@@ -112,9 +118,31 @@ class Test(unittest.TestCase):
 
                 self.assertTrue(rsp['success'], output)
                 self.assertEqual(expected, rsp['status'], output)
-                self.assertNotIn('version', rsp)
+                self.assertEqual('1.5.8', rsp['version'], output)
                 qga.return_value.guest_exec_program.assert_called_with(
                     'sc.exe', ['query', 'zstack_zwatch_agent'])
+
+    def test_zwatch_status_survives_version_query_failure(self):
+        from kvmagent.plugins import vm_plugin
+        from zstacklib.utils import http
+
+        plugin = vm_plugin.VmPlugin()
+        vm = mock.Mock(state=vm_plugin.Vm.VM_STATE_RUNNING)
+        with mock.patch.object(vm_plugin, 'get_vm_by_uuid_no_retry', return_value=vm), \
+                mock.patch.object(vm_plugin, 'is_qga_connected', return_value=True), \
+                mock.patch.object(plugin, 'get_vm_guest_tools_info_for_windows_guest',
+                                  side_effect=RuntimeError('VERSION is unavailable')), \
+                mock.patch.object(vm_plugin, 'VmQga') as qga:
+            qga.return_value.guest_exec_program.return_value = (0, 'STATE : 4 RUNNING\r\n')
+            rsp = json.loads(plugin.get_vm_zwatch_status({
+                http.REQUEST_BODY: json.dumps({'vmInstanceUuid': 'vm-uuid'}),
+            }))
+
+            self.assertTrue(rsp['success'])
+            self.assertEqual('Running', rsp['status'])
+            self.assertIsNone(rsp.get('version'))
+            qga.return_value.guest_exec_program.assert_called_once_with(
+                'sc.exe', ['query', 'zstack_zwatch_agent'])
 
 
 if __name__ == "__main__":

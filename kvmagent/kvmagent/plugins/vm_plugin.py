@@ -1142,6 +1142,7 @@ class GetVmZWatchStatusRsp(kvmagent.AgentResponse):
     def __init__(self):
         super(GetVmZWatchStatusRsp, self).__init__()
         self.status = None
+        self.version = None
 
 class GetVmMetricsRoutingStatusRsp(kvmagent.AgentResponse):
     def __init__(self):
@@ -11553,6 +11554,14 @@ host side snapshot files chian:
             return jsonobject.dumps(rsp)
 
         rsp.status = VmPlugin.GUESTTOOLS_STATE_NOT_RUNNING
+        try:
+            tools_rsp = GetVmGuestToolsInfoRsp()
+            self.get_vm_guest_tools_info_for_windows_guest(vm_uuid, tools_rsp)
+            if tools_rsp.success:
+                rsp.version = tools_rsp.version
+        except Exception as e:
+            logger.warn('failed to query GuestTools version for vm[uuid:%s]: %s' % (vm_uuid, e))
+
         try:
             r, o = VmQga(vm.domain).guest_exec_program('sc.exe', ['query', 'zstack_zwatch_agent'])
         except Exception as e:
