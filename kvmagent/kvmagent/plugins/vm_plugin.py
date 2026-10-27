@@ -1142,6 +1142,7 @@ class GetVmZWatchStatusRsp(kvmagent.AgentResponse):
     def __init__(self):
         super(GetVmZWatchStatusRsp, self).__init__()
         self.status = None
+        self.version = None
 
 class GetVmMetricsRoutingStatusRsp(kvmagent.AgentResponse):
     def __init__(self):
@@ -4761,8 +4762,9 @@ class Vm(object):
             parameter_map[libvirt.VIR_MIGRATE_PARAM_MIGRATE_DISKS] = disks
             parameter_map[libvirt.VIR_MIGRATE_PARAM_URI] = tcpUri
             parameter_map[libvirt.VIR_MIGRATE_PARAM_DEST_XML] = destXml
+            parameter_map[libvirt.VIR_MIGRATE_PARAM_PERSIST_XML] = destXml
             if bandwidth != 0:
-                parameter_map[libvirt.VIR_MIGRATE_PARAM_BANDWIDTH] = bandwidth
+                parameter_map[libvirt.VIR_MIGRATE_PARAM_BANDWIDTH] = (bandwidth + len(disks) - 1) // len(disks)
         else:
             disks, destXml = self._build_domain_new_xml({})
         logger.debug("migrate dest xml:%s" % destXml)
@@ -4840,9 +4842,46 @@ class Vm(object):
                 self.domain = domain
                 self.uuid = uuid
                 self.progress_status =deque(maxlen=60)
+                self.to_migrate_disks = disks
+                self.ready_disks = []
+                self.bandwidth = bandwidth  # in MiB/s
+
+            def check_bandwidth_mismatch(self):
+                ready_blocks = []
+                for disk in disks:
+                    # {'end': 21474836480L, 'bandwidth': 5L, 'type': 2, 'cur': 21474836480L}
+                    blkjob = self.domain.blockJobInfo(disk)  # type: dict
+                    end = blkjob.get('end', 1)
+                    if blkjob and end and end - blkjob.get("cur", 0) == 0:
+                        ready_blocks.append(disk)
+
+                ready_blocks.sort()
+                mismatch = ready_blocks != self.ready_disks
+                if mismatch:
+                    logger.debug('now ready devices: %s, before ready disks: %s' % (ready_blocks, self.ready_disks))
+                    self.ready_disks = ready_blocks
+                return mismatch
+
+            def reset_bandwidth(self):
+                block_jobs = qmp.query_block_jobs_by_device(self.uuid)
+                to_set_bw_devices = []
+                for device, job in list(block_jobs.items()):
+                    if job.get('status') != 'ready':
+                        to_set_bw_devices.append(device)
+                if not to_set_bw_devices:
+                    qmp.migrate_set_speed(self.uuid, self.bandwidth * 1024 * 1024)
+                    return
+
+                bw = (self.bandwidth + len(to_set_bw_devices) - 1) // len(to_set_bw_devices)
+                for device in to_set_bw_devices:
+                    qmp.block_job_set_speed(self.uuid, device, bw * 1024 * 1024)
 
             def _get_percent(self):
                 try:
+                    if self.to_migrate_disks and self.check_bandwidth_mismatch():
+                        logger.debug('bandwitdh mismatch, reset other device bandwidth')
+                        self.reset_bandwidth()
+
                     stats = self.domain.jobStats()
                     if libvirt.VIR_DOMAIN_JOB_DATA_REMAINING in stats and libvirt.VIR_DOMAIN_JOB_DATA_TOTAL in stats:
                         remain = stats[libvirt.VIR_DOMAIN_JOB_DATA_REMAINING]
@@ -5587,21 +5626,30 @@ class Vm(object):
         for command in guest_info.get('supported_commands', []):
             if command.get('name') == 'guest-set-user-password' and command.get('enabled') is False:
                 raise kvmagent.KvmError(password_disabled_error)
+        password = cmd.accountPerference.accountPassword
+        escape_password = None
         try:
-            escape_password = self._escape_char_password(cmd.accountPerference.accountPassword)
-            shell.call('virsh set-user-password %s %s %s' % (self.uuid,
-                                                                 cmd.accountPerference.userAccount,
-                                                                 escape_password))
+            escape_password = self._escape_char_password(password)
+            command = shell.ShellCmd('virsh set-user-password %s %s %s' % (
+                uuid, cmd.accountPerference.userAccount, escape_password))
+            command(is_exception=False, logcmd=False)
+            if command.return_code == 0:
+                return
+            error = ('failed to execute shell command: virsh\nreturn code: %s\nstdout: %s\nstderr: %s'
+                     % (command.return_code, command.stdout, command.stderr))
         except Exception as e:
             error = str(e)
-            if 'guest-set-user-password' in error and 'has been disabled' in error:
-                raise kvmagent.KvmError(password_disabled_error)
-            logger.warn(error)
-            if error.find("child process has failed to set user password") < 0:
-                raise e
 
-            raise kvmagent.KvmError('unable to execute "chpasswd" in guest[uuid:%s], check if user[%s] existing or guest system log.'
-                                    % (uuid, cmd.accountPerference.userAccount))
+        if 'guest-set-user-password' in error and 'has been disabled' in error:
+            error = password_disabled_error
+        elif 'child process has failed to set user password' in error:
+            error = ('unable to execute "chpasswd" in guest[uuid:%s], check if user[%s] existing or guest system log.'
+                     % (uuid, cmd.accountPerference.userAccount))
+        for secret in (escape_password, password):
+            if secret:
+                error = error.replace(secret, '******')
+        logger.warn(error)
+        raise kvmagent.KvmError(error)
 
     def _check_snapshot_can_livemerge(self, base, top, fullrebase):
         """Check live mrege/block stream can be processed
@@ -11515,6 +11563,14 @@ host side snapshot files chian:
             return jsonobject.dumps(rsp)
 
         rsp.status = VmPlugin.GUESTTOOLS_STATE_NOT_RUNNING
+        try:
+            tools_rsp = GetVmGuestToolsInfoRsp()
+            self.get_vm_guest_tools_info_for_windows_guest(vm_uuid, tools_rsp)
+            if tools_rsp.success:
+                rsp.version = tools_rsp.version
+        except Exception as e:
+            logger.warn('failed to query GuestTools version for vm[uuid:%s]: %s' % (vm_uuid, e))
+
         try:
             r, o = VmQga(vm.domain).guest_exec_program('sc.exe', ['query', 'zstack_zwatch_agent'])
         except Exception as e:

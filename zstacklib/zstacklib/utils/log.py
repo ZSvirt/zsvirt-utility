@@ -5,6 +5,7 @@
 import logging
 import sys
 import os.path
+import pprint
 import gzip
 import shutil
 
@@ -191,7 +192,10 @@ def mask_sensitive_field(cmd, cmd_str):
     if not cmd or not hasattr(cmd, SENSITIVE_FIELD_NAME):
         return cmd_str
 
-    field_paths = getattr(cmd, SENSITIVE_FIELD_NAME)
+    return _mask_sensitive_fields(getattr(cmd, SENSITIVE_FIELD_NAME), cmd_str)
+
+
+def _mask_sensitive_fields(field_paths, cmd_str):
     obj = simplejson.loads(cmd_str)
 
     def set_nested(o, keys):
@@ -219,3 +223,19 @@ def mask_sensitive_field(cmd, cmd_str):
             del obj[SENSITIVE_FIELD_NAME]
 
     return simplejson.dumps(obj)
+
+
+def format_request_args(args, kwargs):
+    def mask_request(arg):
+        if not isinstance(arg, dict) or 'body' not in arg or not arg.get(SENSITIVE_FIELD_NAME):
+            return arg
+        request = arg.copy()
+        field_paths = request.pop(SENSITIVE_FIELD_NAME)
+        if request['body']:
+            request['body'] = _mask_sensitive_fields(field_paths, request['body'])
+        return request
+
+    return pprint.pformat([
+        tuple(mask_request(arg) for arg in args),
+        {key: mask_request(arg) for key, arg in kwargs.items()}
+    ])

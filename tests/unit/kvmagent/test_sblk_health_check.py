@@ -1,11 +1,17 @@
 import ast
-import importlib.util
 import os
 import re
-import sys
 import textwrap
 import types
+import json
+import shlex
+import shutil
+import socket
+import subprocess
+import time
 from unittest.mock import mock_open, patch
+
+import pytest
 
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
@@ -26,33 +32,24 @@ class _LoggerStub(object):
     def warn(self, *_args, **_kwargs):
         pass
 
+    def error(self, *_args, **_kwargs):
+        pass
+
 
 def _load_sanlock():
-    package = types.ModuleType('zstacklib')
-    package.__path__ = []
-    utils = types.ModuleType('zstacklib.utils')
-    utils.__path__ = []
-    log_module = types.ModuleType('zstacklib.utils.log')
-    linux_module = types.ModuleType('zstacklib.utils.linux')
-    thread_module = types.ModuleType('zstacklib.utils.thread')
-    bash_module = types.ModuleType('zstacklib.utils.bash')
-
-    log_module.get_logger = lambda _name: _LoggerStub()
-    bash_module.in_bash = lambda fn: fn
-    modules = {
-        'zstacklib': package,
-        'zstacklib.utils': utils,
-        'zstacklib.utils.log': log_module,
-        'zstacklib.utils.linux': linux_module,
-        'zstacklib.utils.thread': thread_module,
-        'zstacklib.utils.bash': bash_module,
-    }
+    # Load the actual pure parser/judgment code without importing storage services.
     module_path = os.path.join(ROOT, 'zstacklib', 'zstacklib', 'utils', 'sanlock.py')
-    with patch.dict(sys.modules, modules):
-        spec = importlib.util.spec_from_file_location('zstacklib.utils.sanlock_under_test', module_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    return module
+    tree = ast.parse(open(module_path, encoding='utf-8').read())
+    names = {'SanlockClientStatus', 'read_monotonic_uptime', 'io_failed',
+             'calc_id_renewal_fail_seconds'}
+    selected = [node for node in tree.body
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in names]
+    selected += [node for node in tree.body if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id in
+                         ('SANLK_EIO', 'SANLK_AIO_TIMEOUT') for target in node.targets)]
+    namespace = {'logger': _LoggerStub()}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), module_path, 'exec'), namespace)
+    return types.SimpleNamespace(**namespace)
 
 
 sanlock = _load_sanlock()
@@ -61,14 +58,17 @@ sanlock = _load_sanlock()
 def _load_health_check(uptime):
     namespace = {
         'logger': _LoggerStub(),
-        'sanlock': sanlock,
+        'sanlock': types.SimpleNamespace(**vars(sanlock)),
         'linux': types.SimpleNamespace(
             ignore_error_retry=lambda *args, **kwargs: (lambda fn: fn)),
         'bash': types.SimpleNamespace(bash_errorout=lambda _cmd: 's %s\n' % LOCKSPACE),
     }
     path = os.path.join(ROOT, 'kvmagent', 'kvmagent', 'plugins', 'ha_plugin.py')
     lines = open(path, encoding='utf-8').read().splitlines(True)
-    names = ('inc_vg_failure_cnt', 'reset_vg_failure_cnt', '_do_health_check_vg', '_do_health_check')
+    names = ('inc_vg_failure_cnt', 'reset_vg_failure_cnt', '_do_health_check_vg',
+             '_do_sanlock_heartbeat_check', '_do_health_check_vg_by_sanlock',
+             '_do_health_check_vg_by_zsblkagent', '_do_zsblkagent_heartbeat_check',
+             '_do_health_check', 'fencer_backend_ready')
     selected = []
     indent = 4
     for index, line in enumerate(lines):
@@ -82,6 +82,9 @@ def _load_health_check(uptime):
                 break
             end += 1
         selected.extend(ast.parse(textwrap.dedent(''.join(lines[index:end]))).body)
+    source_tree = ast.parse(''.join(lines))
+    selected += [node for node in source_tree.body
+                 if isinstance(node, ast.ClassDef) and node.name == 'HealthCheckResult']
     module = ast.Module(body=selected, type_ignores=[])
     exec(compile(module, path, 'exec'), namespace)
 
@@ -93,9 +96,58 @@ def _load_health_check(uptime):
     for name in names:
         setattr(Checker, name, namespace[name])
 
+    Checker.ZSBLKAGENT_HEARTBEAT_STATUS_PATH = 'http://127.0.0.1:7276/zsblk-agent/vg/heartbeat/status'
+    namespace['shell'] = types.SimpleNamespace()
+    namespace['jsonobject'] = types.SimpleNamespace(loads=lambda text: json.loads(
+        text, object_hook=lambda fields: types.SimpleNamespace(**fields)))
+    namespace['linux'].get_current_timestamp = lambda: 1000
     clock = {'now': uptime}
-    sanlock.read_monotonic_uptime = lambda: clock['now']
+    namespace['sanlock'].read_monotonic_uptime = lambda: clock['now']
     return Checker(), clock
+
+
+def test_known_backend_readiness_does_not_probe_unresponsive_agent():
+    checker, _clock = _load_health_check(0)
+    checker._do_health_check_vg_by_sanlock = lambda vgs: {VG: _result()}
+    def unexpected(vgs):
+        raise AssertionError('known sanlock backend must not wait for HTTP')
+    checker._do_health_check_vg_by_zsblkagent = unexpected
+    assert checker.fencer_backend_ready(VG) is True
+
+
+def test_unresponsive_local_http_probe_is_bounded_and_keeps_other_vg_failure():
+    checker, _clock = _load_health_check(0)
+    checker.health_check_interval = 0.2
+    checker.storage_timeout = 5
+    checker.max_failure = 6
+    calls = []
+    curl = shutil.which('curl.exe') or shutil.which('curl')
+    assert curl, 'curl is required to exercise the actual local transport deadline'
+    def call(command):
+        args = shlex.split(command)
+        calls.append(args)
+        return subprocess.check_output([curl] + args[1:], stderr=subprocess.PIPE)
+    checker._do_health_check_vg_by_zsblkagent.__globals__['shell'].call = call
+    # The original helper has a 120-second timeout; reject it without hanging
+    # the RED run for minutes. The GREEN path below exercises real curl.
+    def legacy_get(*args, **kwargs):
+        raise AssertionError('legacy HTTP helper has timeout=120 and Retry(15)')
+    checker._do_health_check_vg_by_zsblkagent.__globals__['http'] = types.SimpleNamespace(json_dump_get=legacy_get)
+    # Complete the TCP handshake but never return HTTP headers or data.
+    with socket.socket() as listener:
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        checker.ZSBLKAGENT_HEARTBEAT_STATUS_PATH = 'http://127.0.0.1:%d/status' % listener.getsockname()[1]
+        checker.all_vgs['failed-vg'] = object()
+        failure = _result(failed=True)
+        checker._do_health_check_vg_by_sanlock = lambda vgs: {VG: _result(no_way=True), 'failed-vg': failure}
+        start = time.monotonic()
+        results = checker._do_health_check(5, 6)
+        assert time.monotonic() - start < 1.5
+    assert results[VG].no_way is True
+    assert results['failed-vg'] is failure
+    assert len(calls) == 1
+    assert calls[0][calls[0].index('--retry') + 1] == '0'
 
 
 class Record(object):
@@ -180,6 +232,27 @@ def test_aged_io_error_kills_without_accumulating():
     assert VG in victims
 
 
+@pytest.mark.parametrize('io_timeout,age,failed', [
+    (5, 34, False), (5, 35, False), (5, 36, True),
+    (20, 139, False), (20, 140, False), (20, 141, True),
+])
+@pytest.mark.parametrize('result', [-5, -202])
+def test_io_failure_fences_before_shared_lease_expiry(io_timeout, age, failed, result):
+    checker, _clock = _load_health_check(1000)
+    record = Record(result=result, success=1000 - age, io_timeout=io_timeout)
+    sanlock_result = checker._do_sanlock_heartbeat_check(VG, record, [LOCKSPACE])
+    checker._do_health_check_vg_by_sanlock = lambda _vgs: {VG: sanlock_result}
+
+    def unexpected_fallback(_vgs):
+        raise AssertionError('known sanlock I/O result must not use a healthy fallback')
+
+    checker._do_health_check_vg_by_zsblkagent = unexpected_fallback
+    combined = checker._do_health_check(5, 3)[VG]
+
+    assert combined.no_way is False
+    assert combined.failed is failed
+
+
 def test_space_dead_kills_before_renewal_threshold():
     checker, _clock = _load_health_check(LAST_SUCCESS + 120)
     victims = _run(checker, Record(result=-202, space_dead=1))
@@ -241,21 +314,12 @@ def test_adding_lockspace_resets_even_if_space_dead():
     assert VG not in checker.vg_failures
 
 
-def test_missing_lockspace_counts_until_max_failure():
+def test_missing_lockspace_is_unknown_instead_of_counting_to_kill():
     checker, _clock = _load_health_check(0)
-
-    class Parser(object):
-        def get_lockspace_record(self, _needle):
-            return None
-
-    sanlock.SanlockClientStatusParser = Parser
-    for expected in range(1, 6):
-        assert checker._do_health_check(5, 6) == {}
-        assert checker.vg_failures[VG] == expected
-
-    victims = checker._do_health_check(5, 6)
-    assert VG in victims
-    assert checker.vg_failures[VG] == 6
+    result = checker._do_sanlock_heartbeat_check(VG, None, [LOCKSPACE])
+    assert result.no_way is True
+    assert result.failed is None
+    assert VG not in checker.vg_failures
 
 
 def _run(checker, record):
@@ -264,4 +328,59 @@ def _run(checker, record):
             return record
 
     sanlock.SanlockClientStatusParser = Parser
-    return checker._do_health_check(5, 6)
+    result = checker._do_sanlock_heartbeat_check(VG, record, [LOCKSPACE])
+    return {VG: result.error} if result.failed else {}
+
+
+def _result(no_way=False, failed=False):
+    return types.SimpleNamespace(no_way=no_way, failed=failed)
+
+
+def test_unknown_sanlock_uses_independent_heartbeat():
+    checker, _clock = _load_health_check(0)
+    fallback = _result(failed=False)
+    checker._do_health_check_vg_by_sanlock = lambda vgs: {VG: _result(no_way=True)}
+    checker._do_health_check_vg_by_zsblkagent = lambda vgs: {VG: fallback}
+    assert checker._do_health_check(5, 6)[VG] is fallback
+
+
+def test_known_sanlock_failure_is_not_overridden_by_healthy_fallback():
+    checker, _clock = _load_health_check(0)
+    failure = _result(failed=True)
+    checker._do_health_check_vg_by_sanlock = lambda vgs: {VG: failure}
+    def unexpected(vgs):
+        raise AssertionError('known storage failure must not use fallback')
+    checker._do_health_check_vg_by_zsblkagent = unexpected
+    assert checker._do_health_check(5, 6)[VG] is failure
+
+
+def test_two_unknown_channels_remain_unknown():
+    checker, _clock = _load_health_check(0)
+    checker._do_health_check_vg_by_sanlock = lambda vgs: {VG: _result(no_way=True)}
+    checker._do_health_check_vg_by_zsblkagent = lambda vgs: {VG: _result(no_way=True)}
+    assert checker._do_health_check(5, 6)[VG].no_way is True
+
+
+def test_backend_ready_requires_at_least_one_known_channel():
+    checker, _clock = _load_health_check(0)
+    for sanlock_unknown, agent_unknown, expected in ((True, True, False),
+            (True, False, True), (False, True, True), (False, False, True)):
+        checker._do_health_check_vg_by_sanlock = lambda vgs: {VG: _result(no_way=sanlock_unknown)}
+        checker._do_health_check_vg_by_zsblkagent = lambda vgs: {VG: _result(no_way=agent_unknown)}
+        assert checker.fencer_backend_ready(VG) is expected
+
+
+def test_agent_heartbeat_distinguishes_stale_success_and_timeout():
+    checker, _clock = _load_health_check(0)
+    checker.max_failure = 6
+    checker.health_check_interval = 5
+    checker.storage_timeout = 5
+    assert checker._do_zsblkagent_heartbeat_check(VG, {}).no_way is True
+    stale = types.SimpleNamespace(lastCheck=1, lastSuccess=1, code=0, error='')
+    assert checker._do_zsblkagent_heartbeat_check(VG, {VG: stale}).no_way is True
+    success = types.SimpleNamespace(lastCheck=1000, lastSuccess=1000, code=0, error='')
+    assert checker._do_zsblkagent_heartbeat_check(VG, {VG: success}).failed is False
+    timeout = types.SimpleNamespace(lastCheck=1000, lastSuccess=900, code=-2, error='timeout')
+    result = checker._do_zsblkagent_heartbeat_check(VG, {VG: timeout})
+    assert result.failed is True
+    assert result.io_timeout is True
