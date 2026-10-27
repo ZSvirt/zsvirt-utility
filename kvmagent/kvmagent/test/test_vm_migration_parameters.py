@@ -37,6 +37,7 @@ class TaskDaemon(object):
         pass
 
     def __enter__(self):
+        TaskDaemon.current = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -63,6 +64,7 @@ def load_migrate():
         VIR_MIGRATE_PARAM_PERSIST_XML='persistent_xml',
         VIR_MIGRATE_PARAM_BANDWIDTH='bandwidth', libvirtError=MigrationError)
     vm_class = type('Vm', (object,), {'VM_STATE_SHUTDOWN': 'Shutdown'})
+    qmp = mock.Mock()
     namespace = {
         'Vm': vm_class, 'libvirt': libvirt, 'deque': deque,
         'linux': mock.Mock(get_host_name=lambda: 'migration-source',
@@ -71,10 +73,11 @@ def load_migrate():
         'plugin': mock.Mock(TaskDaemon=TaskDaemon), 'logger': mock.Mock(),
         'get_task_stage': lambda cmd: None, 'get_timeout': lambda cmd: 30,
         'check_mirror_jobs': mock.Mock(), 'LIBVIRT_MAJOR_VERSION': 3,
+        'qmp': qmp,
     }
     exec(compile(textwrap.dedent(method), source_path, 'exec'), namespace)
     vm_class.migrate = namespace['migrate']
-    return vm_class, libvirt
+    return vm_class, libvirt, qmp
 
 
 class Command(object):
@@ -84,11 +87,12 @@ class Command(object):
 
 class TestVmMigrationParameters(unittest.TestCase):
     def setUp(self):
-        vm_class, self.libvirt = load_migrate()
+        vm_class, self.libvirt, self.qmp = load_migrate()
         self.vm = vm_class()
         self.vm.uuid = 'migration-test'
         self.vm.state = 'Running'
         self.vm.domain = mock.Mock()
+        self.vm.domain.jobStats.return_value = {}
         self.vm.domain_xmlobject = mock.Mock()
         self.vm.domain_xmlobject.devices.get_child_node_as_list.return_value = []
         self.vm._build_domain_new_xml = mock.Mock(return_value=(['vda'], DEST_XML))
@@ -144,6 +148,52 @@ class TestVmMigrationParameters(unittest.TestCase):
         params, _ = self.migrate_storage()
         self.assertNotIn('bandwidth', params)
 
+    def sample_three_disk_migration(self, ready_stages, bandwidth=12):
+        disks = ['vda', 'vdb', 'vdc']
+        self.cmd.bandwidth = bandwidth
+        self.vm._build_domain_new_xml.return_value = (disks, DEST_XML)
+
+        def migrate(*args):
+            for ready in ready_stages:
+                self.vm.domain.blockJobInfo.side_effect = lambda disk: {
+                    'end': 100, 'cur': 100 if disk in ready else 20}
+                self.qmp.query_block_jobs_by_device.return_value = {
+                    disk: {'status': 'ready' if disk in ready else 'running'}
+                    for disk in disks}
+                TaskDaemon.current._get_percent()
+
+        self.vm.domain.migrateToURI3.side_effect = migrate
+        return self.migrate_storage()[0]
+
+    def test_three_disks_start_with_a_share_of_total_bandwidth(self):
+        params = self.sample_three_disk_migration([[]])
+        self.assertEqual(4, params['bandwidth'])
+        self.qmp.block_job_set_speed.assert_not_called()
+        self.qmp.migrate_set_speed.assert_not_called()
+
+    def test_ready_disks_release_bandwidth_to_remaining_disks_then_memory(self):
+        self.sample_three_disk_migration([
+            [], ['vda'], ['vda'], ['vda', 'vdb'], ['vda', 'vdb', 'vdc']])
+        self.qmp.block_job_set_speed.assert_has_calls([
+            mock.call(self.vm.uuid, 'vdb', 6 * 1024 * 1024),
+            mock.call(self.vm.uuid, 'vdc', 6 * 1024 * 1024),
+            mock.call(self.vm.uuid, 'vdc', 12 * 1024 * 1024),
+        ], any_order=True)
+        self.assertEqual(3, self.qmp.block_job_set_speed.call_count)
+        self.qmp.migrate_set_speed.assert_called_once_with(
+            self.vm.uuid, 12 * 1024 * 1024)
+        self.assertEqual(3, self.qmp.query_block_jobs_by_device.call_count,
+                         'unchanged ready disks must not trigger another reset')
+
+    def test_non_divisible_total_bandwidth_rounds_up_each_share(self):
+        params = self.sample_three_disk_migration([['vda']], bandwidth=10)
+        self.assertEqual(4, params['bandwidth'])
+        self.qmp.block_job_set_speed.assert_has_calls([
+            mock.call(self.vm.uuid, 'vdb', 5 * 1024 * 1024),
+            mock.call(self.vm.uuid, 'vdc', 5 * 1024 * 1024),
+        ], any_order=True)
+        self.assertEqual(2, self.qmp.block_job_set_speed.call_count)
+
     def test_shared_storage_migration_keeps_uri2_and_persistence_flags(self):
         for disks in (None, Command()):
             self.vm.domain.reset_mock()
@@ -155,6 +205,7 @@ class TestVmMigrationParameters(unittest.TestCase):
             self.vm.domain.migrateToURI2.assert_called_once()
             args = self.vm.domain.migrateToURI2.call_args[0]
             self.assertEqual('qemu+tcp://192.0.2.3/system', args[0])
+            self.assertEqual(32, args[-1])
             self.assertTrue(args[3] & self.libvirt.VIR_MIGRATE_PERSIST_DEST)
 
     def test_libvirt_error_converts_to_kvm_error_without_retry(self):
