@@ -1,6 +1,9 @@
 import base64
 import json
 import time
+import threading
+import uuid
+import subprocess
 
 import libvirt
 import libvirt_qemu
@@ -76,6 +79,10 @@ def is_qga_connected(vm_dom):
 
 # windows zs-tools command wait 120s
 zs_tools_wait_retry = 120
+# Preserve unconfirmed net executions across VmQga instances. This protects
+# older guests too; the Guest mutex additionally survives Agent restarts.
+_zs_tools_net_pending = {}
+_zs_tools_net_lock = threading.RLock()
 
 
 class QgaException(Exception):
@@ -187,8 +194,10 @@ class VmQga(object):
             raise Exception('guest-exec-status exception')
         return ret
 
-    def guest_exec(self, args):
-        return self.call_qga_command("guest-exec", args=args)
+    def guest_exec(self, args, timeout=None):
+        if timeout is None:
+            return self.call_qga_command("guest-exec", args=args)
+        return self.call_qga_command("guest-exec", args=args, timeout=timeout)
 
     def guest_exec_program(self, path, args=None, output=True, wait=qga_exec_wait_interval, retry=qga_exec_wait_retry):
         if args is None:
@@ -319,12 +328,403 @@ class VmQga(object):
 
         return exit_code, ret_data
 
+    def _net_task_script(self, task, action, config=None):
+        # ZSN2 binds every launched tree to a unique, non-inheritable Job handle.
+        # All state transitions and cancellation use the same exclusive lock.
+        script = r"""
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$taskId = '%s'
+$recordPath = 'C:\ProgramData\ZStack\zs-tools-net\' + $taskId + '.state'
+$lockPath = $recordPath + '.lock'
+function Lock-Record {
+    return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate,
+        [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+}
+function Read-Record {
+    $parts = [IO.File]::ReadAllText($recordPath).Trim().Split('|')
+    if ($parts.Length -ne 5 -or $parts[0] -ne 'ZSN2' -or
+        $parts[1] -ne $taskId -or
+        @('reserved','starting','running','finished','failed','cancelled') -notcontains $parts[2] -or
+        $parts[3] -notmatch '^\d+$' -or $parts[4] -notmatch '^\d+$') {
+        throw 'Invalid net task receipt'
+    }
+    return $parts
+}
+function Write-Record($state, $wrapperPid, $childPid) {
+    $text = 'ZSN2|{0}|{1}|{2}|{3}' -f $taskId,$state,$wrapperPid,$childPid
+    [IO.File]::WriteAllText($recordPath, $text, [Text.Encoding]::ASCII)
+}
+""" % task['task_id']
+        script += r"""
+$jobName = 'Global\ZStackNetTask_' + $taskId
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class ZStackNetJob {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool SetInformationJobObject(IntPtr job, int kind, IntPtr info, uint length);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool QueryInformationJobObject(IntPtr job, int kind, IntPtr info, uint length, IntPtr result);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError=true)]
+    static extern bool TerminateJobObject(IntPtr job, uint code);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+    public static IntPtr Enter(string name) {
+        IntPtr job = CreateJobObject(IntPtr.Zero, name);
+        int error = Marshal.GetLastWin32Error();
+        if (job == IntPtr.Zero) throw new Win32Exception(error);
+        if (error == 183) { CloseHandle(job); throw new InvalidOperationException("Duplicate job"); }
+        int size = IntPtr.Size == 8 ? 144 : 112;
+        IntPtr info = Marshal.AllocHGlobal(size);
+        try {
+            for (int i=0; i<size; i++) Marshal.WriteByte(info, i, 0);
+            Marshal.WriteInt32(info, 16, 0x2000); // KILL_ON_JOB_CLOSE; no breakaway
+            if (!SetInformationJobObject(job, 9, info, (uint)size) ||
+                !AssignProcessToJobObject(job, GetCurrentProcess()))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return job;
+        } catch { CloseHandle(job); throw; }
+        finally { Marshal.FreeHGlobal(info); }
+    }
+    public static uint Active(IntPtr job) {
+        IntPtr info = Marshal.AllocHGlobal(48);
+        try {
+            if (!QueryInformationJobObject(job, 1, info, 48, IntPtr.Zero))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return (uint)Marshal.ReadInt32(info, 40);
+        } finally { Marshal.FreeHGlobal(info); }
+    }
+    public static bool Absent(string name) {
+        // QUERY only: the observer cannot cancel or rebind a process by PID.
+        IntPtr job = OpenJobObject(4, false, name);
+        if (job == IntPtr.Zero) {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 2) return true;
+            throw new Win32Exception(error);
+        }
+        try { Active(job); return false; }
+        finally { CloseHandle(job); }
+    }
+    public static void Stop(IntPtr job) {
+        // The wrapper is also a member. Successful termination does not return.
+        if (!TerminateJobObject(job, 1))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+    }
+}
+'@
+"""
+
+        if action == 'launch':
+            arguments = subprocess.list2cmdline(['net', '--config', config])
+            script += r"""
+$locked = $null
+$job = [IntPtr]::Zero
+try {
+    $locked = Lock-Record
+    $record = Read-Record
+    if ($record[2] -ne 'reserved') { throw 'Net task is sealed or already claimed' }
+    # Join BEFORE creating the child. Even a crash in Start-Process cannot
+    # leave an unbound child; normal children automatically inherit this Job.
+    $job = [ZStackNetJob]::Enter($jobName)
+    [Environment]::SetEnvironmentVariable('ZS_TOOLS_NET_JOB', $taskId, 'Process')
+    Write-Record 'starting' $PID 0
+    $stdoutPath = $recordPath + '.out'
+    $stderrPath = $recordPath + '.err'
+    $process = Start-Process -FilePath '%s' -ArgumentList '%s' -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $processHandle = $process.Handle
+    Write-Record 'running' $PID $process.Id
+    $locked.Dispose(); $locked = $null
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    while (!$process.WaitForExit(100)) {
+        if ([IO.File]::Exists($recordPath + '.cancel') -or $watch.Elapsed.TotalSeconds -ge %d) {
+            [ZStackNetJob]::Stop($job)
+        }
+    }
+    # Keep the original root handle until the complete Job is checked.
+    # A root exit is not proof that its children stopped.
+    $drain = [Diagnostics.Stopwatch]::StartNew()
+    while ([ZStackNetJob]::Active($job) -gt 1 -and $drain.Elapsed.TotalSeconds -lt 3) { Start-Sleep -Milliseconds 50 }
+    if ([ZStackNetJob]::Active($job) -ne 1) { [ZStackNetJob]::Stop($job) }
+    $code = $process.ExitCode
+    $locked = Lock-Record
+    [IO.File]::WriteAllText($recordPath + '.result', [string]$code, [Text.Encoding]::ASCII)
+    Write-Record 'finished' $PID $process.Id
+    $locked.Dispose(); $locked = $null
+    [Console]::Out.Write([IO.File]::ReadAllText($stdoutPath))
+    [Console]::Error.Write([IO.File]::ReadAllText($stderrPath))
+    $process.Dispose()
+    # Do not explicitly close our Job while alive: that would kill this wrapper
+    # before it can return the exit code. OS exit closes its sole owning handle.
+    exit $code
+} catch {
+    [Console]::Error.WriteLine('Net task launcher failed')
+    if ($job -ne [IntPtr]::Zero) { [ZStackNetJob]::Stop($job) }
+    if ($locked -ne $null -and $record -ne $null -and $record[2] -eq 'reserved') { Write-Record 'failed' $PID 0 }
+    exit 1
+} finally {
+    if ($locked -ne $null) { $locked.Dispose() }
+}
+""" % (self.ZS_TOOLS_PATN_WIN.replace("'", "''"), arguments.replace("'", "''"),
+       max(1, int(task.get('budget', 105))))
+        else:
+            if action not in ('prepare', 'inspect', 'cancel', 'seal', 'collect'):
+                raise ValueError('invalid net task action')
+            script += r"""
+$action = '%s'
+if ($action -eq 'prepare') { [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($recordPath)) | Out-Null }
+$locked = $null
+try {
+    $locked = Lock-Record
+    if ($action -eq 'prepare') {
+        if ([IO.File]::Exists($recordPath)) { throw 'Duplicate net task ID' }
+        Write-Record 'reserved' 0 0
+    }
+    $record = Read-Record
+    if ($action -eq 'cancel' -or $action -eq 'seal') {
+        if ($record[2] -eq 'reserved') {
+            Write-Record 'cancelled' $record[3] $record[4]
+        } else {
+            # Signal a task, never a PID. Only the wrapper owns a terminating
+            # handle. Missing Job means its complete bound tree has ended.
+            [IO.File]::WriteAllText($recordPath + '.cancel', 'cancel')
+            if ([ZStackNetJob]::Absent($jobName)) {
+                Write-Record 'cancelled' $record[3] $record[4]
+            } else { throw 'Net task Job is still active' }
+        }
+        $record = Read-Record
+    }
+    if ($action -eq 'inspect' -and @('starting','running') -contains $record[2] -and
+        [ZStackNetJob]::Absent($jobName)) {
+        Write-Record 'failed' $record[3] $record[4]
+        $record = Read-Record
+    }
+    $reply = ($record -join '|') + '|%s'
+    if ($action -eq 'collect') {
+        if ($record[2] -ne 'finished' -or ![ZStackNetJob]::Absent($jobName)) {
+            throw 'Net task result is not ready'
+        }
+        $code = [IO.File]::ReadAllText($recordPath + '.result').Trim()
+        if ($code -notmatch '^-?\d+$') { throw 'Invalid net task result' }
+        $stdout = [Convert]::ToBase64String([IO.File]::ReadAllBytes($recordPath + '.out'))
+        $stderr = [Convert]::ToBase64String([IO.File]::ReadAllBytes($recordPath + '.err'))
+        $reply = $reply + '|' + $code + '|' + $stdout + '|' + $stderr
+    }
+    [Console]::Out.WriteLine($reply)
+} catch {
+    [Console]::Out.WriteLine('ZSN2|%s|error|0|0|%s')
+    exit 1
+} finally { if ($locked -ne $null) { $locked.Dispose() } }
+""" % (action, task.get('control_id', 'source-test'), task['task_id'], task.get('control_id', 'source-test'))
+        return script
+
+    def _net_task_launch_args(self, task, config):
+        encoded = base64.b64encode(self._net_task_script(task, 'launch', config).encode('utf-16le'))
+        if not isinstance(encoded, str):
+            encoded = encoded.decode('ascii')
+        return {'path': r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+                'arg': ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                'capture-output': True}
+
+    @staticmethod
+    def _net_task_timeout(deadline, limit):
+        # libvirt takes whole seconds. Never round a fractional remainder up
+        # or pass zero (which has special timeout semantics).
+        remaining = int(deadline - time.time())
+        if remaining < 1:
+            raise Exception('net task deadline exhausted')
+        return min(limit, remaining)
+
+    def _net_task_control(self, task, action, deadline=None):
+        # Prepare/cancel have their own bounded control budget. Execution
+        # inspect/collect inherit the caller's absolute deadline unchanged.
+        if deadline is None:
+            deadline = time.time() + 10
+        request = dict(task, control_id=uuid.uuid4().hex)
+        script = self._net_task_script(request, action)
+        encoded = base64.b64encode(script.encode('utf-16le'))
+        if not isinstance(encoded, str):
+            encoded = encoded.decode('ascii')
+        result = self.guest_exec({
+            'path': r'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+            'arg': ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+            'capture-output': True}, timeout=self._net_task_timeout(deadline, 3))
+        if not result or 'pid' not in result:
+            raise Exception('net task control did not return a PID')
+        while time.time() < deadline:
+            try:
+                status = self.guest_exec_status_with_timeout(
+                    result['pid'], self._net_task_timeout(deadline, 2))
+            except Exception:
+                time.sleep(min(0.2, max(0, deadline - time.time())))
+                continue
+            if time.time() >= deadline:
+                break
+            if status.get('exited'):
+                data = status.get('out-data', b'')
+                if not isinstance(data, str):
+                    data = data.decode('ascii', 'replace')
+                fields = data.strip().split('|')
+                # QGA may retain an exited record after releasing its process
+                # handle. A reused PID can return another invocation's result.
+                # Consume stale replies, but accept only this random nonce.
+                if (len(fields) in (6, 9) and
+                        fields[:2] == ['ZSN2', task['task_id']] and
+                        fields[5] == request['control_id']):
+                    if fields[2] == 'error' or status.get('exitcode') != 0:
+                        raise Exception('net task control failed or is not ready')
+                    if (fields[2] not in ('reserved', 'starting', 'running', 'finished', 'failed', 'cancelled') or
+                            not fields[3].isdigit() or not fields[4].isdigit()):
+                        raise Exception('invalid net task receipt response')
+                    record = {'phase': fields[2], 'wrapper_pid': int(fields[3]), 'pid': int(fields[4])}
+                    if action == 'collect':
+                        if len(fields) != 9 or fields[2] != 'finished' or not fields[6].lstrip('-').isdigit():
+                            raise Exception('invalid net task result response')
+                        record.update(exitcode=int(fields[6]),
+                                      **{'out-data': base64.b64decode(fields[7]),
+                                         'err-data': base64.b64decode(fields[8])})
+                    elif len(fields) != 6:
+                        raise Exception('invalid net task control response')
+                    return record
+            time.sleep(min(0.2, max(0, deadline - time.time())))
+        raise Exception('net task control response timed out')
+
+    def _recover_net_task(self, task):
+        if not isinstance(task, dict):
+            raise Exception('legacy net reservation has no safe cancellation identity')
+        # Cancellation is task-bound. A lost reply remains blocked until the
+        # Guest independently confirms the named Job has been destroyed.
+        record = self._net_task_control(task, 'cancel')
+        if record['phase'] != 'cancelled':
+            raise Exception('previous net task is still active or unconfirmed')
+
+    def _guest_exec_zs_tools_net(self, config, config_obj, output, wait, retry):
+        started = time.time()
+        task = None
+        execution_started = None
+        with _zs_tools_net_lock:
+            try:
+                if self.vm_uuid in _zs_tools_net_pending:
+                    try:
+                        self._recover_net_task(_zs_tools_net_pending[self.vm_uuid])
+                        _zs_tools_net_pending.pop(self.vm_uuid)
+                    except Exception as error:
+                        raise Exception('new execution blocked: {}'.format(error))
+                task = {'task_id': uuid.uuid4().hex, 'phase': 'preparing', 'pid': None,
+                        'budget': max(1, wait * retry - 5)}
+                _zs_tools_net_pending[self.vm_uuid] = task
+                self._net_task_control(task, 'prepare')
+                # Everything after this point may have been accepted by QGA,
+                # even if the transport never delivers the wrapper PID.
+                task['phase'] = 'unknown'
+                execution_started = time.time()
+                deadline = execution_started + wait * retry
+                result = self.guest_exec(self._net_task_launch_args(task, config),
+                                         timeout=self._net_task_timeout(deadline, 3))
+                if not result or 'pid' not in result:
+                    raise Exception('net launcher submission result is unknown')
+                task['wrapper_pid'] = result['pid']
+                task['phase'] = 'submitted'
+                while time.time() < deadline:
+                    time.sleep(min(wait, max(0, deadline-time.time())))
+                    remaining = deadline-time.time()
+                    if remaining < 1:
+                        break
+                    try:
+                        record = self._net_task_control(task, 'inspect', deadline=deadline)
+                    except Exception:
+                        # A launch transition can briefly hold the receipt
+                        # lock. Retain the reservation and retry within budget.
+                        continue
+                    task['pid'] = record['pid'] or None
+                    remaining = deadline-time.time()
+                    if remaining < 1:
+                        break
+                    if record['phase'] == 'finished':
+                        try:
+                            completed = self._net_task_control(task, 'collect', deadline=deadline)
+                        except Exception:
+                            # The wrapper can still be flushing its own output.
+                            # Only collect confirms Job absence and binds output
+                            # to the task; a numeric QGA exit record cannot do so.
+                            continue
+                        _zs_tools_net_pending.pop(self.vm_uuid)
+                        data = []
+                        if output:
+                            formatted = self._get_zs_tools_output(completed)
+                            if formatted:
+                                data.append(formatted)
+                        # Best-effort QGA record reclamation only. A stale or
+                        # lost PID status never supplies the task result or
+                        # proves tree termination.
+                        try:
+                            self.guest_exec_status_with_timeout(
+                                task['wrapper_pid'], self._net_task_timeout(deadline, 1))
+                        except Exception:
+                            pass
+                        code = completed['exitcode']
+                        if code != 0 and not data:
+                            data.append('net task {} pid={} exited with code={}'.format(
+                                task['task_id'], task.get('pid'), code))
+                        if code != 0:
+                            tail = self._try_read_zs_tools_log_tail(deadline=deadline)
+                            if tail:
+                                data.append('zs-tools.log tail:\n' + tail)
+                        return code, '\n'.join(data)
+                    if record['phase'] in ('failed', 'cancelled'):
+                        self._recover_net_task(task)
+                        _zs_tools_net_pending.pop(self.vm_uuid)
+                        detail = 'net task {} pid={} ended without a confirmed result'.format(
+                            task['task_id'], task.get('pid'))
+                        tail = self._try_read_zs_tools_log_tail(deadline=deadline)
+                        if tail:
+                            detail += '\nzs-tools.log tail:\n' + tail
+                        return 1, detail
+                raise Exception('net task {} exceeded deadline {}s'.format(task['task_id'], wait*retry))
+            except Exception as error:
+                cleanup_started = time.time()
+                execution_elapsed = cleanup_started - execution_started if execution_started is not None else 0
+                cleanup = ''
+                if task is not None:
+                    if task['phase'] == 'preparing':
+                        # No net launch has been sent; a lost prepare response
+                        # can leave an unused receipt but cannot start a task.
+                        _zs_tools_net_pending.pop(self.vm_uuid, None)
+                    elif task.get('pid') is not None:
+                        try:
+                            self._recover_net_task(task)
+                            _zs_tools_net_pending.pop(self.vm_uuid, None)
+                            cleanup = '; guest process tree terminated'
+                        except Exception:
+                            cleanup = '; cleanup unconfirmed; subsequent net execution blocked'
+                    else:
+                        cleanup = '; submission result unknown; subsequent net execution blocked'
+                tail = self._try_read_zs_tools_log_tail(deadline=cleanup_started + 10)
+                if tail:
+                    error = '{}\nzs-tools.log tail:\n{}'.format(error, tail)
+                return 1, 'qga exec zs-tools operate net failed for vm {}, task={}, pid={}, elapsed={:.3f}s, execution_elapsed={:.3f}s, cleanup_elapsed={:.3f}s, config: {}, error: {}{}'.format(
+                    self.vm_uuid, task['task_id'] if task else None,
+                    task.get('pid') if task else None, time.time()-started,
+                    execution_elapsed, time.time()-cleanup_started, log.mask_sensitive_field(config_obj, config), error, cleanup)
+
     def guest_exec_zs_tools(self, operate, config, config_obj=None, output=True, wait=qga_exec_wait_interval, retry=zs_tools_wait_retry):
+        if operate == 'net':
+            return self._guest_exec_zs_tools_net(config, config_obj, output, wait, retry)
         def get_return_data(result):
             return self._get_zs_tools_output(result)
 
         ret = None
         try:
+            execution_started = time.time()
             ret = self.guest_exec(
                 {"path": self.ZS_TOOLS_PATN_WIN, "arg": [operate, "--config", config], "capture-output": output})
 
@@ -335,9 +735,13 @@ class VmQga(object):
                     json.dumps(ret, default=repr)))
 
             ret = None
-            for i in range(retry):
-                time.sleep(wait)
-                ret = self.guest_exec_status_with_timeout(pid, 15)
+            deadline = execution_started + wait * retry
+            while time.time() < deadline:
+                time.sleep(min(wait, max(0, deadline - time.time())))
+                remaining = deadline - time.time()
+                if remaining < 1:
+                    break
+                ret = self.guest_exec_status_with_timeout(pid, min(15, int(remaining)))
                 if ret['exited']:
                     break
 
@@ -381,29 +785,38 @@ class VmQga(object):
                          for key, label in [('out-data', 'stdout'), ('err-data', 'stderr')]
                          if result.get(key) is not None)
 
-    def _try_read_zs_tools_log_tail(self, n_bytes=4096):
+    def _try_read_zs_tools_log_tail(self, n_bytes=4096, deadline=None):
         # Each attempt uses only bounded QGA file operations, never guest-exec.
+        def file_command(command, args):
+            timeout = 1
+            if deadline is not None:
+                # Reserve two seconds before non-close calls so an acquired
+                # handle can be closed even with whole-second QGA timeouts.
+                reserve = 0 if command == 'guest-file-close' else 2
+                timeout = self._net_task_timeout(deadline - reserve, 1)
+            return self.call_qga_command(command, args, timeout=timeout)
+
         paths = [r'C:\Program Files\GuestTools\zs-tools\log\zs-tools.log',
                  r'C:\Program Files\zstack\zs-tools\log\zs-tools.log']
         for path in paths:
             handle = None
             try:
-                handle = self.call_qga_command('guest-file-open',
-                                               {'path': path, 'mode': 'rb'}, timeout=1)
-                end = self.call_qga_command('guest-file-seek',
-                                           {'handle': handle, 'offset': 0, 'whence': 2}, timeout=1)
-                self.call_qga_command('guest-file-seek',
-                                      {'handle': handle, 'offset': max(0, end['position'] - n_bytes),
-                                       'whence': 0}, timeout=1)
-                data = self.call_qga_command('guest-file-read',
-                                             {'handle': handle, 'count': n_bytes}, timeout=1)
+                handle = file_command('guest-file-open',
+                                      {'path': path, 'mode': 'rb'})
+                end = file_command('guest-file-seek',
+                                   {'handle': handle, 'offset': 0, 'whence': 2})
+                file_command('guest-file-seek',
+                             {'handle': handle, 'offset': max(0, end['position'] - n_bytes),
+                              'whence': 0})
+                data = file_command('guest-file-read',
+                                    {'handle': handle, 'count': n_bytes})
                 return self._decode_zs_tools_data(data.get('buf-b64', b''))
             except Exception:
                 pass
             finally:
                 if handle is not None:
                     try:
-                        self.call_qga_command('guest-file-close', {'handle': handle}, timeout=1)
+                        file_command('guest-file-close', {'handle': handle})
                     except Exception:
                         pass
         return ''
