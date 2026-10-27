@@ -14,7 +14,6 @@ from . import external_plugin
 
 import functools
 import os.path
-import pprint
 import platform
 import re
 import subprocess
@@ -200,7 +199,7 @@ def replyerror(func):
             return func(*args, **kwargs)
         except Exception as e:
             content = traceback.format_exc()
-            err = '%s\n%s\nargs:%s' % (str(e), content, pprint.pformat([args, kwargs]))
+            err = '%s\n%s\nargs:%s' % (str(e), content, log.format_request_args(args, kwargs))
             rsp = AgentResponse()
             rsp.success = False
             rsp.error = str(e)

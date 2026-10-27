@@ -79,6 +79,9 @@ class SyncUriHandler(object):
 
         entity = {REQUEST_HEADER : req.headers}
         entity[REQUEST_BODY] = req.body if req.body else None
+        sensitive_fields = getattr(self.uri_obj.cmd, log.SENSITIVE_FIELD_NAME, None)
+        if sensitive_fields:
+            entity[log.SENSITIVE_FIELD_NAME] = list(sensitive_fields)
         return self.uri_obj.func(entity)
 
     @cherrypy.expose
