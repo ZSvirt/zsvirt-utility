@@ -46,31 +46,59 @@ def is_nic_info_skip(nic_info):
     return obj.get(NIC_INFO_SKIP_KEY) == NIC_INFO_SKIP_LOCK_BUSY and len(obj) == 1
 
 
+# A per-QGA-object negative cache; recheck old tools after 60 seconds.
+WINDOWS_ZWATCH_LEGACY_TTL = 60
+
+
+def _windows_zwatch_legacy_file(qga, path, contents):
+    if contents is not None:
+        data = contents.encode('utf-8')
+        count = qga.guest_file_write(path, data)
+        if count != len(data):
+            raise Exception('Incomplete Windows ZWatch file write')
+        return count, data if isinstance(data, str) else data.decode('utf-8')
+    try:
+        # Do not use guest_file_is_exist: it hides every open error as "missing".
+        return qga.guest_file_read(path, not_exist_exception=True)
+    except Exception as exc:
+        prefix = 'qga command return value format error:'
+        message = str(exc)
+        if not message.startswith(prefix):
+            raise
+        try:
+            error = json.loads(message[len(prefix):])['error']
+            description = error['desc'].strip()
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise exc
+        # QGA exposes localized Win32 text, not numeric GetLastError codes.
+        missing = ('No such file or directory',
+                   'The system cannot find the file specified.',
+                   'The system cannot find the path specified.',
+                   u'\u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002',
+                   u'\u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002')
+        if error.get('class') == 'GenericError' and description in [
+                u"failed to open file '%s': %s" % (path, reason) for reason in missing]:
+            return 0, None
+        raise
+
+
 def windows_zwatch_file(qga, path, contents=None):
-    # A guest process owns and closes the file even if its QGA reply is lost.
-    path = path.replace("'", "''")
-    if contents is None:
-        operation = "$data = [IO.File]::ReadAllBytes('%s')" % path
-    else:
-        encoded = base64.b64encode(contents.encode('utf-8')).decode('ascii')
-        operation = ("$data = [Convert]::FromBase64String('%s'); "
-                     "[IO.File]::WriteAllBytes('%s', $data)") % (encoded, path)
-    script = r"""
-$ErrorActionPreference = 'Stop'
-try {
-    %s
-    [Console]::Write(('{0}:' -f $data.Length) + [Convert]::ToBase64String($data))
-} catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
-    exit 2
-} catch {
-    [Console]::Error.WriteLine($_.Exception.Message)
-    exit 1
-}
-""" % operation
-    encoded_script = base64.b64encode(script.encode('utf-16le')).decode('ascii')
-    code, output = qga.guest_exec_program(
-        'powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive',
-                           '-EncodedCommand', encoded_script], retry=10)
+    now = time.time()
+    legacy_until = getattr(qga, '_zwatch_file_legacy_until', 0)
+    # A clock rollback must not extend a negative cache indefinitely.
+    if now < legacy_until <= now + WINDOWS_ZWATCH_LEGACY_TTL:
+        return _windows_zwatch_legacy_file(qga, path, contents)
+    qga._zwatch_file_legacy_until = 0
+    # The native helper owns and closes the file even if its QGA reply is lost.
+    args = ['zwatch-file', path]
+    if contents is not None:
+        args.append(base64.b64encode(contents.encode('utf-8')).decode('ascii'))
+    code, output = qga.guest_exec_program(VmQga.ZS_TOOLS_PATN_WIN, args, retry=10)
+    # Only an explicit unsupported-command response permits the legacy protocol.
+    unsupported = b'Error: unknown command "zwatch-file" for "zs-tools"'
+    if code == 1 and output and unsupported in output.splitlines():
+        qga._zwatch_file_legacy_until = now + WINDOWS_ZWATCH_LEGACY_TTL
+        return _windows_zwatch_legacy_file(qga, path, contents)
     if code == 2 and contents is None:
         return 0, None
     if code != 0:
