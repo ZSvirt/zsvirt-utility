@@ -1,4 +1,5 @@
 import os.path
+import base64
 import time
 import libvirt
 import json
@@ -43,6 +44,44 @@ def is_nic_info_skip(nic_info):
         return False
     # Only the dedicated skip marker; never treat a real empty map "{}" as skip.
     return obj.get(NIC_INFO_SKIP_KEY) == NIC_INFO_SKIP_LOCK_BUSY and len(obj) == 1
+
+
+def windows_zwatch_file(qga, path, contents=None):
+    # A guest process owns and closes the file even if its QGA reply is lost.
+    path = path.replace("'", "''")
+    if contents is None:
+        operation = "$data = [IO.File]::ReadAllBytes('%s')" % path
+    else:
+        encoded = base64.b64encode(contents.encode('utf-8')).decode('ascii')
+        operation = ("$data = [Convert]::FromBase64String('%s'); "
+                     "[IO.File]::WriteAllBytes('%s', $data)") % (encoded, path)
+    script = r"""
+$ErrorActionPreference = 'Stop'
+try {
+    %s
+    [Console]::Write(('{0}:' -f $data.Length) + [Convert]::ToBase64String($data))
+} catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] {
+    exit 2
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+""" % operation
+    encoded_script = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    code, output = qga.guest_exec_program(
+        'powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive',
+                           '-EncodedCommand', encoded_script], retry=10)
+    if code == 2 and contents is None:
+        return 0, None
+    if code != 0:
+        raise Exception('Windows ZWatch file operation failed: %s' % output)
+    # guest_exec_program returns bytes on both Python 2 and Python 3.
+    count, encoded = output.strip().split(b':', 1)
+    data = base64.b64decode(encoded)
+    if int(count) != len(data) or base64.b64encode(data) != encoded:
+        raise Exception('Incomplete Windows ZWatch file response')
+    # Preserve the byte-string body required by the Python 2 HTTP client.
+    return len(data), data if isinstance(data, str) else data.decode('utf-8')
 
 
 class AgentRsp(object):
@@ -205,7 +244,8 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
                 if uuid not in self.running_vm_list:
                     logger.debug('vm[%s] has been stop running' % uuid)
                     break
-                if qga.os and 'mswindows' in qga.os:
+                is_windows = qga.os and 'mswindows' in qga.os
+                if is_windows:
                     zwatch_vm_info_path = self.WIN_ZWATCH_VM_INFO_PATH
                     zwatch_vm_metric_path = self.WIN_ZWATCH_VM_METRIC_PATH
                     zwatch_restart_cmd = self.WIN_ZWATCH_RESTART_CMD
@@ -216,18 +256,24 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
                     # centos version 6.x need special cmd
                     if qga.os_version == '6':
                         zwatch_restart_cmd = self.ZWATCH_RESTART_CMD_EL6
-                dhcpStatus = not qga.guest_file_is_exist(zwatch_vm_info_path)
+                if is_windows:
+                    _, qgaZWatch = windows_zwatch_file(qga, zwatch_vm_info_path)
+                    dhcpStatus = qgaZWatch is None
+                else:
+                    dhcpStatus = not qga.guest_file_is_exist(zwatch_vm_info_path)
                 # skip when dhcp enable
                 if dhcpStatus:
                     with self.running_vm_lock:
                         self.running_vm_list.remove(uuid)
                     break
-                _, qgaZWatch = qga.guest_file_read(zwatch_vm_info_path)
+                if not is_windows:
+                    _, qgaZWatch = qga.guest_file_read(zwatch_vm_info_path)
                 logger.debug('vm[%s] start monitor with qga' % uuid)
                 # set vmUuid by qga at first
                 if qgaZWatch != uuid:
                     logger.debug('vm[%s] init zwatch qga vm.info first...' % uuid)
-                    ret = qga.guest_file_write(zwatch_vm_info_path, uuid)
+                    ret = (windows_zwatch_file(qga, zwatch_vm_info_path, uuid)[0] if is_windows
+                           else qga.guest_file_write(zwatch_vm_info_path, uuid))
                     if ret == 0:
                         logger.debug('config vm[%s], write qga zwatch qga vm.info failed' % uuid)
                         with self.running_vm_lock:
@@ -236,7 +282,8 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
                     # switch zwatch mode to qga
                     qga.guest_exec_cmd_no_exitcode(zwatch_restart_cmd)
                 # fetch zwatch metrics
-                _, vmMetrics = qga.guest_file_read(zwatch_vm_metric_path)
+                _, vmMetrics = (windows_zwatch_file(qga, zwatch_vm_metric_path) if is_windows
+                                else qga.guest_file_read(zwatch_vm_metric_path))
                 if vmMetrics:
                     push_metrics_to_gateway(self.PROMETHEUS_PUSHGATEWAY_URL, uuid, vmMetrics)
                 time.sleep(self.push_interval_time)
