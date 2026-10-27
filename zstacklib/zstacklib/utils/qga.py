@@ -679,9 +679,9 @@ class VmQga(object):
         try:
             handle = self.call_qga_command("guest-file-open", args={"path": path, "mode": 'r'})
         except Exception as e:
-            if 'No such file' in e.message and not not_exist_exception:
+            if not not_exist_exception and 'No such file' in str(e):
                 return 0, None
-            raise e
+            raise
 
         data_b64 = ''
         total_count = 0

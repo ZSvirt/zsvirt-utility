@@ -50,6 +50,38 @@ def is_nic_info_skip(nic_info):
 WINDOWS_ZWATCH_LEGACY_TTL = 60
 
 
+def _windows_zwatch_file_missing(exc, path, executing=False):
+    prefix = 'qga command return value format error:'
+    message = str(exc)
+    if not message.startswith(prefix):
+        return False
+    try:
+        error = json.loads(message[len(prefix):])['error']
+        description = error['desc'].strip()
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+    if error.get('class') != 'GenericError':
+        return False
+    # QGA exposes localized Win32 text, not numeric GetLastError codes.
+    missing = ('No such file or directory',
+               'The system cannot find the file specified.',
+               'The system cannot find the path specified.',
+               u'\u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002',
+               u'\u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002')
+    if executing:
+        wrapper = "Guest agent command failed, error was '"
+        if description.startswith(wrapper) and description.endswith("'"):
+            description = description[len(wrapper):-1]
+        prefixes = [u'Failed to execute child process (',
+                    u'Failed to execute child process "' + path + u'" (',
+                    u"Failed to execute child process '" + path + u"' ("]
+        suffix = ')'
+    else:
+        prefixes = [u"failed to open file '" + path + u"': "]
+        suffix = ''
+    return description in [prefix + reason + suffix for prefix in prefixes for reason in missing]
+
+
 def _windows_zwatch_legacy_file(qga, path, contents):
     if contents is not None:
         data = contents.encode('utf-8')
@@ -61,23 +93,7 @@ def _windows_zwatch_legacy_file(qga, path, contents):
         # Do not use guest_file_is_exist: it hides every open error as "missing".
         return qga.guest_file_read(path, not_exist_exception=True)
     except Exception as exc:
-        prefix = 'qga command return value format error:'
-        message = str(exc)
-        if not message.startswith(prefix):
-            raise
-        try:
-            error = json.loads(message[len(prefix):])['error']
-            description = error['desc'].strip()
-        except (ValueError, KeyError, TypeError, AttributeError):
-            raise exc
-        # QGA exposes localized Win32 text, not numeric GetLastError codes.
-        missing = ('No such file or directory',
-                   'The system cannot find the file specified.',
-                   'The system cannot find the path specified.',
-                   u'\u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002',
-                   u'\u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u8def\u5f84\u3002')
-        if error.get('class') == 'GenericError' and description in [
-                u"failed to open file '%s': %s" % (path, reason) for reason in missing]:
+        if _windows_zwatch_file_missing(exc, path):
             return 0, None
         raise
 
@@ -93,7 +109,13 @@ def windows_zwatch_file(qga, path, contents=None):
     args = ['zwatch-file', path]
     if contents is not None:
         args.append(base64.b64encode(contents.encode('utf-8')).decode('ascii'))
-    code, output = qga.guest_exec_program(VmQga.ZS_TOOLS_PATN_WIN, args, retry=10)
+    try:
+        code, output = qga.guest_exec_program(VmQga.ZS_TOOLS_PATN_WIN, args, retry=10)
+    except Exception as exc:
+        if not _windows_zwatch_file_missing(exc, VmQga.ZS_TOOLS_PATN_WIN, executing=True):
+            raise
+        qga._zwatch_file_legacy_until = now + WINDOWS_ZWATCH_LEGACY_TTL
+        return _windows_zwatch_legacy_file(qga, path, contents)
     # Only an explicit unsupported-command response permits the legacy protocol.
     unsupported = b'Error: unknown command "zwatch-file" for "zs-tools"'
     if code == 1 and output and unsupported in output.splitlines():

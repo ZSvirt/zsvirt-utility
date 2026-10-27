@@ -335,6 +335,63 @@ class TestWindowsZWatchFile(unittest.TestCase):
             1, b'Error: unknown command "zwatch-file" for "zs-tools"\r\n'
                b'Run \'zs-tools --help\' for usage.\r\n')
 
+    def missing_executable(self, reason='No such file or directory'):
+        return self.open_error("Guest agent command failed, error was '"
+                               "Failed to execute child process (%s)'" % reason)
+
+    def test_missing_exe_preserves_ps1_only_monitoring_and_cache(self):
+        self.qga.guest_exec_program.side_effect = self.missing_executable()
+        self.qga.os, self.qga.os_version = 'mswindows', '10'
+        self.qga.guest_file_read.side_effect = [(2, 'vm'), (3, 'cpu')]
+        monitor = qga_zwatch.ZWatchMetricMonitor()
+        monitor.running_vm_list = ['vm']
+        with mock.patch.object(qga_zwatch, 'push_metrics_to_gateway', side_effect=lambda *args: monitor.running_vm_list.remove('vm')) as push:
+            with mock.patch.object(qga_zwatch.time, 'sleep'):
+                monitor.zwatch_qga_monitor_vm('vm', self.qga)
+        self.assertEqual(self.qga.guest_file_read.call_count, 2)
+        self.assertEqual(self.qga.guest_exec_program.call_count, 1)
+        self.qga.guest_file_is_exist.assert_not_called()
+        push.assert_called_once_with(monitor.PROMETHEUS_PUSHGATEWAY_URL, 'vm', 'cpu')
+
+    def test_missing_exe_can_initialize_uuid_without_native_tool(self):
+        self.qga.guest_exec_program.side_effect = self.missing_executable()
+        self.qga.os, self.qga.os_version = 'mswindows', '10'
+        self.qga.guest_file_read.side_effect = [(16, 'NeedConfigVmInfo'), (3, 'cpu')]
+        self.qga.guest_file_write.return_value = 2
+        monitor = qga_zwatch.ZWatchMetricMonitor()
+        monitor.running_vm_list = ['vm']
+        with mock.patch.object(qga_zwatch, 'push_metrics_to_gateway', side_effect=lambda *args: monitor.running_vm_list.remove('vm')) as push:
+            with mock.patch.object(qga_zwatch.time, 'sleep'):
+                monitor.zwatch_qga_monitor_vm('vm', self.qga)
+        self.qga.guest_file_write.assert_called_once_with(monitor.WIN_ZWATCH_VM_INFO_PATH, b'vm')
+        self.qga.guest_exec_cmd_no_exitcode.assert_called_once_with(monitor.WIN_ZWATCH_RESTART_CMD)
+        self.assertEqual(self.qga.guest_exec_program.call_count, 1)
+        push.assert_called_once()
+
+    def test_missing_exe_cache_expires_and_detects_installation(self):
+        self.qga.guest_exec_program.side_effect = [self.missing_executable(), (0, b'3:bmV3')]
+        self.qga.guest_file_read.return_value = (3, 'old')
+        with mock.patch.object(qga_zwatch.time, 'time', side_effect=[100, 120, 160]):
+            results = [qga_zwatch.windows_zwatch_file(self.qga, 'metrics') for _ in range(3)]
+        self.assertEqual(results, [(3, 'old'), (3, 'old'), (3, 'new')])
+        self.assertEqual(self.qga.guest_exec_program.call_count, 2)
+
+    def test_spawn_runtime_errors_and_unstructured_missing_never_fall_back(self):
+        errors = [self.missing_executable('Access is denied.'),
+                  self.missing_executable('sharing violation'),
+                  self.missing_executable('Guest agent is not responding'),
+                  self.open_error('invalid pid'),
+                  Exception('RPC timeout: Failed to execute child process (No such file or directory)'),
+                  self.open_error('Failed to execute child process "other.exe" (No such file or directory)')]
+        for error in errors:
+            self.qga.guest_exec_program.side_effect = error
+            with self.assertRaises(Exception) as caught:
+                qga_zwatch.windows_zwatch_file(self.qga, 'metrics')
+            self.assertIs(caught.exception, error)
+        self.qga.guest_file_read.assert_not_called()
+        self.qga.guest_file_write.assert_not_called()
+        self.assertEqual(self.qga._zwatch_file_legacy_until, 0)
+
     def test_old_tool_reads_metrics_and_empty_files(self):
         self.old_tool()
         self.qga.guest_file_is_exist.return_value = True
@@ -508,6 +565,26 @@ class TestWindowsZWatchLegacyQgaErrors(unittest.TestCase):
         if request['execute'] == 'guest-file-open':
             return json.dumps({'error': {'class': 'GenericError', 'desc': self.description}})
         raise AssertionError('unexpected QGA request: %s' % request)
+
+    def test_real_qga_missing_exe_error_allows_legacy_read(self):
+        del self.qga.guest_exec_program  # Exercise real guest-exec error wrapping.
+        self.qga.guest_file_read = mock.Mock(return_value=(3, 'cpu'))
+        path = qga_zwatch.VmQga.ZS_TOOLS_PATN_WIN
+        descriptions = [
+            "Guest agent command failed, error was 'Failed to execute child process (No such file or directory)'",
+            'Failed to execute child process "' + path + '" (The system cannot find the file specified.)',
+            u'Failed to execute child process (\u7cfb\u7edf\u627e\u4e0d\u5230\u6307\u5b9a\u7684\u6587\u4ef6\u3002)']
+        def spawn_error(domain, command, timeout, flags):
+            request = json.loads(command)
+            self.assertEqual(request['execute'], 'guest-exec')
+            self.assertEqual(request['arguments']['path'], path)
+            return json.dumps({'error': {'class': 'GenericError', 'desc': self.description}})
+        with mock.patch.object(self.module.libvirt_qemu, 'qemuAgentCommand', side_effect=spawn_error):
+            for description in descriptions:
+                self.qga._zwatch_file_legacy_until = 0
+                self.description = description
+                self.assertEqual(qga_zwatch.windows_zwatch_file(self.qga, 'metrics'), (3, 'cpu'))
+        self.qga.guest_file_read.assert_called_with('metrics', not_exist_exception=True)
 
     def test_real_qga_open_errors_are_not_missing_files(self):
         for reason in ['Access is denied.', 'sharing violation', 'Guest agent is not responding']:

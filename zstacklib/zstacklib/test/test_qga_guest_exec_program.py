@@ -159,5 +159,33 @@ class TestGuestExecProgram(unittest.TestCase):
         self.assertIn('timeout', str(ctx.exception))
 
 
+class TestGuestFileReadErrors(unittest.TestCase):
+    def setUp(self):
+        self.qga = _make_qga()
+
+    def test_default_missing_file_still_returns_none(self):
+        self.qga.call_qga_command = mock.Mock(side_effect=Exception('No such file or directory'))
+        self.assertEqual(self.qga.guest_file_read('missing'), (0, None))
+        self.qga.call_qga_command.assert_called_once_with('guest-file-open', args={'path': 'missing', 'mode': 'r'})
+
+    def test_strict_read_preserves_original_exception_without_formatting(self):
+        class Unprintable(Exception):
+            def __str__(self):
+                raise AssertionError('Strict mode must not reformat the error')
+        error = Unprintable()
+        self.qga.call_qga_command = mock.Mock(side_effect=error)
+        with self.assertRaises(Unprintable) as caught:
+            self.qga.guest_file_read('missing', not_exist_exception=True)
+        self.assertIs(caught.exception, error)
+
+    def test_other_open_error_is_propagated_in_both_modes(self):
+        error = Exception('Access is denied.')
+        self.qga.call_qga_command = mock.Mock(side_effect=error)
+        for strict in (False, True):
+            with self.assertRaises(Exception) as caught:
+                self.qga.guest_file_read('metrics', not_exist_exception=strict)
+            self.assertIs(caught.exception, error)
+
+
 if __name__ == '__main__':
     unittest.main()
