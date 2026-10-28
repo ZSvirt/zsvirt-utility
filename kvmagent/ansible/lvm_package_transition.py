@@ -39,8 +39,9 @@ def _installed_packages(host, run_remote_command):
     return installed
 
 
-def migrate_legacy_packages(release, arch, repo, skipped, host, run_remote_command):
-    if release != 'h2203sp1o' or arch != 'aarch64' or repo == 'false':
+def migrate_legacy_packages(release, arch, repos_with_quote,  # type: str
+                            skipped, host, run_remote_command):
+    if release != 'h2203sp1o' or arch != 'aarch64' or repos_with_quote == 'false':
         return False
 
     installed = _installed_packages(host, run_remote_command)
@@ -59,7 +60,7 @@ def migrate_legacy_packages(release, arch, repo, skipped, host, run_remote_comma
     specs = ['%s-%s:%s-%s.%s' % ((name,) + target[name]) for name in PACKAGES]
     command = ('yum --refresh --disablerepo=* --enablerepo=%s '
                '--setopt=install_weak_deps=False install -y %s' %
-               (quote(repo), ' '.join(quote(spec) for spec in specs)))
+               (repos_with_quote, ' '.join(quote(spec) for spec in specs)))
     if not run_remote_command(command, host, return_status=True):
         raise PackageTransitionError('failed to replace the legacy LVM/device-mapper package set')
     if _installed_packages(host, run_remote_command) != target:
