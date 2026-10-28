@@ -913,8 +913,12 @@ def yum_remove_package(name, host_post_info):
             handle_ansible_info(details, host_post_info, "INFO")
             runner_args = ZstackRunnerArg()
             runner_args.host_post_info = host_post_info
-            runner_args.module_name = 'yum'
-            runner_args.module_args = 'name=' + name + ' state=absent'
+            runner_args.module_name = 'shell'
+            # Installed packages resolve from the local rpmdb. Disable every
+            # remote repo so dnf does not refresh still-enabled system mirrors
+            # such as Kylin ks10-adv-os. Internal repos stay enabled=0 and are
+            # not required for removal.
+            runner_args.module_args = 'yum --disablerepo=* -y remove ' + name
             zstack_runner = ZstackRunner(runner_args)
             result = zstack_runner.run()
             logger.debug(result)
