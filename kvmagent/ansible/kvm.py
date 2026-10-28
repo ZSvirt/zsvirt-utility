@@ -25,7 +25,7 @@ proxy = ""
 sproxy = ""
 chroot_env = 'false'
 init = 'false'
-zstack_repo = 'false'
+zstack_repo = 'false'  # maybe 'false', 'zstack-mn,qemu-kvm-ev-mn' (join with ',')
 zstack_apt_source = 'false'
 chrony_servers = None
 post_url = ""
@@ -320,8 +320,9 @@ def install_kvm_pkg():
                 update_list += ' storcli'
 
             lvm_package_transition.migrate_legacy_packages(
-                releasever, host_info.host_arch, zstack_repo, _skip_list,
-                host_post_info, run_remote_command)
+                releasever, host_info.host_arch, repos_with_quote=zstack_repo,
+                skipped=_skip_list, host=host_post_info,
+                run_remote_command=run_remote_command)
 
             # name: install/update kvm related packages on RedHat based OS from user defined repo
             command = ("echo {1} >/var/lib/zstack/dependencies && yum --disablerepo=* --enablerepo={0} clean metadata >/dev/null && \

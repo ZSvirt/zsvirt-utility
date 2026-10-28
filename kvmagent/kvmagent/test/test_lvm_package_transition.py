@@ -52,8 +52,9 @@ class PackageTransitionTest(unittest.TestCase):
                          'device-mapper-libs', 'device-mapper-event', 'device-mapper-event-libs'))
         return True
 
-    def apply(self, release='h2203sp1o', arch='aarch64', repo='zstack-local', skipped=()):
-        return transition.migrate_legacy_packages(release, arch, repo, skipped, object(), self.remote)
+    def apply(self, release='h2203sp1o', arch='aarch64', repos_with_quote='zstack-local', skipped=()):
+        return transition.migrate_legacy_packages(
+            release, arch, repos_with_quote, skipped, object(), self.remote)
 
     def test_legacy_packages_and_split_libraries_use_one_exact_transaction(self):
         self.assertTrue(self.apply())
@@ -65,6 +66,12 @@ class PackageTransitionTest(unittest.TestCase):
         self.assertIn('--enablerepo=zstack-local', command)
         self.assertNotIn('--allowerasing', command)
         self.assertNotIn('--skip-broken', command)
+
+    def test_comma_separated_repo_list_is_not_quoted_again(self):
+        self.assertTrue(self.apply(repos_with_quote='"zstack-mn,qemu-kvm-ev-mn"'))
+        transactions = [c for c in self.calls if c[0] == 'yum']
+        enablerepo = [arg for arg in transactions[0] if arg.startswith('--enablerepo=')]
+        self.assertEqual(['--enablerepo=zstack-mn,qemu-kvm-ev-mn'], enablerepo)
 
     def test_repeated_deploy_does_not_downgrade_a_second_time(self):
         self.apply()
