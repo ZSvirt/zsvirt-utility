@@ -235,6 +235,18 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
 
     @thread.AsyncThread
     def qga_get_vm_nic(self, uuid, qga):
+        if qga.os and 'mswindows' in qga.os:
+            # Hold through cache update and publication as well as collection.
+            # This also covers legacy GuestTools and PowerShell fallback.
+            with lock.NonBlockNamedLock('qga-network-%s' % uuid) as guard:
+                if not guard.acquired:
+                    logger.debug('vm[%s] network configuration in progress, skip nic info' % uuid)
+                    return
+                self._qga_get_vm_nic(uuid, qga)
+        else:
+            self._qga_get_vm_nic(uuid, qga)
+
+    def _qga_get_vm_nic(self, uuid, qga):
         with self.vm_nic_inflight_lock:
             if uuid in self.vm_nic_inflight:
                 logger.debug('vm[%s] nic info collection still in flight, skip this round' % uuid)
@@ -261,6 +273,9 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
                     except Exception as e:
                         logger.debug('vm[%s] read nic info by zs-tools.exe failed, fallback to powershell script due to [%s]' % (uuid, str(e)))
                 # Lock-busy skip must not fall back to PowerShell or clear MN cache.
+                if nicInfo is not None and not str(nicInfo).strip():
+                    logger.debug('vm[%s] nic info skipped: empty legacy zs-tools output' % uuid)
+                    return
                 if nicInfo is not None and is_nic_info_skip(nicInfo):
                     logger.debug('vm[%s] nic info skipped: zs-tools lock busy' % uuid)
                     return
@@ -268,7 +283,10 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
                     nicInfo = qga.guest_exec_cmd_no_exitcode(zwatch_nic_info_path)
             else:
                 nicInfo = qga.guest_exec_cmd_no_exitcode(zwatch_nic_info_path)
-            nicInfo = str(nicInfo).strip()
+            nicInfo = str(nicInfo).strip() if nicInfo is not None else ''
+            if not nicInfo:
+                logger.debug('vm[%s] nic info skipped: empty legacy collector output' % uuid)
+                return
             if is_nic_info_skip(nicInfo):
                 logger.debug('vm[%s] nic info skipped: zs-tools lock busy' % uuid)
                 return
