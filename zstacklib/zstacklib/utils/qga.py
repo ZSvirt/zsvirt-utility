@@ -676,18 +676,16 @@ try {
                             data.append('net task {} pid={} exited with code={}'.format(
                                 task['task_id'], task.get('pid'), code))
                         if code != 0:
-                            tail = self._try_read_zs_tools_log_tail(deadline=deadline)
-                            if tail:
-                                data.append('zs-tools.log tail:\n' + tail)
+                            diagnostic = self._get_zs_tools_log_diagnostic(deadline=deadline)
+                            if diagnostic:
+                                data.append(diagnostic.lstrip('\n'))
                         return code, '\n'.join(data)
                     if record['phase'] in ('failed', 'cancelled'):
                         self._recover_net_task(task)
                         _zs_tools_net_pending.pop(self.vm_uuid)
                         detail = 'net task {} pid={} ended without a confirmed result'.format(
                             task['task_id'], task.get('pid'))
-                        tail = self._try_read_zs_tools_log_tail(deadline=deadline)
-                        if tail:
-                            detail += '\nzs-tools.log tail:\n' + tail
+                        detail += self._get_zs_tools_log_diagnostic(deadline=deadline)
                         return 1, detail
                 raise Exception('net task {} exceeded deadline {}s'.format(task['task_id'], wait*retry))
             except Exception as error:
@@ -708,9 +706,9 @@ try {
                             cleanup = '; cleanup unconfirmed; subsequent net execution blocked'
                     else:
                         cleanup = '; submission result unknown; subsequent net execution blocked'
-                tail = self._try_read_zs_tools_log_tail(deadline=cleanup_started + 10)
-                if tail:
-                    error = '{}\nzs-tools.log tail:\n{}'.format(error, tail)
+                diagnostic = self._get_zs_tools_log_diagnostic(deadline=cleanup_started + 10)
+                if diagnostic:
+                    error = '{}{}'.format(error, diagnostic)
                 return 1, 'qga exec zs-tools operate net failed for vm {}, task={}, pid={}, elapsed={:.3f}s, execution_elapsed={:.3f}s, cleanup_elapsed={:.3f}s, config: {}, error: {}{}'.format(
                     self.vm_uuid, task['task_id'] if task else None,
                     task.get('pid') if task else None, time.time()-started,
@@ -756,18 +754,14 @@ try {
             result = get_return_data(ret)
             if exitcode != 0:
                 result = 'zs-tools pid {} exitcode {}, {}'.format(pid, exitcode, result)
-                tail = self._try_read_zs_tools_log_tail()
-                if tail:
-                    result += '\nzs-tools.log tail:\n' + tail
+                result += self._get_zs_tools_log_diagnostic()
             return exitcode, result
         except Exception as e:
             detail = str(e) or type(e).__name__
             partial_output = get_return_data(ret)
             if partial_output and partial_output not in detail:
                 detail += '\n' + partial_output
-            tail = self._try_read_zs_tools_log_tail()
-            if tail:
-                detail += '\nzs-tools.log tail:\n' + tail
+            detail += self._get_zs_tools_log_diagnostic()
             return 1, 'qga exec zs-tools operate {} failed for vm {}, config: {}, error: {}'.format(
                     operate, self.vm_uuid, log.mask_sensitive_field(config_obj, config), detail)
 
@@ -785,40 +779,105 @@ try {
                          for key, label in [('out-data', 'stdout'), ('err-data', 'stderr')]
                          if result.get(key) is not None)
 
-    def _try_read_zs_tools_log_tail(self, n_bytes=4096, deadline=None):
-        # Each attempt uses only bounded QGA file operations, never guest-exec.
-        def file_command(command, args):
-            timeout = 1
-            if deadline is not None:
-                # Reserve two seconds before non-close calls so an acquired
-                # handle can be closed even with whole-second QGA timeouts.
-                reserve = 0 if command == 'guest-file-close' else 2
-                timeout = self._net_task_timeout(deadline - reserve, 1)
-            return self.call_qga_command(command, args, timeout=timeout)
+    def _get_zs_tools_log_diagnostic(self, deadline=None):
+        tail = self._try_read_zs_tools_log_tail(deadline=deadline)
+        if tail:
+            return '\nzs-tools.log tail:\n' + tail
+        failures = getattr(self, '_zs_tools_log_tail_failures', [])
+        if failures:
+            return '\nzs-tools.log tail unavailable: ' + '; '.join(failures)
+        return ''
 
-        paths = [r'C:\Program Files\GuestTools\zs-tools\log\zs-tools.log',
+    @staticmethod
+    def _zs_tools_log_read_error(error):
+        # Only return a fixed category: QGA errors can contain command arguments.
+        message = error.args[0] if error.args and isinstance(error.args[0], (bytes, type(u''))) else str(error)
+        if not isinstance(message, type(u'')):
+            for encoding in ('utf-8', 'gbk', 'latin-1'):
+                try:
+                    message = message.decode(encoding)
+                    break
+                except UnicodeDecodeError:
+                    continue
+        message = message.lower()
+        if any(text in message for text in ('sharing violation', 'used by another process',
+                                           'sharing access', 'error 32', 'error 33',
+                                           u'\u53e6\u4e00\u4e2a\u7a0b\u5e8f\u6b63\u5728\u4f7f\u7528',
+                                           u'\u5171\u4eab\u51b2\u7a81')):
+            return 'sharing violation (QGA cannot share an active write handle)'
+        if any(text in message for text in ('cannot find', 'not found', 'no such file',
+                                           'error 2', 'error 3', u'\u627e\u4e0d\u5230\u6307\u5b9a')):
+            return 'file/path not found'
+        if any(text in message for text in ('permission denied', 'access is denied',
+                                           'access denied', 'error 5', u'\u62d2\u7edd\u8bbf\u95ee')):
+            return 'access denied'
+        if 'timeout' in message or 'timed out' in message:
+            return 'QGA timeout'
+        return 'QGA file operation failed'
+
+    def _try_read_zs_tools_log_tail(self, n_bytes=4096, deadline=None):
+        # QGA on Windows uses FILE_SHARE_READ, so rb does not bypass a writer.
+        # Do not launch PowerShell to collect diagnostics for a hung PS process.
+        n_bytes = min(4096, max(0, n_bytes))
+        self._zs_tools_log_tail_failures = []
+        if not n_bytes:
+            return ''
+        paths = [self.ZS_TOOLS_PATN_WIN.rsplit('\\', 1)[0] + r'\zs-tools.log',
+                 r'C:\Program Files\GuestTools\zs-tools\log\zs-tools.log',
                  r'C:\Program Files\zstack\zs-tools\log\zs-tools.log']
+        # At most five attempts per path. The collection budget is five seconds,
+        # plus at most one second to close an already opened handle.
+        collection_deadline = time.time() + 5
+        if deadline is not None:
+            # Preserve the network task's absolute budget. As in its original
+            # reader, reserve two seconds before non-close operations.
+            collection_deadline = min(collection_deadline, deadline - 2)
+
+        def call(command, args):
+            if time.time() + 1 > collection_deadline:
+                raise Exception('QGA timeout: log collection budget exhausted')
+            return self.call_qga_command(command, args, timeout=1)
+
         for path in paths:
-            handle = None
-            try:
-                handle = file_command('guest-file-open',
-                                      {'path': path, 'mode': 'rb'})
-                end = file_command('guest-file-seek',
-                                   {'handle': handle, 'offset': 0, 'whence': 2})
-                file_command('guest-file-seek',
-                             {'handle': handle, 'offset': max(0, end['position'] - n_bytes),
-                              'whence': 0})
-                data = file_command('guest-file-read',
-                                    {'handle': handle, 'count': n_bytes})
-                return self._decode_zs_tools_data(data.get('buf-b64', b''))
-            except Exception:
-                pass
-            finally:
-                if handle is not None:
-                    try:
-                        file_command('guest-file-close', {'handle': handle})
-                    except Exception:
-                        pass
+            for attempt in range(5):
+                handle = None
+                operation = 'open'
+                retry = False
+                try:
+                    handle = call('guest-file-open', {'path': path, 'mode': 'rb'})
+                    operation = 'seek'
+                    end = call('guest-file-seek',
+                               {'handle': handle, 'offset': 0, 'whence': 2})
+                    call('guest-file-seek',
+                         {'handle': handle, 'offset': max(0, end['position'] - n_bytes),
+                          'whence': 0})
+                    operation = 'read'
+                    data = call('guest-file-read', {'handle': handle, 'count': n_bytes})
+                    return self._decode_zs_tools_data(data.get('buf-b64', b'')[:n_bytes])
+                except Exception as error:
+                    reason = self._zs_tools_log_read_error(error)
+                    retry = (reason.startswith('sharing violation') and attempt < 4
+                             and time.time() + 1.25 <= collection_deadline)
+                    if not retry:
+                        self._zs_tools_log_tail_failures.append(
+                            '{} [{}, {} attempt(s)]: {}'.format(
+                                path, operation, attempt + 1, reason))
+                finally:
+                    if handle is not None:
+                        try:
+                            timeout = 1 if deadline is None else self._net_task_timeout(deadline, 1)
+                            self.call_qga_command('guest-file-close', {'handle': handle}, timeout=timeout)
+                        except Exception as error:
+                            self._zs_tools_log_tail_failures.append('{} [close]: {}'.format(
+                                path, self._zs_tools_log_read_error(error)))
+                            retry = False
+                if not retry:
+                    break
+                # Only sharing violations are retried. Never wait for a hung
+                # process indefinitely or terminate it just to obtain its log.
+                time.sleep(0.25)
+            if time.time() + 1 > collection_deadline:
+                break
         return ''
 
     def guest_exec_wmic(self, cmd, output=True, wait=qga_exec_wait_interval, retry=qga_exec_wait_retry):
