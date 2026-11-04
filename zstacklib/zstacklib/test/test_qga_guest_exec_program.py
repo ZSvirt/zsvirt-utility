@@ -159,5 +159,87 @@ class TestGuestExecProgram(unittest.TestCase):
         self.assertIn('timeout', str(ctx.exception))
 
 
+class TestZsToolsRebaseDiagnostics(unittest.TestCase):
+    def setUp(self):
+        self.qga = _make_qga()
+        self.qga.ZS_TOOLS_PATN_WIN = r'C:\zs-tools.exe'
+        self.qga.guest_exec = mock.Mock(return_value={'pid': 42})
+        self.qga.guest_exec_status_with_timeout = mock.Mock(return_value={
+            'exited': True, 'exitcode': 0, 'out-data': b'hello\r\n', 'err-data': b'warning'})
+        self.qga._try_read_zs_tools_log_tail = mock.Mock(return_value='known log tail')
+        self.now = 100.0
+        self.patches = [mock.patch.object(qga_mod.log, 'mask_sensitive_field', side_effect=lambda obj, value: value, create=True),
+                        mock.patch.object(qga_mod.time, 'time', side_effect=lambda: self.now),
+                        mock.patch.object(qga_mod.time, 'sleep', side_effect=self.sleep),
+                        mock.patch.object(qga_mod, 'decode_with_fallback', side_effect=lambda x: x.decode('utf-8') if isinstance(x, bytes) else x)]
+        for patch in self.patches: patch.start()
+
+    def sleep(self, seconds): self.now += seconds
+
+    def tearDown(self):
+        for patch in reversed(self.patches): patch.stop()
+
+    def run_host(self):
+        return self.qga.guest_exec_zs_tools('host', '{}', wait=1, retry=3)
+
+    def test_target_stdout_stderr_labels_survive_rebase(self):
+        code, output = self.run_host()
+        self.assertEqual(0, code)
+        self.assertEqual('stdout: hello\n\nstderr: warning', output)
+        self.qga._try_read_zs_tools_log_tail.assert_not_called()
+
+    def test_target_nonzero_exit_keeps_pid_and_log_tail(self):
+        self.qga.guest_exec_status_with_timeout.return_value['exitcode'] = 2
+        code, output = self.run_host()
+        self.assertEqual(2, code)
+        self.assertIn('pid 42 exitcode 2', output)
+        self.assertIn('stderr: warning', output)
+        self.assertIn('zs-tools.log tail:\nknown log tail', output)
+
+    def test_target_missing_exitcode_is_failure_with_log_tail(self):
+        del self.qga.guest_exec_status_with_timeout.return_value['exitcode']
+        code, output = self.run_host()
+        self.assertEqual(1, code)
+        self.assertIn('exited without exitcode', output)
+        self.assertIn('known log tail', output)
+
+    def test_task_bound_net_result_keeps_target_diagnostics_with_deadline(self):
+        self.qga._net_task_control = mock.Mock(return_value={
+            'phase': 'finished', 'pid': 43, 'exitcode': 2, 'out-data': b'net output', 'err-data': b'net error'})
+        code, output = self.qga.guest_exec_zs_tools('net', '{}', wait=1, retry=3)
+        self.assertEqual(2, code)
+        self.assertIn('stdout: net output', output)
+        self.assertIn('stderr: net error', output)
+        self.assertIn('known log tail', output)
+        self.qga._try_read_zs_tools_log_tail.assert_called_once_with(deadline=103.0)
+
+    def real_log_tail(self, budget):
+        del self.qga._try_read_zs_tools_log_tail
+        calls = []
+        def transport(command, args, timeout):
+            calls.append((command, timeout, self.now))
+            self.now += timeout
+            if command == 'guest-file-open': return 7
+            if command == 'guest-file-seek': return {'position': 100}
+            if command == 'guest-file-read': return {'buf-b64': b'log detail'}
+            self.assertEqual('guest-file-close', command)
+        self.qga.call_qga_command = mock.Mock(side_effect=transport)
+        result = self.qga._try_read_zs_tools_log_tail(deadline=100+budget)
+        self.assertLessEqual(self.now, 100+budget)
+        self.assertTrue(all(timeout == 1 for _, timeout, _ in calls))
+        self.assertEqual('guest-file-close', calls[-1][0])
+        return result, calls
+
+    def test_net_log_reads_respect_budget_and_close_handle(self):
+        result, calls = self.real_log_tail(6)
+        self.assertEqual('log detail', result)
+        self.assertEqual(5, len(calls))
+
+    def test_short_log_budget_skips_reads_but_reserves_close(self):
+        result, calls = self.real_log_tail(3)
+        self.assertEqual('', result)
+        self.assertEqual(['guest-file-open', 'guest-file-close'], [c[0] for c in calls])
+
+
 if __name__ == '__main__':
     unittest.main()

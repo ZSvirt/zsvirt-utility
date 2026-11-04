@@ -6,7 +6,12 @@
     </description>
 
     <property file="build.properties" />
-    <property file="${zstack.source}/VERSION" />
+    <!-- Prefer zsvirt-ee/VERSION when present; open-source has no ee dir/file. -->
+    <available file="${zstack.source}/zsvirt-ee/VERSION" property="ee.version.exists"/>
+    <condition property="zstack.version.file" value="${zstack.source}/zsvirt-ee/VERSION" else="${zstack.source}/VERSION">
+        <isset property="ee.version.exists"/>
+    </condition>
+    <property file="${zstack.version.file}" />
     <property file="${zstack.source}/PJNUM"/>
     <property name="build.dir" location="${basedir}/target" />
     <property name="war.file" location="${build.dir}/zstack.war" />
@@ -148,6 +153,7 @@
         <makeDir dir="${commonModules.dir}" />
 
         <property name="allinone.versionfile.in.war" location="${war.dir}/VERSION" />
+        <echo message="write war VERSION from ${zstack.version.file}: ${product.name} ${allinone.version}" />
         <echo file="${allinone.versionfile.in.war}" append="true">${product.name} ${allinone.version}</echo>
 
         <property name="allinone.projectnumfile.in.war" location="${war.dir}/PJNUM" />
@@ -463,8 +469,21 @@
         <echo message="successfully build zstack-vr.img in /root/build_zstack_vr_image/zstack-vr.img" />
         <echo message="--------------------------------------------------------------------" />
     </target>
+    <target name="package-external-archive">
+        <!-- Rebuild external-*.tar after ant (prepare wipes early build_external output). -->
+        <condition property="package.external.build.num" value="${build.num}" else="">
+            <isset property="build.num"/>
+        </condition>
+        <exec executable="bash" failonerror="true">
+            <arg value="${basedir}/scripts/build_external.sh" />
+            <arg value="--from-target" />
+            <env key="BUILD_NUM" value="${package.external.build.num}" />
+            <env key="ZSTACK_BUILD_ROOT" value="${zstack_build_root}" />
+            <env key="ZSTACK_DISTRO_SOURCE" value="${zstack.distro.source}" />
+        </exec>
+    </target>
+    <target name="all-in-one" depends="build-war, build-allinone, package-external-archive">
 
-    <target name="all-in-one" depends="build-war, build-allinone"> 
         <echo message="--------------------------------------------------------------------" />
         <echo message="successfully build ${product.bin.name} all in one package at ${allinone.bin.file} " />
         <echo message="--------------------------------------------------------------------" />

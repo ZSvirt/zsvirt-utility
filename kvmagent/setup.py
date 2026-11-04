@@ -1,6 +1,5 @@
 from setuptools import setup, find_packages
 import sys, os
-import platform
 
 version = '5.0.0'
 
@@ -9,10 +8,9 @@ install_requires = [
     "typing",
     "future",
     "setuptools==21.0.0",   # Keep the same setuptools version as zstacklib
+    "grpcio==1.27.2",
+    "protobuf==3.12.4",
 ]
-if platform.machine() == 'x86_64':
-    install_requires.append("grpcio==1.27.2")
-    install_requires.append("protobuf==3.12.4")
 
 setup(name='kvmagent',
       version=version,

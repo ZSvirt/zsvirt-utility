@@ -7,6 +7,7 @@ import zlib
 
 import bash
 import jsonobject
+import linux
 import log
 import shell
 from linux import get_vm_pid, get_process_start_time, HOST_ARCH
@@ -41,14 +42,29 @@ def get_bin_dir():
             'Could not find qemu/qemu-kvm bin directory in /usr/share/qemu-kvm/ or /usr/share/qemu/')
 
 
+# QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
+# QEMU emulator version 4.2.0 (qemu-kvm-4.2.0-640.g70d8f25.el7)
+# return 2.12.0
+def _parse_version2(version_output):
+    return version_output.splitlines()[0].strip().split(" ")[3]
+
+# QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
+# return 2.12.0
+def get_version_from_exe_file2(path, error_out=False):
+    r, o, e = bash.bash_roe("%s --version" % path)
+    if r == 0:
+        return _parse_version2(o.strip())
+
+    if error_out:
+        raise Exception("cannot get version from %s: %s" % (path, e))
+    else:
+        logger.debug("cannot get version from %s: %s" % (path, e))
+
+    return ""
+
+
 def get_version():
-    version = shell.call("virsh version | awk '/hypervisor.*QEMU/{print $4}'", False).strip()
-
-    # failed to get qemu version, fallback to get its version from path
-    if version == "":
-        return get_version_from_exe_file2(get_path())
-
-    return version
+    return get_version_from_exe_file2(get_path())
 
 def get_install_date():
     r, o, _ = bash.bash_roe("rpm -q --queryformat '%{INSTALLTIME}' qemu-kvm")
@@ -98,20 +114,6 @@ def get_version_from_exe_file(path, error_out=False):
     return ""
 
 # QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
-# return 2.12.0
-def get_version_from_exe_file2(path, error_out=False):
-    r, o, e = bash.bash_roe("%s --version" % path)
-    if r == 0:
-        return _parse_version2(o.strip())
-
-    if error_out:
-        raise Exception("cannot get version from %s: %s" % (path, e))
-    else:
-        logger.debug("cannot get version from %s: %s" % (path, e))
-
-    return ""
-
-# QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
 # return qemu-kvm-ev-2.12.0-44.1.el7_9.1
 def _parse_version(version_output):
     lines = version_output.splitlines()
@@ -129,15 +131,9 @@ def _parse_version(version_output):
 
     return "-".join(filter(lambda s: s[0].isdigit(), full_ver.split("-")))
 
-# QEMU emulator version 2.12.0 (qemu-kvm-ev-2.12.0-44.1.el7_9.1)
-# QEMU emulator version 4.2.0 (qemu-kvm-4.2.0-640.g70d8f25.el7)
-# return 2.12.0
-def _parse_version2(version_output):
-    return version_output.splitlines()[0].strip().split(" ")[3]
-
 
 def get_device_map(path, option=""):
-    out = shell.call("%s --output=json %s %s" % (qemu_img.subcmd('map'), option, path))
+    out = shell.call("%s --output=json %s %s" % (qemu_img.subcmd('map'), option, linux.shellquote(path)))
     return out.strip()
 
 
@@ -148,28 +144,63 @@ def get_data_bitmap(path, max_length, zero, data, qemu_img_command_option=""):
     for item in json_map:
         if item['zero'] is zero and item['data'] is data:
             if item['length'] > max_length:
-                result.update(split_large_blocks(item, max_length))
+                result.update(split_bitmap_extent(item['start'], item['length'], max_length))
             else:
                 result[item['start']] = item['length']
     return result
 
 
 def get_rbd_data_bitmap(path, max_length):
-    o = shell.call("""rbd diff %s --format json""" % (path))
+    o = shell.call("""rbd diff %s --format json""" % linux.shellquote(path))
     o = jsonobject.loads(o.strip())
     result = {}
     for item in o:
         if item['exists'] == 'true':
             if item['length'] > max_length:
-                result.update(split_large_blocks(item, max_length))
+                result.update(split_bitmap_extent(item['offset'], item['length'], max_length))
             else:
                 result[item['offset']] = item['length']
     return result
 
 
+def merge_data_bitmaps(bitmap_maps, max_length):
+    intervals = []
+    for bitmap_map in bitmap_maps:
+        for start, length in bitmap_map.items():
+            start = int(start)
+            length = int(length)
+            if start < 0 or length <= 0:
+                raise ValueError("invalid bitmap extent: start must be non-negative and length must be positive")
+            intervals.append((start, start + length))
+
+    if not intervals:
+        return {}
+
+    intervals.sort(key=lambda interval: interval[0])
+    merged = []
+    current_start, current_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+            continue
+        merged.append((current_start, current_end))
+        current_start, current_end = start, end
+    merged.append((current_start, current_end))
+
+    result = {}
+    for start, end in merged:
+        result.update(split_bitmap_extent(start, end - start, max_length))
+    return result
+
+
 def split_large_blocks(item, max_length):
-    start = item['start']
-    length = item['length']
+    start = item['start'] if 'start' in item else item['offset']
+    return split_bitmap_extent(start, item['length'], max_length)
+
+
+def split_bitmap_extent(start, length, max_length):
+    if max_length <= 0:
+        raise ValueError("max bitmap extent length must be positive")
     result = {}
 
     while length > 0:

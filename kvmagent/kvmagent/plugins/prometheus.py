@@ -14,6 +14,7 @@ from zstacklib.utils import form
 from zstacklib.utils import http, debug
 from zstacklib.utils import jsonobject
 from zstacklib.utils import linux
+from zstacklib.utils.restart_fence import monotonic_time
 from zstacklib.utils import lock
 from zstacklib.utils import lvm
 from zstacklib.utils import shell
@@ -24,6 +25,8 @@ from zstacklib.utils.ip import get_host_physicl_nics
 from zstacklib.utils.ip import get_nic_supported_max_speed
 from zstacklib.utils.ipmitool import get_sensor_info_from_ipmi
 from zstacklib.utils.linux import is_virtual_machine, is_support_bmc
+from kvmagent.plugins import vm_performance_metrics
+from kvmagent.plugins import prometheus_registration
 
 logger = log.get_logger(__name__)
 collector_dict = {}  # type: Dict[str, threading.Thread]
@@ -34,7 +37,45 @@ asyncDataCollectorLock = threading.RLock()
 QEMU_CMD = os.path.basename(kvmagent.get_qemu_path())
 ALARM_CONFIG = None
 PAGE_SIZE = None
-disk_list_record = None
+DISK_LIST_MISMATCH_THRESHOLD = 3
+
+
+class DiskListChangeTracker(object):
+    def __init__(self, mismatch_threshold):
+        self.mismatch_threshold = mismatch_threshold
+        self.disk_list = None
+        self.pending_disk_list = None
+        self.pending_count = 0
+
+    def update(self, disk_list):
+        disk_list = dict(disk_list)
+        if self.disk_list is None:
+            self.disk_list = disk_list
+            return None
+
+        if cmp(self.disk_list, disk_list) == 0:
+            self.pending_disk_list = None
+            self.pending_count = 0
+            return None
+
+        if self.pending_disk_list is not None and cmp(self.pending_disk_list, disk_list) == 0:
+            self.pending_count += 1
+        else:
+            self.pending_disk_list = disk_list
+            self.pending_count = 1
+
+        if self.pending_count < self.mismatch_threshold:
+            return None
+
+        change = (self.disk_list, disk_list)
+        self.disk_list = disk_list
+        self.pending_disk_list = None
+        self.pending_count = 0
+        return change
+
+
+disk_list_tracker = DiskListChangeTracker(DISK_LIST_MISMATCH_THRESHOLD)
+disk_list_tracker_lock = threading.RLock()
 block_devices_record = None
 hba_port_state_list_record_map = {}
 dump_stack_and_objects = True
@@ -58,6 +99,8 @@ hw_status_abnormal_list_record = {
 
 # collect domain max memory
 domain_max_memory = {}
+vm_performance_collector = vm_performance_metrics.VmHostPerformanceCollector()
+vm_performance_last_result = []
 
 def read_number(fname):
     res = linux.read_file(fname)
@@ -277,25 +320,25 @@ def collect_memory_locator():
 
 @thread.AsyncThread
 def check_disk_insert_and_remove(disk_list):
-    global disk_list_record
-    if disk_list_record is None:
-        disk_list_record = disk_list
+    if not disk_list:
+        logger.warn("skip disk insert/remove check because the disk list is empty")
         return
-    
-    if cmp(disk_list_record, disk_list) == 0:
+
+    with disk_list_tracker_lock:
+        change = disk_list_tracker.update(disk_list)
+    if change is None:
         return
-    
+
+    old_disk_list, new_disk_list = change
     # check disk insert
-    for sn in disk_list.keys():
-        if sn not in disk_list_record.keys():
-            send_physical_disk_insert_alarm_to_mn(sn, disk_list[sn])
+    for sn in new_disk_list.keys():
+        if sn not in old_disk_list.keys():
+            send_physical_disk_insert_alarm_to_mn(sn, new_disk_list[sn])
     
     # check disk remove
-    for sn in disk_list_record.keys():
-        if sn not in disk_list.keys():
-            send_physical_disk_remove_alarm_to_mn(sn, disk_list_record[sn])
-            
-    disk_list_record = disk_list
+    for sn in old_disk_list.keys():
+        if sn not in new_disk_list.keys():
+            send_physical_disk_remove_alarm_to_mn(sn, old_disk_list[sn])
 
 # use lazy loading to avoid re-registering global configuration when other modules are initialized
 host_network_interface_service_type_map = None
@@ -572,10 +615,6 @@ def collect_raid_state():
                                                  ['slot_number', 'disk_group']),
     }
     
-    r, o = bash_ro("sas3ircu list | grep -A 8 'Index' | awk '{print $1}'")
-    if r == 0 and o.strip() != "":
-        return collect_sas_raid_state(metrics, o)
-
     r, o = bash_ro("/opt/MegaRAID/storcli/storcli64 /call/vall show all J")
     if r == 0 and jsonobject.loads(o)['Controllers'][0]['Command Status']['Status'] == "Success":
         return collect_mega_raid_state(metrics, o)
@@ -583,13 +622,17 @@ def collect_raid_state():
     r, o = bash_ro("arcconf list | grep -A 8 'Controller ID' | awk '{print $2}'")
     if r == 0 and o.strip() != "":
         return collect_arcconf_raid_state(metrics, o)
+
+    r, o = bash_ro("sas3ircu list | grep -A 8 'Index' | awk '{print $1}'")
+    if r == 0 and o.strip() != "":
+        return collect_sas_raid_state(metrics, o)
     
     return metrics.values()
 
 
-def handle_raid_state(target_id, state_int):
+def handle_raid_state(target_id, state_int, origin_state):
     if state_int != 0:
-        send_raid_state_alarm_to_mn(target_id, state_int)
+        send_raid_state_alarm_to_mn(target_id, origin_state)
         return
     remove_raid_status_abnormal(target_id)
 
@@ -621,7 +664,7 @@ def collect_arcconf_raid_state(metrics, infos):
                 state = l.strip().split(":")[-1].strip()
                 state_int = convert_raid_state_to_int(state)
                 metrics['raid_state'].add_metric([target_id], state_int)
-                handle_raid_state(target_id, state_int)
+                handle_raid_state(target_id, state_int, state)
 
         for infos in device_arr[1:]:
             drive_state = serial_number = slot_number = enclosure_device_id = "unknown"
@@ -672,7 +715,7 @@ def collect_sas_raid_state(metrics, infos):
                     continue
                 state_int = convert_raid_state_to_int(state)
                 metrics['raid_state'].add_metric([target_id], state_int)
-                handle_raid_state(target_id, state_int)
+                handle_raid_state(target_id, state_int, state)
         
         disk_info = bash_o("sas3ircu %s display | grep -E 'Enclosure #|Slot #|State|Serial No|Drive Type'" % line.strip())
         enclosure_device_id = slot_number = state = serial_number = "unknown"
@@ -714,17 +757,49 @@ def collect_mega_raid_state(metrics, infos):
             if not match:
                 continue
             vd_state = data[attr][0]["State"]
-            disk_group = data[attr][0]["DG/VD"].split("/")[0]
+            disk_group = data[attr][0]["DG/VD"]
+            if disk_group:
+                disk_group = disk_group.split("/")[0]
+            else:
+                disk_group = data[attr][0]["VD"]
             converted_vd_state = convert_raid_state_to_int(vd_state)
             metrics['raid_state'].add_metric([disk_group], converted_vd_state)
-            handle_raid_state(disk_group, converted_vd_state)
+            handle_raid_state(disk_group, converted_vd_state, vd_state)
 
     # collect disk state
-    o = bash_o("/opt/MegaRAID/storcli/storcli64 /call/eall/sall show all J").strip()
-    pd_infos = jsonobject.loads(o.strip())
-    for controller in pd_infos["Controllers"]:
+    r, o, e = bash_roe("/opt/MegaRAID/storcli/storcli64 /call/eall/sall show all J")
+    if r != 0 or not o.strip():
+        logger.warn("skip physical disk change check because storcli query failed, "
+                    "return code[%s], stderr[%s]" % (r, e))
+        return metrics.values()
+
+    try:
+        pd_infos = jsonobject.loads(o.strip())
+        controllers = pd_infos["Controllers"]
+        for controller in controllers:
+            command_status = controller["Command Status"]
+            status_data = command_status.to_dict()
+            status = status_data.get("Status")
+            if status != "Success":
+                description = status_data.get("Description", "")
+                logger.warn("skip physical disk change check because storcli query failed, "
+                            "controller[%s], status[%s], description[%s]" %
+                            (status_data.get("Controller", ""), status, description))
+                return metrics.values()
+    except Exception as ex:
+        logger.warn("skip physical disk change check because storcli response is invalid: %s" % ex)
+        return metrics.values()
+
+    for controller in controllers:
         controller_id = controller["Command Status"]["Controller"]
-        data = controller["Response Data"]
+        try:
+            data = controller["Response Data"]
+        except Exception:
+            logger.warn("skip physical disk change check because storcli response data is missing")
+            return metrics.values()
+        if data is None:
+            logger.warn("skip physical disk change check because storcli response data is empty")
+            return metrics.values()
         for attr in dir(data):
             match = re.match(r"^Drive /c%s/e(\d+)/s(\d+)$" % controller_id, attr)
             if not match:
@@ -836,11 +911,22 @@ def collect_ssd_state():
     return metrics.values()
 
 
+HARDWARE_COLLECTION_TIMEOUT = 30
+
+
+def _collect_hardware_command(command, deadline):
+    remaining = deadline - monotonic_time()
+    if remaining <= 0:
+        return shell.TIMEOUT_EXIT_CODE, ''
+    return bash_ro("timeout -k 5s %.3fs %s" % (max(0.001, remaining), command), pipe_fail=True)
+
+
 collect_equipment_state_last_time = None
 collect_equipment_state_last_result = None
 
 
 def collect_ipmi_state():
+    deadline = monotonic_time() + HARDWARE_COLLECTION_TIMEOUT
     metrics = {
         'power_supply': GaugeMetricFamily('power_supply',
                                           'power supply', None, ['ps_id']),
@@ -862,10 +948,10 @@ def collect_ipmi_state():
         return collect_equipment_state_last_result
 
     # get ipmi status
-    metrics['ipmi_status'].add_metric([], bash_r("ipmitool mc info"))
+    metrics['ipmi_status'].add_metric([], _collect_hardware_command("ipmitool mc info", deadline)[0])
 
     # get cpu info
-    r, cpu_temps = bash_ro("sensors")
+    r, cpu_temps = _collect_hardware_command("sensors", deadline)
     if r == 0:
         count = 0
         for info in cpu_temps.splitlines():
@@ -884,7 +970,7 @@ def collect_ipmi_state():
                     count = count + 1
 
     # get cpu status
-    r, cpu_infos = bash_ro("hd_ctl -c cpu")
+    r, cpu_infos = _collect_hardware_command("hd_ctl -c cpu", deadline)
     if r == 0:
         infos = jsonobject.loads(cpu_infos)
         for info in infos:
@@ -902,7 +988,7 @@ def collect_ipmi_state():
                 send_cpu_status_alarm_to_mn(cpu_id, info.Status)
                 
     # get physical memory info
-    r, memory_infos = bash_ro("hd_ctl -c memory")
+    r, memory_infos = _collect_hardware_command("hd_ctl -c memory", deadline)
     if r == 0:
         memory_locator_list = collect_memory_locator()
         infos = jsonobject.loads(memory_infos)
@@ -929,7 +1015,7 @@ def collect_ipmi_state():
 
     # get fan info
     origin_fan_flag = False
-    r, fan_infos = bash_ro("hd_ctl -c fan")
+    r, fan_infos = _collect_hardware_command("hd_ctl -c fan", deadline)
     if r == 0:
         infos = jsonobject.loads(fan_infos)
         for info in infos.fan_list:
@@ -1136,6 +1222,7 @@ def get_power_info_from_ipmi(sensor_info, metrics):
 
 
 def collect_equipment_state_from_ipmi():
+    deadline = monotonic_time() + HARDWARE_COLLECTION_TIMEOUT
     metrics = {
         'power_supply': GaugeMetricFamily('power_supply', 'power supply', None, ['ps_id']),
         "power_supply_current_output_power": GaugeMetricFamily('power_supply_current_output_power',
@@ -1151,7 +1238,7 @@ def collect_equipment_state_from_ipmi():
     if is_virtual_machine():
         return metrics.values()
 
-    metrics['ipmi_status'].add_metric([], bash_r("ipmitool mc info"))
+    metrics['ipmi_status'].add_metric([], _collect_hardware_command("ipmitool mc info", deadline)[0])
 
     '''
         ================
@@ -1205,13 +1292,14 @@ def collect_equipment_state_from_ipmi():
 
 
 def collect_equipment_state():
+    deadline = monotonic_time() + HARDWARE_COLLECTION_TIMEOUT
     metrics = {
         'power_supply': GaugeMetricFamily('power_supply',
                                           'power supply', None, ['ps_id']),
         'ipmi_status': GaugeMetricFamily('ipmi_status', 'ipmi status', None, []),
     }
 
-    r, ps_info = bash_ro("ipmitool sdr type 'power supply'")  # type: (int, str)
+    r, ps_info = _collect_hardware_command("ipmitool sdr type 'power supply'", deadline)  # type: (int, str)
     if r == 0:
         for info in ps_info.splitlines():
             info = info.strip()
@@ -1219,7 +1307,7 @@ def collect_equipment_state():
             health = 10 if "fail" in info.lower() or "lost" in info.lower() else 0
             metrics['power_supply'].add_metric([ps_id], health)
 
-    metrics['ipmi_status'].add_metric([], bash_r("ipmitool mc info"))
+    metrics['ipmi_status'].add_metric([], _collect_hardware_command("ipmitool mc info", deadline)[0])
     return metrics.values()
 
 
@@ -1282,6 +1370,23 @@ def collect_vm_statistics():
         collect(pid_vm_map.keys()[i:i + n])
 
     return metrics.values()
+
+
+def collect_vm_host_performance_statistics():
+    """Collect interval VM/host metrics exposed by the KVM hypervisor.
+
+    The stateful collector establishes a counter baseline on its first run.
+    Keep the previous successful result when libvirt or procfs is temporarily
+    unavailable, matching the existing asynchronous collector behaviour.
+    Memory and co-stop metrics are intentionally not exported here.
+    """
+    global vm_performance_last_result
+    try:
+        result = list(vm_performance_collector.collect())
+        vm_performance_last_result = result
+    except Exception as ex:
+        logger.warn("failed to collect VM/host performance metrics: %s" % ex)
+    return vm_performance_last_result
 
 
 # since Cloud 4.5.0, Because GetVmGuestToolsAction calls are too frequent,
@@ -2041,34 +2146,39 @@ def collect_kvmagent_memory_statistics():
     return metrics.values()
 
 
-kvmagent.register_prometheus_collector(collect_host_network_statistics)
-kvmagent.register_prometheus_collector(collect_host_capacity_statistics)
-kvmagent.register_prometheus_collector(collect_vm_statistics)
-kvmagent.register_prometheus_collector(collect_vm_pvpanic_enable_in_domain_xml)
-kvmagent.register_prometheus_collector(collect_node_disk_wwid)
-kvmagent.register_prometheus_collector(collect_host_conntrack_statistics)
-kvmagent.register_prometheus_collector(collect_physical_network_interface_state)
-kvmagent.register_prometheus_collector(collect_memory_overcommit_statistics)
-kvmagent.register_prometheus_collector(collect_kvmagent_memory_statistics)
+def _register_metric_collector(collector):
+    prometheus_registration.register_callback_once(kvmagent.register_prometheus_collector, collector)
+
+
+_register_metric_collector(collect_host_network_statistics)
+_register_metric_collector(collect_host_capacity_statistics)
+_register_metric_collector(collect_vm_statistics)
+_register_metric_collector(collect_vm_host_performance_statistics)
+_register_metric_collector(collect_vm_pvpanic_enable_in_domain_xml)
+_register_metric_collector(collect_node_disk_wwid)
+_register_metric_collector(collect_host_conntrack_statistics)
+_register_metric_collector(collect_physical_network_interface_state)
+_register_metric_collector(collect_memory_overcommit_statistics)
+_register_metric_collector(collect_kvmagent_memory_statistics)
 
 if misc.isMiniHost():
-    kvmagent.register_prometheus_collector(collect_lvm_capacity_statistics)
-    kvmagent.register_prometheus_collector(collect_mini_raid_state)
-    kvmagent.register_prometheus_collector(collect_equipment_state)
+    _register_metric_collector(collect_lvm_capacity_statistics)
+    _register_metric_collector(collect_mini_raid_state)
+    _register_metric_collector(collect_equipment_state)
 
 if misc.isHyperConvergedHost():
-    kvmagent.register_prometheus_collector(collect_ipmi_state)
+    _register_metric_collector(collect_ipmi_state)
 elif is_support_bmc():
-    kvmagent.register_prometheus_collector(collect_equipment_state_from_ipmi)
+    _register_metric_collector(collect_equipment_state_from_ipmi)
 
-kvmagent.register_prometheus_collector(collect_raid_state)
-kvmagent.register_prometheus_collector(collect_ssd_state)
-kvmagent.register_prometheus_collector(collect_nvidia_gpu_status)
-kvmagent.register_prometheus_collector(collect_amd_gpu_status)
-kvmagent.register_prometheus_collector(collect_hy_gpu_status)
-kvmagent.register_prometheus_collector(collect_block_device_status)
-kvmagent.register_prometheus_collector(collect_hba_port_device_state)
-kvmagent.register_prometheus_collector(collect_disk_stat)
+_register_metric_collector(collect_raid_state)
+_register_metric_collector(collect_ssd_state)
+_register_metric_collector(collect_nvidia_gpu_status)
+_register_metric_collector(collect_amd_gpu_status)
+_register_metric_collector(collect_hy_gpu_status)
+_register_metric_collector(collect_block_device_status)
+_register_metric_collector(collect_hba_port_device_state)
+_register_metric_collector(collect_disk_stat)
 
 class PrometheusPlugin(kvmagent.KvmAgent):
 
@@ -2320,11 +2430,13 @@ modules:
             if "collectd_exporter" in cmd.binaryPath:
                 start_collectd_exporter(cmd)
             elif "ipmi_exporter" in cmd.binaryPath:
-                if not is_virtual_machine() and is_support_bmc():
-                    start_ipmi_exporter(cmd)
-                else:
+                if is_virtual_machine():
                     logger.info("Current environment is a virtualized environment, skipping ipmi_exporter startup")
                     continue
+                if not is_support_bmc():
+                    logger.info("BMC capability probe failed, skipping ipmi_exporter startup")
+                    continue
+                start_ipmi_exporter(cmd)
             else:
                 start_exporter(cmd)
 
@@ -2415,7 +2527,9 @@ modules:
                 Collector.__store_cache__(collectStartTime, ret)
                 return ret
 
-        REGISTRY.register(Collector())
+        if not prometheus_registration.register_once(
+                REGISTRY, Collector(), "kvmagent-prometheus-exporter"):
+            logger.warn("prometheus collector has already been installed, skip duplicate registration")
 
 
     @thread.AsyncThread

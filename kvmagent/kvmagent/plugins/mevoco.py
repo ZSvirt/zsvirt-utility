@@ -3,6 +3,7 @@ __author__ = 'frank'
 from kvmagent import kvmagent
 from kvmagent.plugins import network_plugin
 from zstacklib.utils import jsonobject
+from zstacklib.utils import openstack_userdata
 from zstacklib.utils import http
 from zstacklib.utils import log
 from zstacklib.utils import shell
@@ -18,6 +19,7 @@ from zstacklib.utils import thread
 import os.path
 import re
 import email
+import json
 import tempfile
 import cStringIO as c
 from email.mime.multipart import MIMEMultipart
@@ -1877,14 +1879,10 @@ mimetype.assign = (
 
         conf_folder = os.path.join(self.USERDATA_ROOT, to.namespaceName)
         http_root = os.path.join(conf_folder, 'html')
-        meta_data_json = '''\
-{
-    "uuid": "{{vmInstanceUuid}}"
-}'''
-        tmpt = Template(meta_data_json)
-        conf = tmpt.render({
-            'vmInstanceUuid': to.metadata.vmUuid
-        })
+        metadata = {'uuid': to.metadata.vmUuid}
+        if to.metadata.vmHostname:
+            metadata['hostname'] = to.metadata.vmHostname
+        conf = json.dumps(metadata)
 
         root = os.path.join(http_root, to.vmIp)
         meta_root = os.path.join(root, 'meta-data')
@@ -1912,13 +1910,17 @@ mimetype.assign = (
             with open(userdata_file_path, 'w') as fd:
                 fd.write(packUserdata(to.userdataList))
 
+            admin_password, windows_userdata = openstack_userdata.prepare(to.userdataList)
+            if admin_password is not None:
+                metadata['admin_pass'] = admin_password
+            conf = json.dumps(metadata)
             windows_meta_data_json_path = os.path.join(root, 'meta_data.json')
             with open(windows_meta_data_json_path, 'w') as fd:
                 fd.write(conf)
 
             windows_userdata_file_path = os.path.join(root, 'user_data')
             with open(windows_userdata_file_path, 'w') as fd:
-                fd.write(packUserdata(to.userdataList))
+                fd.write(windows_userdata)
 
             windows_meta_data_password = os.path.join(root, 'password')
             with open(windows_meta_data_password, 'w') as fd:

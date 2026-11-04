@@ -4,9 +4,13 @@ import os
 import os.path
 import platform
 import json
+import socket
+from contextlib import closing
 
 from kvmagent import kvmagent
+from kvmagent.plugins import volume_secret
 from zstacklib.utils import jsonobject
+from zstacklib.utils import rollback
 from zstacklib.utils import shell
 from zstacklib.utils import traceable_shell
 from zstacklib.utils.bash import bash_progress_1, in_bash, bash_r, bash_roe
@@ -22,6 +26,7 @@ class ImageStoreClient(object):
     ZSTORE_CLI_BIN = "/usr/local/zstack/imagestore/bin/zstcli"
     ZSTORE_CLI_PATH = ZSTORE_CLI_BIN + " -rootca /var/lib/zstack/imagestorebackupstorage/package/certs/ca.pem"
     ZSTORE_DEF_PORT = 8000
+    KEY_AGENT_PROVIDER = "unix:///var/run/key-agent/key-agent.sock"
 
     UPLOAD_BIT_PATH = "/imagestore/upload"
     DOWNLOAD_BIT_PATH = "/imagestore/download"
@@ -48,8 +53,19 @@ class ImageStoreClient(object):
     def _build_install_path(self, name, imgid):
         return "{0}{1}/{2}".format(self.ZSTORE_PROTOSTR, name, imgid)
 
-    def upload_image(self, hostname, fpath, concurrency=None):
-        imf = self.commit_image(fpath)
+    def change_backup_encryption(self, request):
+        args_file = self._write_json_temp_file(request)
+        try:
+            cmdstr = '%s -url %s:%s bakconvert -args-json-file %s -secret-channel-provider %s' % (
+                self.ZSTORE_CLI_BIN, request['bsAgentHost'], request['bsAgentPort'],
+                linux.shellquote(args_file), self.KEY_AGENT_PROVIDER)
+            output = shell.call(cmdstr)
+        finally:
+            linux.rm_file_force(args_file)
+        return json.loads(output)['installPaths']
+
+    def upload_image(self, hostname, fpath, concurrency=None, encryption_spec=None):
+        imf = self.commit_image(fpath, encryption_spec)
 
         extra_param = ""
         if concurrency and concurrency > 1:
@@ -62,11 +78,20 @@ class ImageStoreClient(object):
 
         return imf
 
-    def commit_image(self, fpath):
-        cmdstr = '%s -json add -file %s' % (self.ZSTORE_CLI_PATH, fpath)
+    def commit_image(self, fpath, encryption_spec=None):
+        args_file = None
+        encryption_option = ''
+        if encryption_spec:
+            args_file = self._write_json_temp_file(encryption_spec)
+            encryption_option = ' -encryption-json-file %s -secret-channel-provider %s' % (
+                args_file, self.KEY_AGENT_PROVIDER)
+
+        cmdstr = '%s -json add -file %s%s' % (self.ZSTORE_CLI_PATH, fpath, encryption_option)
         logger.debug('adding %s to local image store' % fpath)
         output = shell.call(cmdstr.encode(encoding="utf-8"))
         logger.debug('%s added to local image store' % fpath)
+        if args_file:
+            linux.rm_file_force(args_file)
 
         return jsonobject.loads(output.splitlines()[-1])
 
@@ -131,12 +156,17 @@ class ImageStoreClient(object):
                 raise Exception('fail to mirror volume %s, because %s' % (vm, str(err)))
 
     def cbt_backup_volume(self, vm, volume_infos, bitmapTimestamp, portRange):
+        def _find_target_disk(volume):
+            if volume.deviceType == 'cbd':
+                return vm._get_target_disk_by_path(volume.installPath)
+            return vm._get_target_disk(volume)
+
         def _parse_json_and_update_mode(volume_infos, json_data):
             json_list = json.loads(json_data)
             infos = []
 
             for info in volume_infos:
-                target_disk, _ = vm._get_target_disk(info.volume)
+                target_disk, _ = _find_target_disk(info.volume)
                 node_name = self.get_disk_device_name(target_disk)
                 for item in json_list:
                     if item['device'] == node_name:
@@ -151,7 +181,7 @@ class ImageStoreClient(object):
 
         volumes = ""
         for volume_info in volume_infos:
-            target_disk, _ = vm._get_target_disk(volume_info.volume)
+            target_disk, _ = _find_target_disk(volume_info.volume)
             node_name = self.get_disk_device_name(target_disk)
 
             target_install_path = volume_info.target
@@ -161,11 +191,17 @@ class ImageStoreClient(object):
         with linux.ShowLibvirtErrorOnException(vm):
             cmdstr = '%s cbtbak -domain %s -volumes "%s" -bitmap "%s" -portrange "%s" > %s' % \
                      (self.ZSTORE_CLI_PATH, vm.uuid, volumes, bitmapTimestamp, portRange, PFILE)
-            shell.call(cmdstr)
+            shell_cmd = shell.ShellCmd(cmdstr)
+            shell_cmd(False)
             with open(PFILE) as fd:
                 linux.rm_file_force(PFILE)
                 json_data = fd.read()
-                return  _parse_json_and_update_mode(volume_infos, json_data)
+            infos = _parse_json_and_update_mode(volume_infos, json_data) if json_data else []
+            if shell_cmd.return_code != 0:
+                shell_cmd.raise_error()
+            if not json_data:
+                raise Exception('cbtbak returned empty result')
+            return infos
 
     def stop_vm_cbt_backup_jobs(self, vm, records, force=False):
         infos = ""
@@ -177,6 +213,27 @@ class ImageStoreClient(object):
         with linux.ShowLibvirtErrorOnException(vm):
             cmdstr = '%s stopcbtbak -force=%s -domain %s -volumes "%s" -bitmap "%s"' % \
                      (self.ZSTORE_CLI_PATH, force, vm, infos, bitmapName)
+            return shell.call(cmdstr).strip()
+
+    def rollback_vm_cbt_backup_jobs(self, vm, records):
+        infos = ""
+        previous_bitmap = ""
+        new_bitmap = ""
+        for record in records:
+            if not getattr(record, 'scratchNodeName', None):
+                continue
+            infos += ",".join([record.scratchNodeName, record.target, record.mode]) + ";"
+            if record.lastBitmapName:
+                previous_bitmap = record.lastBitmapName
+            if record.bitmapName:
+                new_bitmap = record.bitmapName
+        if not infos:
+            return
+        if not new_bitmap:
+            raise ValueError("missing new bitmap for CBT rollback")
+        with linux.ShowLibvirtErrorOnException(vm):
+            cmdstr = '%s stopcbtbak -rollback=true -domain %s -volumes "%s" -bitmap "%s" -newbitmap "%s"' % \
+                     (self.ZSTORE_CLI_PATH, vm, infos, previous_bitmap, new_bitmap)
             return shell.call(cmdstr).strip()
 
     def query_vm_mirror_latencies_boundary(self, vm, times):
@@ -216,7 +273,32 @@ class ImageStoreClient(object):
                             break
             return vm, maxInfoMap, minInfoMap
 
+    @staticmethod
+    def _write_json_temp_file(content):
+        fd, path = tempfile.mkstemp(prefix='zstcli-backup-', suffix='.json')
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, json.dumps(content).encode('utf-8'))
+        finally:
+            os.close(fd)
+        return path
+
+    @staticmethod
+    def _check_nbd_connection(dest):
+        if not dest or not dest.startswith('nbd://'):
+            return
+
+        host, _, ports = dest[len('nbd://'):].rpartition(':')
+        host = host.strip('[]')
+        for port in ports.split(','):
+            with closing(socket.socket(socket.AF_INET6 if ':' in host else socket.AF_INET, socket.SOCK_STREAM)) as sock:
+                sock.settimeout(3)
+                if sock.connect_ex((host, int(port))) != 0:
+                    endpoint = '[%s]:%s' % (host, port) if ':' in host else '%s:%s' % (host, port)
+                    raise kvmagent.KvmError('cannot connect to NBD target %s, check the backup network' % endpoint)
+
     def backup_volume(self, vm, node, bitmap, mode, dest, point_in_time, speed, reporter, stage):
+        self._check_nbd_connection(dest)
         self.check_capacity(os.path.dirname(dest))
 
         PFILE = linux.create_temp_file()
@@ -246,9 +328,11 @@ class ImageStoreClient(object):
     # args -> (bitmap, mode, drive)
     # {'drive-virtio-disk0': { "backupFile": "foo", "mode":"full" },
     #  'drive-virtio-disk1': { "backupFile": "bar", "mode":"top" }}
-    def backup_volumes(self, vm, args, dstdir, point_in_time, reporter, stage):
+    def backup_volumes(self, vm, args, dstdir, point_in_time, reporter, stage, addons=None, device_ids=None):
+        self._check_nbd_connection(dstdir)
         self.check_capacity(dstdir)
         PFILE = linux.create_temp_file()
+        args_file = None
 
         def _get_progress(synced):
             last = linux.tail_1(PFILE).strip()
@@ -265,8 +349,12 @@ class ImageStoreClient(object):
 
             cmdstr = '%s -progress %s batbak -domain %s -destdir %s %s -args %s' % \
                      (self.ZSTORE_CLI_PATH, PFILE, vm, dstdir, p_option, ':'.join(["%s,%s,%s,%s" % x for x in args]))
+            cmdstr, args_file = volume_secret.make_backup_args_option(
+                cmdstr, args, addons, device_ids or [], self._write_json_temp_file, self.KEY_AGENT_PROVIDER)
             _, mode, err = bash_progress_1(cmdstr, _get_progress)
             linux.rm_file_force(PFILE)
+            if args_file:
+                linux.rm_file_force(args_file)
             if err:
                 self.check_capacity(dstdir)
                 raise Exception('fail to backup vm %s, because %s' % (vm, str(err)))
@@ -317,6 +405,7 @@ class ImageStoreClient(object):
         return jsonobject.dumps(rsp)
 
 
+    @rollback.rollback
     def commit_to_imagestore(self, cmd, req):
         self._check_zstore_cli()
 
@@ -325,12 +414,17 @@ class ImageStoreClient(object):
         # Synchronize cached writes for 'fpath'
         linux.sync_file(fpath)
 
+        add_ext_param, encryption_file = volume_secret.make_image_store_encryption_option(
+            getattr(cmd, 'addons', None), self._write_json_temp_file, self.KEY_AGENT_PROVIDER)
+
         # Add the image to registry
-        cmdstr = '%s -json  -callbackurl %s -taskid %s -imageUuid %s add -desc \'%s\' -file %s' % (self.ZSTORE_CLI_PATH, req[http.REQUEST_HEADER].get(http.CALLBACK_URI),
-                req[http.REQUEST_HEADER].get(http.TASK_UUID), cmd.imageUuid, cmd.description, fpath)
+        cmdstr = '%s -json  -callbackurl %s -taskid %s -imageUuid %s add %s -desc \'%s\' -file %s' % (self.ZSTORE_CLI_PATH, req[http.REQUEST_HEADER].get(http.CALLBACK_URI),
+                req[http.REQUEST_HEADER].get(http.TASK_UUID), cmd.imageUuid, add_ext_param, cmd.description, fpath)
         logger.debug('adding %s to local image store' % fpath)
         output = shell.call(cmdstr.encode(encoding="utf-8"))
         logger.debug('%s added to local image store' % fpath)
+        if encryption_file:
+            linux.rm_file_force(encryption_file)
 
         imf = jsonobject.loads(output.splitlines()[-1])
 

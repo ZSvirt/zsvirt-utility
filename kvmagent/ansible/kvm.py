@@ -7,6 +7,9 @@ import os
 import re
 from uuid import uuid4
 
+import external_plugin_layout
+import libvirt_control
+import lvm_package_transition
 from zstacklib import *
 
 # create log
@@ -22,7 +25,7 @@ proxy = ""
 sproxy = ""
 chroot_env = 'false'
 init = 'false'
-zstack_repo = 'false'
+zstack_repo = 'false'  # maybe 'false', 'zstack-mn,qemu-kvm-ev-mn' (join with ',')
 zstack_apt_source = 'false'
 chrony_servers = None
 post_url = ""
@@ -131,16 +134,16 @@ def check_nested_kvm(host_post_info):
     modprobe_arg = ModProbeArg()
     if 'intel' in host_info.cpu_info or 'zhaoxin' in host_info.cpu_info:
         # reload kvm_intel for enable nested kvm
+        command = "mkdir -p /etc/modprobe.d/ && echo 'options kvm_intel nested=1' >  /etc/modprobe.d/kvm-nested.conf"
+        run_remote_command(command, host_post_info)
         if enabled_nested_flag is False:
-            command = "mkdir -p /etc/modprobe.d/ && echo 'options kvm_intel nested=1' >  /etc/modprobe.d/kvm-nested.conf"
-            run_remote_command(command, host_post_info)
             command = "modprobe -r kvm_intel"
             run_remote_command(command, host_post_info, return_status=True)
         modprobe_arg.name = 'kvm_intel'
     elif 'amd' in host_info.cpu_info or 'hygon' in host_info.cpu_info:
+        command = "mkdir -p /etc/modprobe.d/ && echo 'options kvm_amd nested=1' >  /etc/modprobe.d/kvm-nested.conf"
+        run_remote_command(command, host_post_info)
         if enabled_nested_flag is False:
-            command = "mkdir -p /etc/modprobe.d/ && echo 'options kvm_amd nested=1' >  /etc/modprobe.d/kvm-nested.conf"
-            run_remote_command(command, host_post_info)
             command = "modprobe -r kvm_amd"
             run_remote_command(command, host_post_info, return_status=True)
         modprobe_arg.name = 'kvm_amd'
@@ -196,7 +199,7 @@ run_remote_command("rm -rf {}/*; mkdir -p /usr/local/zstack/ || true".format(kvm
 
 def install_kvm_pkg():
     def rpm_based_install():
-        os_base_dep = "bridge-utils chrony conntrack-tools cyrus-sasl-md5 device-mapper-multipath expect ipmitool iproute ipset \
+        os_base_dep = "bridge-utils chrony conntrack-tools cryptsetup cyrus-sasl-md5 device-mapper-multipath expect ipmitool iproute ipset \
                         usbredir-server iputils libvirt libvirt-client libvirt-python lighttpd lsof net-tools nfs-utils nmap openssh-clients \
                         smartmontools sshpass usbutils wget audit collectd-virt storcli nvme-cli pv rsync sed pciutils tar"
 
@@ -313,6 +316,13 @@ def install_kvm_pkg():
             _skip_list.extend(["open-iscsi"])
             _dep_list = [ pkg for pkg in dep_list.split() if pkg not in _skip_list ]
             dep_list = ' '.join(_dep_list)
+            if 'storcli' in _dep_list:
+                update_list += ' storcli'
+
+            lvm_package_transition.migrate_legacy_packages(
+                releasever, host_info.host_arch, repos_with_quote=zstack_repo,
+                skipped=_skip_list, host=host_post_info,
+                run_remote_command=run_remote_command)
 
             # name: install/update kvm related packages on RedHat based OS from user defined repo
             command = ("echo {1} >/var/lib/zstack/dependencies && yum --disablerepo=* --enablerepo={0} clean metadata >/dev/null && \
@@ -475,6 +485,8 @@ def install_kvm_pkg():
         if releasever in ['c76', 'c79', 'h76c', 'h79c', 'c74'] and "qemu-kvm" not in skip_packages:
             rpm_deprecated_list += " qemu-img-ev qemu-kvm-ev qemu-kvm-common-ev"
 
+        rpm_deprecated_list += " lvm2-help device-mapper-devel device-mapper-event-devel"
+
         for rpm in rpm_deprecated_list.split():
             yum_remove_package(rpm, host_post_info)
 
@@ -529,6 +541,12 @@ def copy_kvm_files():
         _dst = os.path.join(workplace, file)
         copy_to_remote(_src, _dst, None, host_post_info)
 
+    # Ensure cert dir exists before qemu.conf references it and libvirtd restarts.
+    command = 'test -d /etc/pki/qemu || mkdir -p /etc/pki/qemu'
+    host_post_info.post_label = "ansible.shell.mkdir"
+    host_post_info.post_label_param = "/etc/pki/qemu"
+    run_remote_command(command, host_post_info)
+
     # copy qemu configration file
     qemu_conf_src = os.path.join(file_root, "qemu.conf")
     qemu_conf_dst = "/etc/libvirt/qemu.conf"
@@ -577,6 +595,21 @@ def copy_kvm_files():
     kvmagt_svc_dst = "/etc/init.d/"
     args = "mode=755"
     copy_to_remote(kvmagt_svc_src, kvmagt_svc_dst, args, host_post_info)
+
+    # The external loader treats a missing registry as an empty registry, but
+    # managed plugin deployment requires the fixed root to exist before its
+    # read-only preflight can validate ownership and permissions.
+    external_plugin_layout.install_registry_root(
+        host_post_info, run_remote_command)
+
+    # Order KVM Agent after the active libvirt control endpoint without making
+    # a permanent libvirt failure prevent the base Agent from starting.  The
+    # loader still performs bounded readiness checks because After=/Wants=
+    # only order unit activation; they do not prove API readiness.
+    if ((host_info.distro in RPM_BASED_OS and host_info.major_version >= 7)
+            or host_info.distro in DEB_BASED_OS):
+        libvirt_control.install_ordering_dropin(
+            file_root, host_post_info, run_remote_command, copy_to_remote)
 
     # copy sysctl file
     sysctl_src = os.path.join(file_root, "sysctl")

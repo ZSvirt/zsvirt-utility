@@ -40,7 +40,7 @@ class NvRamVmExtensions(object):
         else:
             raise Exception("invalid nvram_install_path: " + self.nvram_install_path)
 
-    def cleanup(self):
+    def cleanup(self, keep_default_path_nvram=False):
         if not self.vm_uuid:
             if not self.nvram_install_path:
                 raise Exception('vm_uuid and nvram_install_path in NvRamVmExtensions cannot both be empty.')
@@ -57,9 +57,18 @@ class NvRamVmExtensions(object):
             logger.debug("skip nvram cleanup: cannot determine vm_uuid from install path %s" % self.nvram_install_path)
             return
 
-        # if save in nvram/{vm_uuid}.fd, it will be deleted
-        fd_path = "/var/lib/libvirt/qemu/nvram/%s.fd" % self.vm_uuid
-        linux.rm_file_checked(fd_path)
+        # Under /var/lib/libvirt/qemu/nvram/:
+        #   <uuid>.fd: ordinary UEFI without TPM or Secure Boot.
+        #   <uuid>-host-files/<uuid>.fd: managed NVRAM for TPM/Secure Boot.
+        # This flag only controls deletion of the first file. Keep it during
+        # startup preparation and on stop so boot entries survive restarts and
+        # recycle-bin recovery; clean it on permanent deletion instead.
+        # Recreating it from the firmware template loses guest boot entries,
+        # which can prevent booting if the guest has no EFI fallback loader.
+        # Managed host-file marking and volume cleanup below are unaffected.
+        if not keep_default_path_nvram:
+            fd_path = "/var/lib/libvirt/qemu/nvram/%s.fd" % self.vm_uuid
+            linux.rm_file_checked(fd_path)
 
         # for NvRam host file
         NvRamHostFile().cleanup(self.vm_uuid)
@@ -113,6 +122,7 @@ class NvRamHostFile(object):
         if not os.path.isdir(token_dir):
             return
         timestamp_ms = int(time.time() * 1000)
+        # The timestamp may be overwritten by expunge or Direct deletion.
         with open(token_path, 'w') as fs:
             fs.write('%d\n' % timestamp_ms)
             logger.debug('add nvram delete token with timestamp %d in %s' % (timestamp_ms, token_path))

@@ -252,7 +252,8 @@ class VmConfigPlugin(kvmagent.KvmAgent):
 
         # configure windows by zs-tools
         if qga.os == VmQga.VM_OS_WINDOWS:
-            ret, msg = qga.guest_exec_zs_tools(operate='net', config=jsonobject.dumps(nic_params))
+            with lock.NamedLock('qga-network-%s' % vm_uuid):
+                ret, msg = qga.guest_exec_zs_tools(operate='net', config=jsonobject.dumps(nic_params))
             if ret != 0:
                 logger.debug("config vm {} ports by qga failed, detail info {}".format(vm_uuid, msg))
             return ret, msg

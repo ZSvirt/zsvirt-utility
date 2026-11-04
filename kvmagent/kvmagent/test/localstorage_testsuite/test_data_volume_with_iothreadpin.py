@@ -29,6 +29,12 @@ class TestVolumeWithIoThreadPin(TestCase, vm_utils.VmPluginTestStub):
     def setUpClass(cls):
         network_utils.create_default_bridge_if_not_exist()
 
+    @linux.retry(times=2, sleep_time=1)
+    def _detach_volume_from_vm_with_retry(self, vm_uuid, volume):
+        rsp = vm_utils.detach_volume_from_vm(vm_uuid, volume)
+        self.assertTrue(rsp.success, rsp.error)
+        return rsp
+
     @pytest.mark.run(order=1)
     @pytest_utils.ztest_decorater
     def test_virtio_volum(self):
@@ -74,8 +80,7 @@ class TestVolumeWithIoThreadPin(TestCase, vm_utils.VmPluginTestStub):
         vm_utils.set_iothread_pin(self.vm_uuid, self.iothread_id, self.iothread_pin)
 
         logger.info("run test: detach data volume with iothreadpin")
-        rsp = vm_utils.detach_volume_from_vm(self.vm_uuid, self.vol)
-        self.assertTrue(rsp.success)
+        self._detach_volume_from_vm_with_retry(self.vm_uuid, self.vol)
         xml = vm_utils.get_vm_xmlobject_from_virsh_dump(self.vm_uuid)
         vol_xml = volume_utils.find_volume_in_vm_xml_by_path(xml, self.vol_path)
         self.assertIsNone(vol_xml)
@@ -220,8 +225,7 @@ class TestVolumeWithIoThreadPin(TestCase, vm_utils.VmPluginTestStub):
         self.check_volume_iothread_pin(vm_uuid, virtio_vol_path, virtio_vol_iothread_id)
         self.check_virtio_scsi_volume_config(vm_uuid, virtio_scsi_vol_path, virtio_scsi_vol_iothread_id)
 
-        rsp = vm_utils.detach_volume_from_vm(vm_uuid, virtio_vol)
-        self.assertTrue(rsp.success)
+        self._detach_volume_from_vm_with_retry(vm_uuid, virtio_vol)
         xml = vm_utils.get_vm_xmlobject_from_virsh_dump(vm_uuid)
         vol_xml = volume_utils.find_volume_in_vm_xml_by_path(xml, virtio_vol_path)
         self.assertIsNone(vol_xml)

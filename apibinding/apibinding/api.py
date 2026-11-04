@@ -4,6 +4,7 @@
 '''
 import os
 import time
+from numbers import Integral
 from zstacklib.utils import jsonobject
 from zstacklib.utils import log
 from zstacklib.utils import http
@@ -86,7 +87,8 @@ class Api(object):
             logger.warn(
                 'Logout session[uuid:%s] failed:\n%s' % (session_uuid, error_code_to_string(reply.error)))
 
-    def async_call_wait_for_complete(self, apicmd, apievent=None, exception_on_error=True, interval=500, fail_soon=False):
+    def async_call_wait_for_complete(self, apicmd, apievent=None, exception_on_error=True, interval=500, fail_soon=False, wait_timeout=None):
+        """wait_timeout is a local budget in milliseconds, never a message field."""
         # try to find event class from inventory.py for masking sensitive fields
         def create_event(apicmd):
             if not apicmd:
@@ -116,6 +118,10 @@ class Api(object):
         timeout = apicmd.timeout
         if not timeout:
             timeout = 1800000
+        if wait_timeout is not None:
+            if isinstance(wait_timeout, bool) or not isinstance(wait_timeout, Integral) or wait_timeout <= 0:
+                raise ApiError('wait_timeout must be a positive integer in milliseconds')
+            timeout = wait_timeout
         cmd = {apicmd.FULL_NAME: apicmd}
         log_cmd = '{"%s": "%s"}' % (apicmd.FULL_NAME, log.mask_sensitive_field(apicmd, jsonobject.dumps(apicmd)))
         logger.debug("async call[url: %s, request: %s]" % (self.api_url, log_cmd))
@@ -137,8 +143,11 @@ class Api(object):
             rsp = self._get_response(ret_uuid)
             curr += interval
 
-        if curr >= timeout:
-            raise ApiError('API call[%s] timeout after %dms' % (apicmd.FULL_NAME, curr))
+        if rsp.state != 'Done':
+            raise ApiError('Client wait timeout for API[%s] after %dms; job[uuid:%s], '
+                           'last state[%s]. The background task may still be running; '
+                           'query its result at %s%s' %
+                           (apicmd.FULL_NAME, curr, ret_uuid, rsp.state, self.api_result_url, ret_uuid))
 
         logger.debug("async call[url: %s, response: %s] after %dms" % (self.api_url, mask_result(apievent, rsp.result), curr))
         reply = jsonobject.loads(rsp.result)

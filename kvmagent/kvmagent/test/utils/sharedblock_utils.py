@@ -20,7 +20,7 @@ def sharedblock_ping(vgUuid):
     }))
 
 @misc.return_jsonobject()
-def shareblock_connect(sharedBlockUuids=None, allSharedBlockUuids=None, vgUuid=None,hostId=None,hostUuid=None, forceWipe=True, isFirst=True):
+def shareblock_connect(sharedBlockUuids=None, allSharedBlockUuids=None, vgUuid=None,hostId=None,hostUuid=None, forceWipe=True, isFirst=True, ioTimeout=5):
     return get_sharedblock_plugin().connect(misc.make_a_request({
         "sharedBlockUuids":sharedBlockUuids, # [], ls /dev/disk/by-id -l|grep scsi
         "allSharedBlockUuids":allSharedBlockUuids,
@@ -29,7 +29,8 @@ def shareblock_connect(sharedBlockUuids=None, allSharedBlockUuids=None, vgUuid=N
         "hostUuid": hostUuid,
         "forceWipe": forceWipe,
         "primaryStorageUuid":vgUuid,
-        "isFirst":isFirst
+        "isFirst":isFirst,
+        "ioTimeout":ioTimeout
     }))
 
 @misc.return_jsonobject()
@@ -225,14 +226,15 @@ def sharedblock_add_disk(vgUuid=None, hostUuid=None, diskUuid=None, allSharedBlo
     }))
 
 @misc.return_jsonobject()
-def sharedblock_migrate_volumes(vgUuid=None, hostUuid=None, migrateVolumeStructs=None, provisioning=None, volumePath=None, addons={}):
+def sharedblock_migrate_volumes(vgUuid=None, hostUuid=None, migrateVolumeStructs=None, provisioning=None, volumePath=None, addons={}, kvmHostAddons={}):
     return get_sharedblock_plugin().migrate_volumes(misc.make_a_request({
         "vgUuid": vgUuid ,# random uuid
         "hostUuid": hostUuid,
         "migrateVolumeStructs":migrateVolumeStructs,
         "provisioning":provisioning,
         "addons":addons,
-        "volumePath":volumePath
+        "volumePath":volumePath,
+        "kvmHostAddons":kvmHostAddons
     }))
 
 @misc.return_jsonobject()

@@ -443,6 +443,13 @@ def _write_summary_best_effort(summary_path, vm_uuid, vm_name='', vm_category=''
 
 IMAGECACHE_DIR_MARKER = '/imagecache/'
 REBASE_LOCK_SUFFIX = '.vmmeta-lck'
+NFS_MANAGED_PATH_DIRS = frozenset((
+    'rootVolumes',
+    'dataVolumes',
+    'volumeSnapshots',
+    'memory',
+    'imagecache',
+))
 
 
 def _is_imagecache_path(path):
@@ -461,11 +468,63 @@ def _get_rebase_lock_path(image_path):
     return base + REBASE_LOCK_SUFFIX
 
 
-def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
+def _resolve_historical_nfs_backing_path(backing_path, new_prefix):
+    """Map a backing path from a historical sibling NFS mount to new_prefix."""
+    backing_path = os.path.normpath(backing_path)
+    new_prefix = os.path.normpath(new_prefix)
+    mount_parent = os.path.dirname(new_prefix)
+    parent_prefix = mount_parent + os.sep
+    if not backing_path.startswith(parent_prefix):
+        return None
+
+    relative_to_parent = backing_path[len(parent_prefix):]
+    parts = relative_to_parent.split(os.sep)
+    if len(parts) < 3:
+        return None
+    if not parts[0].startswith('prim-'):
+        return None
+    if parts[1] not in NFS_MANAGED_PATH_DIRS:
+        return None
+
+    return os.path.join(new_prefix, *parts[1:])
+
+
+def nfs_qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
+    """Rebase complete NFS chains onto the current managed mount.
+
+    NFS metadata and qcow2 headers can carry different historical ``prim-*``
+    mount prefixes. Preserve each managed relative path, but require every root
+    and backing file to resolve below the current mount before returning.
+    """
+    file_paths = list(file_paths)
+    current_prefix = os.path.normpath(new_prefix) + os.sep
+    for file_path in file_paths:
+        normalized_path = os.path.normpath(file_path)
+        if not normalized_path.startswith(current_prefix):
+            raise Exception(
+                "cannot rebase NFS backing chain: root file %s is outside current "
+                "storage prefix %s" % (normalized_path, current_prefix))
+        if not os.path.exists(normalized_path):
+            raise Exception(
+                "cannot rebase NFS backing chain: root file %s does not exist" %
+                normalized_path)
+    return qcow2_prefix_rebase_backing_files(
+        file_paths,
+        old_prefix,
+        new_prefix,
+        backing_path_resolver=_resolve_historical_nfs_backing_path,
+        fail_on_incomplete=True)
+
+
+def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix,
+                                      backing_path_resolver=None,
+                                      fail_on_incomplete=False):
     """Walk the backing chain of each qcow2 file, rebasing paths that match old_prefix to new_prefix.
 
-    For Local/NFS storage, acquires file locks on shared imagecache
-    backing files to prevent concurrent rebase races.
+    Acquires file locks on shared imagecache backing files to reduce concurrent
+    rebase races. A storage-specific resolver may map additional historical
+    backing paths. Strict callers reject an incomplete plan before mutation and
+    validate every final chain before returning.
 
     Returns the number of files successfully rebased.
     """
@@ -486,7 +545,8 @@ def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
     logger.info("[qcow2_rebase] normalized: old_prefix=%s, new_prefix=%s" % (old_prefix, new_prefix))
 
     # -- Phase 1: Discovery --------------------------------------------------
-    all_rebase_pairs = []  # [(current_path, new_backing), ...]
+    all_rebase_pairs = []  # [(current_path, old_backing, new_backing), ...]
+    planned_rebases = {}  # current_path -> (old_backing, new_backing)
     imagecache_paths = set()  # paths needing file locks
     skipped_chains = []  # [(file_path, reason), ...]
 
@@ -498,7 +558,16 @@ def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
         chain_valid = True
         depth = 0
 
-        while current and current not in visited:
+        while current:
+            if current in visited:
+                reason = "backing chain cycle detected at %s" % current
+                if fail_on_incomplete:
+                    raise Exception(
+                        "cannot rebase backing chain for %s: %s" %
+                        (file_path, reason))
+                logger.warn("[qcow2_rebase]   %s, stop walking chain for %s" %
+                            (reason, file_path))
+                break
             visited.add(current)
             backing = qcow2_get_backing_file(current)
             if not backing:
@@ -518,15 +587,37 @@ def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
 
             backing_norm = os.path.normpath(backing)
 
-            if backing_norm.startswith(old_prefix):
+            new_backing = None
+            managed_backing = backing_norm.startswith(new_prefix)
+            if managed_backing:
+                logger.debug("[qcow2_rebase]   backing already has new prefix: %s" % backing_norm)
+            elif backing_norm.startswith(old_prefix):
                 new_backing = new_prefix + backing_norm[len(old_prefix):]
-                if new_backing == backing_norm:
-                    logger.debug("[qcow2_rebase]   backing already has new prefix, skip: %s" % backing_norm)
-                    current = backing
-                    depth += 1
-                    continue
+            elif backing_path_resolver:
+                new_backing = backing_path_resolver(backing_norm, new_prefix)
+
+            if new_backing == backing_norm:
+                managed_backing = True
+                new_backing = None
+
+            if fail_on_incomplete and managed_backing and not os.path.exists(backing_norm):
+                raise Exception(
+                    "cannot rebase backing chain for %s: current backing %s does not exist" %
+                    (file_path, backing_norm))
+
+            if fail_on_incomplete and not managed_backing and not new_backing:
+                raise Exception(
+                    "cannot rebase backing chain for %s: backing %s is outside "
+                    "the current or recognized historical storage path" %
+                    (file_path, backing_norm))
+
+            if new_backing:
                 if not os.path.exists(new_backing):
                     reason = "new backing %s not exist" % new_backing
+                    if fail_on_incomplete:
+                        raise Exception(
+                            "cannot rebase backing chain for %s: %s" %
+                            (file_path, reason))
                     logger.warn("[qcow2_rebase]   %s, skip entire chain for %s" % (reason, file_path))
                     skipped_chains.append((file_path, reason))
                     chain_valid = False
@@ -534,7 +625,7 @@ def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
 
                 logger.info("[qcow2_rebase]   needs rebase: %s -> %s (on %s)"
                             % (backing_norm, new_backing, current))
-                rebase_pairs.append((current, new_backing))
+                rebase_pairs.append((current, backing_norm, new_backing))
                 # Track imagecache files for locking (use new_prefix path)
                 if _is_imagecache_path(new_backing):
                     imagecache_paths.add(new_backing)
@@ -551,7 +642,20 @@ def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
 
         if chain_valid and rebase_pairs:
             logger.info("[qcow2_rebase]   chain result: %d pairs queued for %s" % (len(rebase_pairs), file_path))
-            all_rebase_pairs.extend(rebase_pairs)
+            if fail_on_incomplete:
+                for current_path, old_backing, new_backing in rebase_pairs:
+                    planned = planned_rebases.get(current_path)
+                    candidate = (old_backing, new_backing)
+                    if planned and planned != candidate:
+                        raise Exception(
+                            "conflicting rebase targets for %s: %s and %s" %
+                            (current_path, planned, candidate))
+                    if not planned:
+                        planned_rebases[current_path] = candidate
+                        all_rebase_pairs.append(
+                            (current_path, old_backing, new_backing))
+            else:
+                all_rebase_pairs.extend(rebase_pairs)
         elif chain_valid:
             logger.info("[qcow2_rebase]   chain result: no rebase needed for %s" % file_path)
 
@@ -565,13 +669,13 @@ def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
         logger.info("[qcow2_rebase] END: nothing to rebase, return 0")
         return 0
 
-    for i, (cp, nb) in enumerate(all_rebase_pairs):
+    for i, (cp, _ob, nb) in enumerate(all_rebase_pairs):
         logger.info("[qcow2_rebase] plan[%d]: rebase %s -> new_backing %s" % (i, cp, nb))
 
     # -- Phase 2: Acquire imagecache locks ------------------------------------
     # Lock imagecache paths involved in rebase (both backing and current_path).
     lock_targets = set(imagecache_paths)
-    for current_path, _new_backing in all_rebase_pairs:
+    for current_path, _old_backing, _new_backing in all_rebase_pairs:
         if _is_imagecache_path(current_path):
             lock_targets.add(current_path)
     sorted_lock_targets = sorted(lock_targets)
@@ -591,15 +695,16 @@ def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
 
         logger.info("[qcow2_rebase] Phase2: all %d locks acquired" % len(acquired_locks))
 
-        # -- Phase 3: Execute rebases under lock ------------------------------
-        # Re-verify backing before each rebase to guard against concurrent
-        # changes that may have happened between discovery and lock acquisition.
-        logger.info("[qcow2_rebase] Phase3: executing %d rebases" % len(all_rebase_pairs))
-        for current_path, new_backing in all_rebase_pairs:
+        # -- Phase 3: Revalidate the complete plan under lock -----------------
+        # Validate every pair before the first header mutation. In strict mode
+        # one changed edge or missing target rejects the whole plan.
+        executable_rebase_pairs = []
+        for current_path, expected_old_norm, new_backing in all_rebase_pairs:
             actual_backing = qcow2_get_backing_file(current_path)
-            expected_old = old_prefix + new_backing[len(new_prefix):]
-            expected_old_norm = os.path.normpath(expected_old)
             if not actual_backing:
+                reason = "backing of %s disappeared since discovery" % current_path
+                if fail_on_incomplete:
+                    raise Exception("cannot execute rebase plan: %s" % reason)
                 logger.warn("[qcow2_rebase]   SKIP: backing of %s disappeared since discovery"
                             % current_path)
                 skipped_count += 1
@@ -610,23 +715,75 @@ def qcow2_prefix_rebase_backing_files(file_paths, old_prefix, new_prefix):
                     os.path.join(os.path.dirname(current_path), actual_backing))
             actual_norm = os.path.normpath(actual_backing)
             if actual_norm != expected_old_norm:
+                reason = "backing of %s changed since discovery (expected=%s, actual=%s)" % (
+                    current_path, expected_old_norm, actual_norm)
+                if fail_on_incomplete:
+                    raise Exception("cannot execute rebase plan: %s" % reason)
                 logger.warn("[qcow2_rebase]   SKIP: backing of %s changed since discovery "
                             "(expected=%s, actual=%s)" % (current_path, expected_old_norm, actual_norm))
                 skipped_count += 1
                 continue
             if not os.path.exists(new_backing):
+                reason = "target backing %s disappeared since discovery" % new_backing
+                if fail_on_incomplete:
+                    raise Exception("cannot execute rebase plan: %s" % reason)
                 logger.warn("[qcow2_rebase]   SKIP: target backing %s disappeared since discovery, "
                             "skip rebase for %s" % (new_backing, current_path))
                 skipped_count += 1
                 continue
+            executable_rebase_pairs.append(
+                (current_path, expected_old_norm, new_backing))
+
+        # -- Phase 4: Execute rebases under lock ------------------------------
+        logger.info("[qcow2_rebase] Phase4: executing %d rebases" % len(executable_rebase_pairs))
+        for current_path, actual_norm, new_backing in executable_rebase_pairs:
             logger.info("[qcow2_rebase]   rebasing: %s, old_backing=%s -> new_backing=%s"
                         % (current_path, actual_norm, new_backing))
             qcow2_rebase_no_check(new_backing, current_path)
+            if fail_on_incomplete:
+                actual_after = qcow2_get_backing_file(current_path)
+                if actual_after and not os.path.isabs(actual_after) and ':' not in actual_after:
+                    actual_after = os.path.normpath(
+                        os.path.join(os.path.dirname(current_path), actual_after))
+                actual_after_norm = os.path.normpath(actual_after) if actual_after else None
+                if actual_after_norm != os.path.normpath(new_backing):
+                    reason = "backing of %s was not rebased to %s (actual=%s)" % (
+                        current_path, new_backing, actual_after_norm)
+                    raise Exception("incomplete rebase plan: %s" % reason)
             rebased_count += 1
             logger.info("[qcow2_rebase]   rebased OK: %s" % current_path)
 
+        if fail_on_incomplete:
+            logger.info("[qcow2_rebase] Phase5: validating final backing chains")
+            for file_path in file_paths:
+                visited = set()
+                current = file_path
+                while current:
+                    if current in visited:
+                        raise Exception(
+                            "incomplete rebase plan: backing chain cycle detected at %s" %
+                            current)
+                    visited.add(current)
+                    backing = qcow2_get_backing_file(current)
+                    if not backing:
+                        break
+                    if not os.path.isabs(backing) and ':' not in backing:
+                        backing = os.path.normpath(
+                            os.path.join(os.path.dirname(current), backing))
+                    backing_norm = os.path.normpath(backing)
+                    if not backing_norm.startswith(new_prefix):
+                        raise Exception(
+                            "incomplete rebase plan: backing %s of %s is outside current "
+                            "storage prefix %s" %
+                            (backing_norm, current, new_prefix))
+                    if not os.path.exists(backing_norm):
+                        raise Exception(
+                            "incomplete rebase plan: backing %s of %s does not exist" %
+                            (backing_norm, current))
+                    current = backing_norm
+
     finally:
-        logger.info("[qcow2_rebase] Phase4: releasing %d locks" % len(acquired_locks))
+        logger.info("[qcow2_rebase] Phase6: releasing %d locks" % len(acquired_locks))
         for fl in reversed(acquired_locks):
             try:
                 fl.unlock()

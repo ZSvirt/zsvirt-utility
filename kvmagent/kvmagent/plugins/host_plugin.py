@@ -4,6 +4,7 @@
 '''
 import base64
 import copy
+import errno
 import hashlib
 import os
 import os.path
@@ -20,14 +21,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 import yaml
 from zstacklib.utils.compat import subprocess
+try:
+    from shlex import quote as shell_quote
+except ImportError:
+    from pipes import quote as shell_quote
 
 from kvmagent import kvmagent
 from kvmagent.plugins import vm_plugin
 from kvmagent.plugins.imagestore import ImageStoreClient
 from kvmagent.plugins.vm_file_uploader import VmFileUploader, VmFileUploadError
-from zstacklib.utils import http, lvm, ceph, form, pci, report, upload_task
+from zstacklib.utils import http, lvm, ceph, form, pci, report, upload_task, cpu_frequency
 from zstacklib.utils import qemu
 from zstacklib.utils import linux
+from zstacklib.utils.restart_fence import monotonic_time
 from zstacklib.utils import iptables
 from zstacklib.utils import iproute
 from zstacklib.utils import ebtables
@@ -83,7 +89,7 @@ KEY_AGENT_ERR_KEYS_NOT_ON_DISK = 'KEY_AGENT_KEYS_NOT_ON_DISK'
 KEY_AGENT_ERR_KEY_FILES_INTEGRITY_MISMATCH = 'KEY_AGENT_KEY_FILES_INTEGRITY_MISMATCH'
 KEY_AGENT_ERR_SECRET_NOT_FOUND = 'KEY_AGENT_SECRET_NOT_FOUND'
 
-KEY_AGENT_SUPPORTED_SECRET_PURPOSES = ('vtpm',)
+KEY_AGENT_SUPPORTED_SECRET_PURPOSES = ('vtpm', 'volume')
 
 
 def is_valid_key_agent_secret_purpose(purpose):
@@ -1096,6 +1102,7 @@ class UpdateConfigration(object):
         bash_o("modprobe vfio && modprobe vfio-pci")
 
 logger = log.get_logger(__name__)
+IPMI_COMMAND = "timeout -k 5s 30s ipmitool"
 
 
 def _run_package_post_update_hooks():
@@ -1151,6 +1158,455 @@ def _update_global_variables_for_net_config():
         netconfig.save_zsha2_vip(zsha2_config_info.dbvip)
 
 
+RPMDB_REPAIR_STALE_SECONDS = 60
+RPMDB_REPAIR_WAIT_SECONDS = 60
+RPMDB_YUM_CHECK_CMD = (
+    "timeout -k 5s 30s yum --disablerepo=* list installed >/dev/null 2>&1"
+)
+RPMDB_CHECK_CMD = "timeout -k 5s 30s rpm -qa >/dev/null 2>&1"
+
+
+def _yum_rpmdb_check():
+    return shell.run(RPMDB_YUM_CHECK_CMD) == 0
+
+
+def _rpmdb_check():
+    return shell.run(RPMDB_CHECK_CMD) == 0
+
+
+def _check_rpmdb_repair_prerequisites():
+    cmd = ("command -v timeout >/dev/null 2>&1 && "
+           "ps -eo pid=,ppid=,pgid=,stat=,etimes=,comm=,args= >/dev/null 2>&1")
+    if shell.run(cmd) != 0:
+        return False, "timeout and ps etimes are required to recover rpmdb safely"
+    return True, None
+
+
+def _remove_stale_yum_pid_files():
+    cmd = r"""
+for pid_file in /var/run/yum.pid /run/yum.pid; do
+    [ -f "$pid_file" ] || continue
+    pid="$(awk '{print $1}' "$pid_file" 2>/dev/null)"
+
+    case "$pid" in
+        ''|*[!0-9]*)
+            echo "remove malformed yum pid file: $pid_file"
+            rm -f "$pid_file" || exit 2
+            continue
+            ;;
+    esac
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "remove stale yum pid file: $pid_file"
+        rm -f "$pid_file" || exit 2
+        continue
+    fi
+
+    proc="$(ps -p "$pid" -o comm= -o args= 2>/dev/null)"
+    case "$proc" in
+        *yum*|*dnf*|*rpm*)
+            ;;
+        *)
+            echo "remove yum pid file owned by non-package process: $pid_file"
+            rm -f "$pid_file" || exit 2
+            ;;
+    esac
+done
+"""
+    r, o, e = bash_roe(cmd)
+    if r != 0:
+        return False, e or o
+    return True, None
+
+
+def _parse_package_processes(output):
+    processes = []
+    for line in output.splitlines():
+        fields = line.split(None, 4)
+        if len(fields) < 4:
+            continue
+
+        try:
+            pid = int(fields[0])
+            etimes = int(fields[2])
+        except ValueError:
+            continue
+
+        processes.append({
+            'pid': pid,
+            'stat': fields[1],
+            'etimes': etimes,
+            'comm': fields[3],
+            'args': fields[4] if len(fields) > 4 else ''
+        })
+    return processes
+
+
+def _list_package_processes():
+    cmd = r"""
+pgid="$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')"
+ps -eo pid=,ppid=,pgid=,stat=,etimes=,comm=,args= 2>/dev/null | awk \
+    -v self="$$" -v parent="$PPID" -v pgid="$pgid" '
+    {
+        pid=$1
+        ppid=$2
+        proc_pgid=$3
+        stat=$4
+        etimes=$5
+        comm=$6
+        args=""
+        for (i = 7; i <= NF; i++) {
+            args = args " " $i
+        }
+
+        if (pid == self || pid == parent || proc_pgid == pgid) {
+            next
+        }
+
+        if (comm ~ /^(yum|dnf|rpm)$/) {
+            print pid, stat, etimes, comm, args
+            next
+        }
+
+        if (comm ~ /(^|-)python[0-9.]*$/ &&
+            args ~ /(\/usr\/bin\/yum|\/bin\/yum|\/usr\/bin\/dnf|\/bin\/dnf)/) {
+            print pid, stat, etimes, comm, args
+        }
+    }'
+"""
+    r, o, e = bash_roe(cmd)
+    if r != 0:
+        return None, e or o
+    return _parse_package_processes(o), None
+
+
+def _format_package_process_pids(processes):
+    return ','.join([str(p['pid']) for p in processes])
+
+
+def _check_d_state_package_processes(processes):
+    d_state_processes = [p for p in processes if p['stat'].startswith('D')]
+    if d_state_processes:
+        return ("package manager process is in D state; rpmdb recovery requires "
+                "host reboot or manual intervention. pids: %s" %
+                _format_package_process_pids(d_state_processes))
+    return None
+
+
+def _check_young_package_processes(processes):
+    young_processes = [p for p in processes
+                       if p['etimes'] < RPMDB_REPAIR_STALE_SECONDS]
+    if young_processes:
+        return ("package manager process is still active and below stale "
+                "threshold; skip destructive rpmdb recovery. pids: %s" %
+                _format_package_process_pids(young_processes))
+    return None
+
+
+def _yum_failed_without_package_processes(processes):
+    return (not processes and _rpmdb_check(),
+            "yum cannot list installed packages but rpmdb is healthy and no "
+            "package manager process is blocking it; skip rpmdb rebuild and "
+            "check yum configuration or plugins")
+
+
+def _yum_failed_with_healthy_rpmdb(processes):
+    return (bool(processes) and _rpmdb_check(),
+            "yum cannot list installed packages because another package "
+            "manager process is running, but rpmdb is healthy; skip killing "
+            "the process and retry later. pids: %s" %
+            _format_package_process_pids(processes))
+
+
+def _core_rpmdb_is_in_use(processes):
+    if not processes:
+        return False, None
+
+    rpmdb_users, error = _list_blocking_rpmdb_users()
+    if error:
+        return False, error
+    if rpmdb_users:
+        return True, ("package manager process is using rpmdb core files; "
+                      "skip killing the process and retry later. pids: %s" %
+                      ','.join(rpmdb_users))
+    return False, None
+
+
+def _terminate_package_processes(processes):
+    if not processes:
+        return True, None
+
+    pids = ' '.join([str(p['pid']) for p in processes])
+    cmd = """
+pids="%s"
+targets=""
+for pid in $pids; do
+    proc="$(ps -p "$pid" -o comm= -o args= 2>/dev/null)" || continue
+    case "$proc" in
+        *yum*|*dnf*|*rpm*)
+            targets="$targets $pid"
+            ;;
+        *)
+            echo "skip pid no longer owned by package manager: $pid"
+            ;;
+    esac
+done
+
+[ -n "$targets" ] || exit 0
+
+echo "terminate stale package manager processes:$targets"
+kill -TERM $targets 2>/dev/null || true
+sleep 5
+
+alive=""
+for pid in $targets; do
+    kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+done
+
+if [ -n "$alive" ]; then
+    echo "force kill stale package manager processes:$alive"
+    kill -KILL $alive 2>/dev/null || true
+    sleep 2
+fi
+
+still_alive=""
+for pid in $targets; do
+    kill -0 "$pid" 2>/dev/null || continue
+    stat="$(ps -o stat= -p "$pid" 2>/dev/null)"
+    case "$stat" in
+        Z*)
+            ;;
+        *)
+            still_alive="$still_alive $pid"
+            ;;
+    esac
+done
+
+if [ -n "$still_alive" ]; then
+    echo "package manager processes are still alive after SIGKILL:$still_alive"
+    exit 2
+fi
+""" % pids
+    r, o, e = bash_roe(cmd)
+    if r != 0:
+        return False, e or o
+    return True, None
+
+
+def _list_blocking_rpmdb_users(include_lock_files=False):
+    cmd = r"""
+dbpath="$(rpm --eval '%{_dbpath}' 2>/dev/null)"
+[ -n "$dbpath" ] || exit 2
+rpmdb_python=""
+for candidate in python3 python2 python /usr/libexec/platform-python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        rpmdb_python="$candidate"
+        break
+    fi
+done
+if [ -z "$rpmdb_python" ]; then
+    echo "cannot find Python for rpmdb user scan" >&2
+    exit 2
+fi
+"$rpmdb_python" - "$dbpath" "__INCLUDE_LOCK_FILES__" "$$" "$PPID" <<'PY'
+import glob
+import os
+import sys
+
+dbpath, include_lock_files, shell_pid, parent_pid = sys.argv[1:]
+prefix = dbpath + '/'
+lock_prefix = prefix + '__db.'
+pgid = os.getpgrp()
+pids = []
+for proc in glob.glob('/proc/[0-9]*'):
+    pid = os.path.basename(proc)
+    if not pid.isdigit() or pid in (shell_pid, parent_pid):
+        continue
+    try:
+        fds = os.listdir(proc + '/fd')
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            target = os.readlink(proc + '/fd/' + fd)
+        except OSError:
+            continue
+        if not target.startswith(prefix):
+            continue
+        if include_lock_files != 'true' and target.startswith(lock_prefix):
+            continue
+        try:
+            if os.getpgid(int(pid)) == pgid:
+                break
+        except OSError:
+            pass
+        pids.append(pid)
+        break
+for pid in sorted(pids):
+    print(pid)
+PY
+""".replace("__INCLUDE_LOCK_FILES__",
+            "true" if include_lock_files else "false")
+    r, o, e = bash_roe(cmd)
+    if r != 0:
+        return None, e or o
+    return [pid for pid in o.split() if pid.isdigit()], None
+
+
+def _backup_and_rebuild_rpmdb():
+    cmd = r"""
+dbpath="$(rpm --eval '%{_dbpath}' 2>/dev/null)"
+[ -n "$dbpath" ] || exit 2
+RPMDB_BACKUP_DIR="/var/lib/zstack/rpmdb-backups"
+mkdir -p "$RPMDB_BACKUP_DIR" || exit 2
+backup_file="$RPMDB_BACKUP_DIR/rpmdb-$(date +%Y%m%d%H%M%S).tar.gz"
+
+if [ -d "$dbpath" ]; then
+    timeout -k 10s 120s tar czf "$backup_file" -C "$(dirname "$dbpath")" "$(basename "$dbpath")" || exit 2
+fi
+ls -1t "$RPMDB_BACKUP_DIR"/rpmdb-*.tar.gz 2>/dev/null | awk 'NR > 5' | xargs -r rm -f
+
+rm -f "$dbpath"/__db.* || exit 2
+timeout -k 10s 180s rpm --rebuilddb || exit 2
+timeout -k 5s 30s rpm -qa >/dev/null || exit 2
+"""
+    r, o, e = bash_roe(cmd)
+    if r != 0:
+        return False, e or o
+    return True, None
+
+
+def repair_rpmdb_if_damaged_on_host():
+    if _yum_rpmdb_check():
+        return True, None
+
+    success, error = _check_rpmdb_repair_prerequisites()
+    if not success:
+        return False, error
+
+    success, error = _remove_stale_yum_pid_files()
+    if not success:
+        return False, error
+    if _yum_rpmdb_check():
+        return True, None
+
+    processes, error = _list_package_processes()
+    if error:
+        return False, error
+
+    error = _check_d_state_package_processes(processes)
+    if error:
+        return False, error
+
+    yum_failed_without_processes, error = _yum_failed_without_package_processes(
+        processes)
+    if yum_failed_without_processes:
+        return False, error
+
+    yum_failed_with_healthy_rpmdb, error = _yum_failed_with_healthy_rpmdb(
+        processes)
+    if yum_failed_with_healthy_rpmdb:
+        return False, error
+
+    core_rpmdb_is_in_use, error = _core_rpmdb_is_in_use(processes)
+    if error:
+        return False, error
+    if core_rpmdb_is_in_use:
+        return False, error
+
+    young_processes = [p for p in processes
+                       if p['etimes'] < RPMDB_REPAIR_STALE_SECONDS]
+    if young_processes:
+        time.sleep(RPMDB_REPAIR_WAIT_SECONDS)
+        if _yum_rpmdb_check():
+            return True, None
+
+        processes, error = _list_package_processes()
+        if error:
+            return False, error
+
+        error = _check_d_state_package_processes(processes)
+        if error:
+            return False, error
+
+        yum_failed_without_processes, error = \
+            _yum_failed_without_package_processes(processes)
+        if yum_failed_without_processes:
+            return False, error
+
+        yum_failed_with_healthy_rpmdb, error = \
+            _yum_failed_with_healthy_rpmdb(processes)
+        if yum_failed_with_healthy_rpmdb:
+            return False, error
+
+        core_rpmdb_is_in_use, error = _core_rpmdb_is_in_use(processes)
+        if error:
+            return False, error
+        if core_rpmdb_is_in_use:
+            return False, error
+
+        error = _check_young_package_processes(processes)
+        if error:
+            return False, error
+
+    success, error = _terminate_package_processes(processes)
+    if not success:
+        return False, error
+
+    processes, error = _list_package_processes()
+    if error:
+        return False, error
+
+    error = _check_d_state_package_processes(processes)
+    if error:
+        return False, error
+
+    yum_failed_with_healthy_rpmdb, error = _yum_failed_with_healthy_rpmdb(
+        processes)
+    if yum_failed_with_healthy_rpmdb:
+        return False, error
+
+    core_rpmdb_is_in_use, error = _core_rpmdb_is_in_use(processes)
+    if error:
+        return False, error
+    if core_rpmdb_is_in_use:
+        return False, error
+
+    if processes:
+        return False, ("package manager processes are still running after "
+                       "stale process cleanup; skip rpmdb rebuild. pids: %s" %
+                       _format_package_process_pids(processes))
+
+    success, error = _remove_stale_yum_pid_files()
+    if not success:
+        return False, error
+
+    if _yum_rpmdb_check():
+        return True, None
+    if _rpmdb_check():
+        return False, ("yum cannot list installed packages but rpmdb is "
+                       "healthy after clearing package manager processes; "
+                       "skip rpmdb rebuild and check yum configuration or "
+                       "plugins")
+
+    rpmdb_users, error = _list_blocking_rpmdb_users(include_lock_files=True)
+    if error:
+        return False, error
+    if rpmdb_users:
+        return False, "rpmdb is still opened by processes: %s" % \
+            ','.join(rpmdb_users)
+
+    success, error = _backup_and_rebuild_rpmdb()
+    if not success:
+        return False, error
+
+    if not _yum_rpmdb_check():
+        return False, ("rpmdb repair finished but yum still cannot list "
+                       "installed packages")
+
+    return True, None
+
+
 class HostPlugin(kvmagent.KvmAgent):
     '''
     classdocs
@@ -1166,6 +1622,7 @@ class HostPlugin(kvmagent.KvmAgent):
     GET_ENVELOPE_PUBLIC_KEY_PATH = '/host/key/envelope/getEnvelopePublicKey'
     CHECK_ENVELOPE_KEY_PATH = '/host/key/envelope/checkEnvelopeKey'
     ENSURE_SECRET_PATH = '/host/key/envelope/ensureSecret'
+    WRITE_SECRET_MATERIAL_FILE_PATH = '/host/key/envelope/writeSecretMaterialFile'
     GET_SECRET_PATH = '/host/key/envelope/getSecret'
     DELETE_SECRET_PATH = '/host/key/envelope/deleteSecret'
     CHECK_FILE_ON_HOST_PATH = '/host/checkfile'
@@ -1427,6 +1884,39 @@ class HostPlugin(kvmagent.KvmAgent):
             return (None, None, details or str(e))
         except Exception as e:
             logger.debug('key-agent EnsureSecret failed: %s' % e)
+            return (None, None, str(e))
+
+    def _prepare_luks_secret_material_channel(self, encrypted_dek):
+        if not KEY_AGENT_GRPC_AVAILABLE:
+            return (None, None, 'key_agent grpc not available')
+        if not encrypted_dek:
+            return (None, None, 'encrypted_dek is required')
+        try:
+            if not os.path.exists('/var/run/key-agent/key-agent.sock'):
+                logger.debug('key-agent unix socket not found, skip PrepareLuksSecretMaterialChannel')
+                return (None, None, 'key-agent socket not found')
+            channel = grpc.insecure_channel(KEY_AGENT_UNIX_SOCKET)
+            try:
+                stub = key_agent_pb2_grpc.KeyAgentServiceStub(channel)
+                req = key_agent_pb2.PrepareLuksSecretMaterialChannelRequest(encrypted_dek=encrypted_dek)
+                resp = stub.PrepareLuksSecretMaterialChannel(req, timeout=60)
+                path = getattr(resp, 'channel_path', None) if resp else None
+                path = str(path).strip() if path else ''
+                if path:
+                    return (path, None, None)
+                return (None, None, 'key-agent PrepareLuksSecretMaterialChannel returned empty channel_path')
+            finally:
+                channel.close()
+        except grpc.RpcError as e:
+            details = e.details() if hasattr(e, 'details') and callable(getattr(e, 'details')) else str(e)
+            logger.debug('key-agent PrepareLuksSecretMaterialChannel gRPC error: %s' % details)
+            if KEY_AGENT_ERR_KEYS_NOT_ON_DISK in details:
+                return (None, KEY_AGENT_ERR_KEYS_NOT_ON_DISK, details)
+            if KEY_AGENT_ERR_KEY_FILES_INTEGRITY_MISMATCH in details:
+                return (None, KEY_AGENT_ERR_KEY_FILES_INTEGRITY_MISMATCH, details)
+            return (None, None, details or str(e))
+        except Exception as e:
+            logger.debug('key-agent PrepareLuksSecretMaterialChannel failed: %s' % e)
             return (None, None, str(e))
 
     def _get_secret_via_key_agent(self, vm_uuid, key_version, purpose, usage_instance=''):
@@ -1752,6 +2242,57 @@ class HostPlugin(kvmagent.KvmAgent):
         return jsonobject.dumps(rsp)
 
     @kvmagent.replyerror
+    def write_secret_material_file(self, req):
+        """
+        MN -> kvmagent: HPKE-sealed encryptedDek (base64); kvmagent -> key-agent PrepareLuksSecretMaterialChannel.
+        Response secFilePath is a FIFO under /tmp for qemu-img --object secret,...,file= (MN filePath on cmd is ignored).
+        """
+        rsp = kvmagent.AgentResponse()
+        if not KEY_AGENT_GRPC_AVAILABLE:
+            rsp.success = False
+            rsp.error = 'key_agent grpc not available'
+            return jsonobject.dumps(rsp)
+        try:
+            cmd = jsonobject.loads(req[http.REQUEST_BODY])
+        except Exception as e:
+            rsp.success = False
+            rsp.error = 'invalid request body: %s' % e
+            return jsonobject.dumps(rsp)
+        encrypted_dek_b64 = getattr(cmd, 'encryptedDek', None)
+        if not encrypted_dek_b64:
+            rsp.success = False
+            rsp.error = 'missing encryptedDek (non-empty)'
+            return jsonobject.dumps(rsp)
+        normalized_b64 = encrypted_dek_b64.strip()
+        if not re.match(r'^[A-Za-z0-9+/]+={0,2}$', normalized_b64) or len(normalized_b64) % 4 != 0:
+            rsp.success = False
+            rsp.error = 'encryptedDek must be valid base64'
+            return jsonobject.dumps(rsp)
+        try:
+            encrypted_dek = base64.b64decode(normalized_b64)
+            enc_again = base64.b64encode(encrypted_dek)
+            if not isinstance(enc_again, str):
+                enc_again = enc_again.decode('ascii')
+            if enc_again.rstrip('=') != normalized_b64.rstrip('='):
+                raise ValueError('non-canonical base64 input')
+        except Exception as e:
+            rsp.success = False
+            rsp.error = 'encryptedDek must be base64: %s' % e
+            return jsonobject.dumps(rsp)
+        channel_path, err_code, err_msg = self._prepare_luks_secret_material_channel(encrypted_dek)
+        if channel_path:
+            rsp.success = True
+            rsp.secFilePath = channel_path
+        else:
+            rsp.success = False
+            if err_code:
+                rsp.errorCode = err_code
+                rsp.error = err_msg or err_code
+            else:
+                rsp.error = err_msg or 'key-agent PrepareLuksSecretMaterialChannel failed'
+        return jsonobject.dumps(rsp)
+
+    @kvmagent.replyerror
     def get_secret(self, req):
         rsp = kvmagent.AgentResponse()
         if not KEY_AGENT_GRPC_AVAILABLE:
@@ -2053,23 +2594,7 @@ class HostPlugin(kvmagent.KvmAgent):
                 libvirtCapabilitiesList.append("blockcopynetworktarget")
             rsp.libvirtCapabilities = libvirtCapabilitiesList
 
-        bmc_version = shell.call("ipmitool mc info | grep 'Firmware Revision' | awk -F ':' '{print $2}'").strip()
-        rsp.bmcVersion = bmc_version if bmc_version else 'unknown'
-
-        # To see which lan the BMC is listening on, try the following (1-11), https://wiki.docking.org/index.php/Configuring_IPMI
-        for channel in range(1, 12):
-            '''     
-            example:
-            except result:         IP Address              : xxx.xxx.xxx.xxx 
-            set ipmi_address "None" when got results unexpected or happened some errors   
-            '''
-            ret, out, err = bash_roe("ipmitool lan print %s | grep -w 'IP Address'| grep -v 'Source'" % channel)
-            if ret == 0 and out != "":
-                rsp.ipmiAddress = out.split(":")[1].strip()
-                break
-            else:
-                rsp.ipmiAddress = 'None'
-                logger.debug("failed to get ipmi address from BMC lan channel [%s], because %s" % (channel, err))
+        self._collect_ipmi_info(rsp)
 
         if IS_AARCH64:
             # FIXME how to check vt of aarch64?
@@ -2140,9 +2665,10 @@ class HostPlugin(kvmagent.KvmAgent):
             host_cpu_model_name = host_cpu_info[0]
             rsp.hostCpuModelName = host_cpu_model_name
 
-            transient_cpuGHz = '%.2f' % (float(host_cpu_info[1]) / 1000)
-            static_cpuGHz_re = re.search('[0-9.]*GHz', host_cpu_model_name)
-            rsp.cpuGHz = static_cpuGHz_re.group(0)[:-3] if static_cpuGHz_re else transient_cpuGHz
+            processor_frequencies = shell.call(
+                "dmidecode -s processor-frequency", exception=False)
+            rsp.cpuGHz = cpu_frequency.get_static_cpu_ghz(
+                host_cpu_model_name, processor_frequencies)
 
             cpu_cores_per_socket = shell.call("lscpu | awk -F':' '/per socket/{print $NF}'")
             # On openeuler, lscpu otuputs 'per cluster' instead of 'per socket'
@@ -2486,6 +3012,7 @@ if __name__ == "__main__":
 
     @kvmagent.replyerror
     @in_bash
+    @lock.file_lock('/run/zstack-yum.lock', locker=lock.Flock())
     def update_os(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         exclude = "--exclude=" + cmd.excludePackages if cmd.excludePackages else ""
@@ -2549,11 +3076,17 @@ if __name__ == "__main__":
 
     @kvmagent.replyerror
     @in_bash
+    @lock.file_lock('/run/zstack-yum.lock', locker=lock.Flock())
     def update_dependency(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = UpdateDependencyRsp()
         if self.IS_YUM:
-            shell.run("yum --disablerepo=* --enablerepo=zstack-mn list >/dev/null 2>&1 || (rm -f /var/lib/rpm/_db.*; rpm --rebuilddb)")
+            success, error = repair_rpmdb_if_damaged_on_host()
+            if not success:
+                rsp.success = False
+                rsp.error = error
+                return jsonobject.dumps(rsp)
+
             releasever = kvmagent.get_host_yum_release()
             shell.run("yum remove -y qemu-kvm-tools-ev")
             yum_cmd = "export YUM0={};yum --enablerepo=* clean all && yum --disablerepo=* --enablerepo={} install `cat /var/lib/zstack/dependencies` -y"\
@@ -2805,10 +3338,42 @@ done
         return jsonobject.dumps(rsp)
 
 
+    def _collect_ipmi_info(self, rsp):
+        deadline = monotonic_time() + 30
+
+        def collect(arguments):
+            remaining = deadline - monotonic_time()
+            if remaining <= 0:
+                return shell.TIMEOUT_EXIT_CODE, '', 'IPMI discovery budget exhausted'
+            return bash_roe("timeout -k 5s %.3fs ipmitool %s" % (max(0.001, remaining), arguments))
+
+        ret, info, _ = collect("mc info")
+        version = re.search(r'(?m)^\s*Firmware Revision\s*:\s*(\S+)', info) if ret == 0 else None
+        rsp.bmcVersion = version.group(1) if version else 'unknown'
+        rsp.ipmiAddress = 'None'
+        if ret in (shell.TIMEOUT_EXIT_CODE, shell.SIGKILL_EXIT_CODE):
+            return
+
+        for channel in range(1, 12):
+            ret, out, err = collect("lan print %s" % channel)
+            address = re.search(r'(?m)^\s*IP Address\s*:\s*(\S+)', out) if ret == 0 else None
+            if address:
+                rsp.ipmiAddress = address.group(1)
+                break
+            logger.debug("failed to get ipmi address from BMC lan channel [%s], because %s" % (channel, err))
+            if ret in (shell.TIMEOUT_EXIT_CODE, shell.SIGKILL_EXIT_CODE):
+                break
+
+    @kvmagent.replyerror
     def identify_host(self, req):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = kvmagent.AgentResponse()
-        sc = shell.ShellCmd("ipmitool chassis identify %s" % cmd.interval)
+        interval = str(cmd.interval)
+        if not re.match(r'\A[0-9]{1,3}\Z', interval) or not 0 <= int(interval) <= 255:
+            rsp.success = False
+            rsp.error = "identify interval must be an integer between 0 and 255"
+            return jsonobject.dumps(rsp)
+        sc = shell.ShellCmd(IPMI_COMMAND + " chassis identify %s" % shell_quote(str(int(interval))))
         sc(True)
         return jsonobject.dumps(rsp)
 
@@ -3031,6 +3596,13 @@ done
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = SetHostKernelInterfaceResponse()
 
+        try:
+            sds_vip = netconfig.get_sds_vip_from_conf()
+        except netconfig.NetConfigError as e:
+            rsp.success = False
+            rsp.error = str(e)
+            return jsonobject.dumps(rsp)
+
         for iface in cmd.interfaces:
             if not iface.interfaceName and not linux.is_physical_nic(iface.interfaceName) and not linux.is_bond(iface.interfaceName):
                 raise Exception('cannot find interface or bond[%s]' % iface.interfaceName)
@@ -3049,6 +3621,10 @@ done
                 ifcfg = netconfig.NetVlanConfig(physical_dev)
             else:
                 ifcfg = linux.get_device_ifcfg(physical_dev)
+            ifcfg.sds_vip = sds_vip
+            # drop SDS VIP already loaded from existing ifcfg; keep runtime address untouched
+            if sds_vip:
+                ifcfg.delete_ip_config(sds_vip)
 
             exist_ips = linux.get_ip_list_by_nic_name(target_dev)
             exist_ip_set = {obj.ip for obj in exist_ips}
@@ -3073,11 +3649,11 @@ done
                     ifcfg.boot_proto = netconfig.NET_CONFIG_BOOTPROTO_NONE
                     for item in exist_ips:
                         if item.ip in exist_ip_set and item.ip not in added_ip_set:
-                            ifcfg.add_ip_config(item.ip, item.netmask, item.gateway, item.version, item.is_default)
+                            ifcfg.add_ip_config(item.ip, item.netmask, item.gateway, item.version, item.is_default, sds_vip)
 
                 for item in added_ips:
                     shell.call('ip addr add %s/%s dev %s' % (item.ip, item.netmask, target_dev))
-                    ifcfg.add_ip_config(item.ip, item.netmask, item.gateway, item.version, item.is_default)
+                    ifcfg.add_ip_config(item.ip, item.netmask, item.gateway, item.version, item.is_default, sds_vip)
 
             ifcfg.restore_config()
 
@@ -3711,6 +4287,7 @@ done
 
 
     @in_bash
+    @lock.lock("sriov-net-devices")
     def _generate_sriov_net_devices(self, cmd, rsp):
         numvfs = os.path.join('/sys/bus/pci/devices/', cmd.pciDeviceAddress, 'sriov_numvfs')
         if not os.path.exists(numvfs):
@@ -3769,45 +4346,188 @@ done
 
 
     @in_bash
+    @lock.lock("sriov-net-devices")
     def _ungenerate_sriov_net_devices(self, cmd, rsp):
-        numvfs = os.path.join('/sys/bus/pci/devices/', cmd.pciDeviceAddress, 'sriov_numvfs')
-        if not os.path.exists(numvfs):
-            rsp.success = False
-            rsp.error = 'cannot find sriov_numvfs file for pci device[addr:%s, type:%s]' % (cmd.pciDeviceAddress, cmd.pciDeviceType)
-            return
+        import xml.etree.ElementTree as ET
 
-        def _check_allocated_virtual_functions():
-            _addr = cmd.pciDeviceAddress
+        detached = []
+        drivers = {}
+        address = cmd.pciDeviceAddress.lower()
+        if re.match(r'^[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$', address):
+            address = '0000:' + address
+        pf_path = os.path.join('/sys/bus/pci/devices', address)
+        numvfs = os.path.join(pf_path, 'sriov_numvfs')
 
-            if len(_addr.split(':')) != 3:
-                _addr = '0000:' + _addr
+        def _read(path):
+            with open(path) as stream:
+                return stream.read().strip()
 
-            pf = "pci_%s_%s_%s_%s" % tuple(re.split(':|\.', _addr))
-            r, vf_lines, e = bash_roe("virsh nodedev-dumpxml %s | grep 'address domain'" % pf)
+        def _write(path, value):
+            if not os.path.exists(path):
+                raise RuntimeError('cannot find sysfs attribute[%s]' % path)
+            with open(path, 'w') as stream:
+                stream.write(value)
+
+        def _run(command):
+            r, o, e = bash_roe("timeout -k 5s 15s " + command)
             if r != 0:
-                return "failed to run `virsh nodedev-dumpxml %s`: %s" % (pf, e)
+                raise RuntimeError('command[%s] failed: %s' % (command, e or o))
+            return o.strip()
 
-            pattern = re.compile(r'.*0x([0-9a-f]*).*0x([0-9a-f]*).*0x([0-9a-f]*).*0x([0-9a-f]*).*')
-            for vf_line in vf_lines.split('\n'):
-                vf_line = vf_line.strip()
-                match = pattern.match(vf_line)
+        def _driver(vf):
+            path = os.path.join('/sys/bus/pci/devices', vf, 'driver')
+            return os.path.basename(os.path.realpath(path)) if os.path.islink(path) else None
+
+        def _vfs():
+            vfs = [os.path.basename(os.path.realpath(os.path.join(pf_path, name)))
+                   for name in sorted(os.listdir(pf_path)) if re.match(r'^virtfn[0-9]+$', name)]
+            if len(set(vfs)) != int(_read(numvfs)) or len(set(vfs)) != len(vfs):
+                raise RuntimeError('VF topology changed; retry after device discovery')
+            for vf in vfs:
+                if os.path.realpath('/sys/bus/pci/devices/%s/physfn' % vf) != os.path.realpath(pf_path):
+                    raise RuntimeError('cannot verify PF ownership of VF[%s]' % vf)
+            return vfs
+
+        def _busy(vf, owner):
+            raise RuntimeError('VF[%s], driver[%s], used by[%s]' % (vf, drivers[vf] or 'unbound', owner))
+
+        def _check_net(vf):
+            vf_path = '/sys/bus/pci/devices/' + vf
+            # Bifurcated DPDK/RDMA can use the VF while its kernel netdev is DOWN.
+            for kind in ('infiniband', 'infiniband_verbs', 'uio'):
+                path = vf_path + '/' + kind
+                if os.path.isdir(path) and os.listdir(path):
+                    _busy(vf, '%s endpoints require userspace usage verification' % kind)
+            net_path = vf_path + '/net'
+            names = os.listdir(net_path) if os.path.isdir(net_path) else []
+            if not names:
+                _busy(vf, 'no visible host network interface; cannot verify usage')
+            for name in names:
+                net = '/sys/class/net/' + name
+                if os.path.realpath(net + '/device') != os.path.realpath('/sys/bus/pci/devices/' + vf):
+                    _busy(vf, 'netdev[%s] is outside the host network namespace or has changed' % name)
+                if int(_read(net + '/flags'), 0) & 1:
+                    _busy(vf, 'netdev[%s] is administratively UP' % name)
+                for entry in os.listdir(net):
+                    if entry == 'master' or entry.startswith('upper_'):
+                        _busy(vf, 'netdev[%s] attached to[%s]' %
+                              (name, os.path.basename(os.path.realpath(net + '/' + entry))))
+                if re.search(r'\binet6?\s', _run('ip -o addr show dev %s' % shell_quote(name))):
+                    _busy(vf, 'netdev[%s] has IP addresses' % name)
+                families = ['-4', '-6'] if os.path.isdir('/proc/sys/net/ipv6') else ['-4']
+                for family in families:
+                    routes = _run('ip %s -o route show table all dev %s' % (family, shell_quote(name)))
+                    if routes:
+                        _busy(vf, 'netdev[%s] has routes[%s]' % (name, routes))
+                if os.path.exists('/etc/sysconfig/network-scripts/ifcfg-' + name):
+                    _busy(vf, 'netdev[%s] has persistent host network configuration' % name)
+                if os.path.exists('/var/run/openvswitch/db.sock'):
+                    owner = _run('ovs-vsctl --timeout=10 --if-exists get Interface %s name' % shell_quote(name))
+                    if owner and owner != '[]':
+                        _busy(vf, 'OVS interface[%s]' % name)
+            return names
+
+        def _check_vms():
+            domains = set(_run('virsh list --all --uuid').split())
+            persistent = set(_run('virsh list --all --persistent --uuid').split())
+            for domain in domains | persistent:
+                options = ['', ' --inactive'] if domain in persistent else ['']
+                for option in options:
+                    xml = ET.fromstring(_run('virsh dumpxml %s%s' % (shell_quote(domain), option)))
+                    owner = 'VM[%s]' % (xml.findtext('name') or domain)
+                    sources = (xml.findall('./devices/hostdev/source') +
+                               xml.findall('./devices/interface/source') +
+                               xml.findall('./devices/interface/actual/source'))
+                    for source in sources:
+                        for addr in source.findall('address'):
+                            keys = ('domain', 'bus', 'slot', 'function')
+                            if all(addr.get(key) is not None for key in keys):
+                                vf = '%04x:%02x:%02x.%x' % tuple(int(addr.get(key), 0) for key in keys)
+                                if vf in drivers:
+                                    _busy(vf, owner)
+                        for vf, names in interfaces.items():
+                            if source.get('dev') in names:
+                                _busy(vf, owner + ' network interface')
+
+        try:
+            if not re.match(r'^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$', address):
+                raise RuntimeError('invalid PCI address[%s]' % address)
+            if not os.path.exists(numvfs):
+                raise RuntimeError('cannot find sriov_numvfs file')
+            vfs = _vfs()
+            if not vfs:
+                return
+            drivers = dict((vf, _driver(vf)) for vf in vfs)
+            for vf, driver in drivers.items():
+                if driver and (driver.startswith('vfio') or driver in ('igb_uio', 'uio_pci_generic', 'pci-stub')):
+                    _busy(vf, 'passthrough/userspace driver binding')
+                if driver:
+                    for attribute in ('bind', 'unbind'):
+                        if not os.path.exists('/sys/bus/pci/drivers/%s/%s' % (driver, attribute)):
+                            _busy(vf, 'driver has no %s attribute; cannot safely release and restore VF' % attribute)
+            # PF representors need switchdev cleanup before removing their VFs.
+            pf_net = pf_path + '/net'
+            for name in os.listdir(pf_net) if os.path.isdir(pf_net) else []:
+                port = pf_net + '/' + name + '/phys_port_name'
+                if not os.path.exists(port):
+                    continue
+                try:
+                    port_name = _read(port)
+                except (IOError, OSError) as error:
+                    # Normal PFs may expose this attribute without driver support.
+                    if error.errno in (errno.EOPNOTSUPP, errno.ENOTSUP):
+                        continue
+                    raise
+                match = re.search(r'(?:^|pf[0-9]+)vf([0-9]+)$', port_name)
                 if match:
-                    vf = "pci_%s_%s_%s_%s" % tuple(match.groups())
-                    r, o, e = bash_roe("virsh nodedev-dumpxml %s | grep vfio-pci" % vf)
-                    if r == 0:
-                        return "virtual function %s of pf %s still allocated to some vm" % (vf, pf)
-
-        _error = _check_allocated_virtual_functions()
-        if _error:
+                    vf = os.path.basename(os.path.realpath(pf_path + '/virtfn' + match.group(1)))
+                    if vf in drivers:
+                        _busy(vf, 'PF representor[%s] requires switchdev cleanup' % name)
+            # Check every bound host VF before releasing any of their drivers.
+            targets = [vf for vf in vfs if drivers[vf]]
+            interfaces = dict((vf, _check_net(vf)) for vf in targets)
+            _check_vms()
+            if _vfs() != vfs or any(_driver(vf) != drivers[vf] for vf in vfs):
+                raise RuntimeError('VF topology or driver changed during usage checks; retry')
+            for vf in targets:
+                _check_net(vf)
+                if _driver(vf) != drivers[vf]:
+                    raise RuntimeError('VF[%s] driver changed before unbind; retry' % vf)
+                # Record the attempt so an ambiguous sysfs write failure can also recover.
+                detached.append(vf)
+                _write('/sys/bus/pci/devices/%s/driver/unbind' % vf, vf)
+                if _driver(vf):
+                    raise RuntimeError('VF[%s] is still bound after unbind' % vf)
+            _check_vms()
+            if _vfs() != vfs or any(_driver(vf) for vf in vfs):
+                raise RuntimeError('VF topology or driver changed before disable; retry')
+            _run('lspci >/dev/null && echo 0 > %s' % shell_quote(numvfs))
+            if _vfs():
+                raise RuntimeError('VFs still exist after writing sriov_numvfs=0')
+        except Exception as error:
+            recovery = []
+            for vf in reversed(detached):
+                try:
+                    if os.path.realpath('/sys/bus/pci/devices/%s/physfn' % vf) != os.path.realpath(pf_path):
+                        raise RuntimeError('VF no longer belongs to this PF')
+                    current = _driver(vf)
+                    if current == drivers[vf]:
+                        continue
+                    if current:
+                        raise RuntimeError('VF now uses driver[%s]; refusing to replace it' % current)
+                    _write('/sys/bus/pci/drivers/%s/bind' % drivers[vf], vf)
+                    if _driver(vf) != drivers[vf]:
+                        raise RuntimeError('original driver did not bind')
+                except Exception as restore_error:
+                    recovery.append('VF[%s], driver[%s]: %s' % (vf, drivers[vf], restore_error))
             rsp.success = False
-            rsp.error = _error
-            return
-
-        r, o, e = bash_roe("lspci >/dev/null && echo 0 > %s" % numvfs)
-        if r != 0:
-            rsp.success = False
-            rsp.error = 'failed to ungenerate virtual functions on pci device[addr:%s, type:%s]' % (cmd.pciDeviceAddress, cmd.pciDeviceType)
-            return
+            rsp.error = 'failed to ungenerate virtual functions on pci device[addr:%s, type:%s]: %s' % (
+                address, cmd.pciDeviceType, error)
+            if drivers:
+                rsp.error += '; VF bindings[%s]' % ', '.join('%s:%s' % (vf, driver or 'unbound')
+                                                           for vf, driver in sorted(drivers.items()))
+            if recovery:
+                rsp.error += '; failed to restore VF drivers: ' + '; '.join(recovery)
 
 
     @kvmagent.replyerror
@@ -4812,6 +5532,7 @@ done
         http_server.register_async_uri(self.GET_ENVELOPE_PUBLIC_KEY_PATH, self.get_envelope_public_key)
         http_server.register_async_uri(self.CHECK_ENVELOPE_KEY_PATH, self.check_envelope_key)
         http_server.register_async_uri(self.ENSURE_SECRET_PATH, self.ensure_secret)
+        http_server.register_async_uri(self.WRITE_SECRET_MATERIAL_FILE_PATH, self.write_secret_material_file)
         http_server.register_async_uri(self.GET_SECRET_PATH, self.get_secret)
         http_server.register_async_uri(self.DELETE_SECRET_PATH, self.delete_secret)
 

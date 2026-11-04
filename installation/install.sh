@@ -229,6 +229,7 @@ declare -a upgrade_params_array=(
     '4.10.16,-DupgradeFlatDhcpServerIp=true'
     '4.10.16,-DfstabDeviceToUuidUpdater=true'
     '4.10.20,-DupgradeZceXUsernamePasswordMigrate=true'
+    '5.1.1,-DfstabNonBlockingMountOptionsUpdater=true'
 )
 #other than the upon params_array, this one could be persisted in zstack.properties
 declare -a upgrade_persist_params_array=(
@@ -663,12 +664,12 @@ set_tomcat_config() {
   </GlobalNamingResources>
 
   <Service name="Catalina">
+    <Executor name="tomcatThreadPool" namePrefix="catalina-exec-" maxThreads="$new_max_thread_num" minSpareThreads="$new_min_spare_threads" prestartminSpareThreads="true" maxQueueSize="$new_max_queue_size" />
     <Connector executor="tomcatThreadPool" port="8080" protocol="HTTP/1.1"
                connectionTimeout="$new_timeout"
                redirectPort="8443"
                maxParameterCount="1000"
                maxHttpHeaderSize="65536" URIEncoding="UTF-8" useBodyEncodingForURI="UTF-8" />
-       <Executor name="tomcatThreadPool" namePrefix="catalina-exec-" maxThreads="$new_max_thread_num" minSpareThreads="$new_min_spare_threads" prestartminSpareThreads="true" maxQueueSize="$new_max_queue_size" />
     <Engine name="Catalina" defaultHost="localhost">
 
       <Realm className="org.apache.catalina.realm.LockOutRealm">
@@ -1358,6 +1359,7 @@ upgrade_zstack(){
     show_spinner is_enable_chronyd
     show_spinner uz_stop_zstack
     show_spinner prepare_zops_user_and_db
+    uz_install_trial_license
     show_spinner uz_upgrade_zstack
     show_spinner upgrade_tomcat_security
     if [[ $REDHAT_OS =~ $OS ]]; then
@@ -1511,42 +1513,12 @@ cs_pre_check(){
     fi
     #change zstack.properties config
     if [ x"$UPGRADE" != x'n' ]; then
-        sharedblock_check_qcow2_volume
         zstack_properties=`zstack-ctl status 2>/dev/null|grep zstack.properties|awk '{print $2}'`
     else
         zstack_properties=$ZSTACK_INSTALL_ROOT/$ZSTACK_PROPERTIES
     fi
     [ -f $zstack_properties ] && sed -i 's/Ansible.var.yum_repo/Ansible.var.zstack_repo/' $zstack_properties >>$ZSTACK_INSTALL_LOG 2>&1
     pass
-}
-
-sharedblock_check_qcow2_volume(){
-    trap 'traplogger $LINENO "$BASH_COMMAND" $?'  DEBUG
-    vercomp '3.7.0' ${CURRENT_VERSION}; cmp=$?
-    if [ ${cmp} -ne 1 ]; then
-        return
-    fi
-
-    db_ip=`zstack-ctl getenv MYSQL_LATEST_IP | awk -F '=' '{print $2}'`
-    db_port=`zstack-ctl getenv MYSQL_LATEST_PORT | awk -F '=' '{print $2}'`
-    db_username=`zstack-ctl show_configuration | grep DB.user | awk -F '=' '{print $2}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'`
-    db_password=`zstack-ctl show_configuration | grep DB.password | awk -F '=' '{print $2}' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'`
-    if [ x"$db_password" != "x" ]; then
-        mysql --vertical -h $db_ip -P $db_port -u $db_username -p$db_password zstack -e 'select count(vol.uuid) from VolumeVO vol, PrimaryStorageVO ps where ps.Type="sharedblock" and vol.primaryStorageUuid = ps.uuid and vol.isShareable <> 0 and vol.format ="qcow2"' >>$ZSTACK_INSTALL_LOG 2>&1
-        sql_running=$?
-        result=`mysql --vertical -h $db_ip -P $db_port -u $db_username -p$db_password zstack -e 'select count(vol.uuid) from VolumeVO vol, PrimaryStorageVO ps where ps.Type="sharedblock" and vol.primaryStorageUuid = ps.uuid and vol.isShareable <> 0 and vol.format ="qcow2"' | grep count | awk -F ':' '{print $2}' | tr -d '[:space:]'`
-    else
-        mysql --vertical -h $db_ip -P $db_port -u $db_username zstack -e 'select count(vol.uuid) from VolumeVO vol, PrimaryStorageVO ps where ps.Type="sharedblock" and vol.primaryStorageUuid = ps.uuid and vol.isShareable <> 0 and vol.format ="qcow2"' >>$ZSTACK_INSTALL_LOG 2>&1
-        sql_running=$?
-        result=`mysql --vertical -h $db_ip -P $db_port -u $db_username zstack -e 'select count(vol.uuid) from VolumeVO vol, PrimaryStorageVO ps where ps.Type="sharedblock" and vol.primaryStorageUuid = ps.uuid and vol.isShareable <> 0 and vol.format ="qcow2"' | grep count | awk -F ':' '{print $2}' | tr -d '[:space:]'`
-    fi
-    if [ x"$sql_running" != x'0' ]; then
-        echo "can not connect to mysql or execute sql, skip check qcow2 shared volume" >>$ZSTACK_INSTALL_LOG 2>&1
-        return
-    fi
-    if [ x"$result" != x'0' ]; then
-        fail "There are $result qcow2 format shared volume on sharedblock group primary storage, please contact technical support to convert volumes and then upgrade zstack"
-    fi
 }
 
 iz_install_unzip(){
@@ -2108,12 +2080,35 @@ upgrade_mysql_configuration(){
     fi
 
     # Fixes ZSTAC-24460
-    # if max_allowed_packet is not configured, then update from default value 1M to 2M
-    grep 'max_allowed_packet' $MYSQL_CONF_FILE >/dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        echo "max_allowed_packet=2M" >>$ZSTACK_INSTALL_LOG 2>&1
-        sed -i '/\[mysqld\]/a max_allowed_packet=2M\' $MYSQL_CONF_FILE
-    fi
+    # add 64M when absent and raise smaller values to 64M
+    awk -F= '
+        /^[[:space:]]*\[/ {
+            section = $0
+            sub(/^[[:space:]]*\[/, "", section)
+            sub(/\].*$/, "", section)
+            in_mysqld = (tolower(section) == "mysqld")
+        }
+        in_mysqld && /^[[:space:]]*max_allowed_packet[[:space:]]*=/ {
+            found = 1
+            value = $2
+            sub(/[[:space:]]*[#;].*$/, "", value)
+            sub(/^[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            if (value !~ /^[0-9]+[kKmMgG]?$/) next
+            unit = tolower(substr(value, length(value)))
+            bytes = value + 0
+            if (unit == "k") bytes *= 1024
+            if (unit == "m") bytes *= 1024 * 1024
+            if (unit == "g") bytes *= 1024 * 1024 * 1024
+            if (bytes < 64 * 1024 * 1024)
+                print NR "s/=[[:space:]]*[0-9]+[kKmMgG]?/=64M/"
+        }
+        END {
+            if (!found)
+                print "/^[[:space:]]*[[]mysqld[]][[:space:]]*([#;].*)?$/a max_allowed_packet=64M"
+        }
+    ' "$MYSQL_CONF_FILE" | sed -i -E -f /dev/stdin "$MYSQL_CONF_FILE"
+    # end ZSTAC-24460
 
     grep 'interactive_timeout' $MYSQL_CONF_FILE >/dev/null 2>&1
     if [ $? -ne 0 ]; then
@@ -2421,10 +2416,13 @@ iz_upgrade_zsphere_tools(){
 
 inner_install_zsphere_tools(){
     ZSV_CONFIG_DIR=$ZSTACK_HOME/WEB-INF/classes/zsphere_config
-
-    /bin/rm -rf $ZSV_CONFIG_DIR
     mkdir -p $ZSV_CONFIG_DIR
-    /bin/cp -f $ZSV_SOURCE_FILE $ZSV_CONFIG_DIR/version
+
+    # Prefer ISO/DVD (commercial product version, e.g. 5.2.0).
+    # Otherwise keep the file baked into war by build.zsv.xml.
+    if [ -s "$ZSV_SOURCE_FILE" ]; then
+        /bin/cp -f $ZSV_SOURCE_FILE $ZSV_CONFIG_DIR/version
+    fi
 }
 
 install_zstack(){
@@ -2554,6 +2552,33 @@ sp_setup_install_param(){
             zstack-ctl configure $normalized_line
         done < "/opt/zstack-dvd/$BASEARCH/$ZSTACK_RELEASE/zs_init_config/global_properties"
     fi
+}
+
+uz_has_installed_trial_license(){
+    local license_file
+    for license_file in "$LICENSE_FOLDER"/license_*; do
+        if cmp -s "$ZSTACK_TRIAL_LICENSE" "$license_file"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+uz_install_trial_license(){
+    local source_config_dir="$ZSTACK_INSTALL_ROOT/$CATALINA_ZSTACK_CLASSES/springConfigXml"
+    if [ ! -d "$upgrade_folder/zstack/WEB-INF/classes/springConfigXml/ee" ] ||
+        [ -d "$source_config_dir/ee" ] ||
+        [ -f "$source_config_dir/license.xml" ]; then
+        return
+    fi
+
+    if uz_has_installed_trial_license; then
+        return
+    fi
+
+    local LICENSE_PATH=''
+    install_license
+    uz_has_installed_trial_license || fail "Failed to verify the installed enterprise trial license"
 }
 
 install_license(){

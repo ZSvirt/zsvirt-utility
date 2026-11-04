@@ -231,5 +231,45 @@ class TestCollectSasHotSpare(unittest.TestCase):
                                 "sas hot-spare must not raise a disk alarm")
 
 
+class TestDiskListChangeTracker(unittest.TestCase):
+
+    def setUp(self):
+        self.tracker = prometheus.DiskListChangeTracker(3)
+
+    def test_alarm_after_three_consecutive_mismatches(self):
+        original = {"disk-a": "252-0", "disk-b": "252-1"}
+        changed = {"disk-a": "252-0"}
+
+        self.assertIsNone(self.tracker.update(original))
+        self.assertIsNone(self.tracker.update(changed))
+        self.assertIsNone(self.tracker.update(changed))
+        self.assertEqual((original, changed), self.tracker.update(changed))
+
+    def test_one_reverse_sample_does_not_alarm(self):
+        original = {"disk-a": "252-0", "disk-b": "252-1"}
+        changed = {"disk-a": "252-0"}
+
+        self.tracker.update(original)
+        self.tracker.update(changed)
+        self.tracker.update(changed)
+        self.assertEqual((original, changed), self.tracker.update(changed))
+        self.assertIsNone(self.tracker.update(original))
+        self.assertIsNone(self.tracker.update(changed))
+        self.assertIsNone(self.tracker.update(original))
+        self.assertIsNone(self.tracker.update(original))
+        self.assertEqual((changed, original), self.tracker.update(original))
+
+    def test_matching_round_resets_pending_mismatch(self):
+        original = {"disk-a": "252-0"}
+        changed = {"disk-a": "252-1"}
+
+        self.tracker.update(original)
+        self.tracker.update(changed)
+        self.assertIsNone(self.tracker.update(original))
+        self.assertIsNone(self.tracker.update(changed))
+        self.assertIsNone(self.tracker.update(changed))
+        self.assertEqual((original, changed), self.tracker.update(changed))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
