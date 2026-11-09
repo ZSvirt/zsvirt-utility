@@ -3150,7 +3150,7 @@ def _resolve_vgs_info(o, tag):
 
     block_devices_by_dev_name = {}
     for bd in block_devices:
-        if bd.dev_name:
+        if getattr(bd, "dev_name", None):
             block_devices_by_dev_name[bd.dev_name] = bd
         if bd.multipathPath:
             block_devices_by_dev_name[bd.multipathPath] = bd
