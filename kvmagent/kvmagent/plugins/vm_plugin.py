@@ -8491,7 +8491,11 @@ class VmPlugin(kvmagent.KvmAgent):
         rsp = CheckVmStateRsp()
         r = bash.bash_r("timeout 5 virsh list")
         if r == 0:
-            states = get_all_vm_states()
+            try:
+                states = get_all_vm_states()
+            except Exception as e:
+                logger.warn("get_all_vm_states failed, fallback to process scan: %s" % e)
+                states = get_all_vm_states_with_process()
         else:
             states = get_all_vm_states_with_process()
 
