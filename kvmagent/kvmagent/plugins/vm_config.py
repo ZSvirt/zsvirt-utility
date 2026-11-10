@@ -253,6 +253,17 @@ class VmConfigPlugin(kvmagent.KvmAgent):
         # configure windows by zs-tools
         if qga.os == VmQga.VM_OS_WINDOWS:
             with lock.NamedLock('qga-network-%s' % vm_uuid):
+                # QGA can reconnect before the Windows installer finishes.
+                script = r"""
+$ErrorActionPreference = 'Stop'
+$setup = Get-WmiObject Win32_Process -Filter "Name = 'GuestTools.exe' OR Name = 'GuestTools.tmp'"
+if ($setup) { exit 1 }
+exit 0
+"""
+                state, detail = qga.guest_exec_program('powershell.exe',
+                    ['-NoProfile', '-NonInteractive', '-Command', script], retry=20)
+                if state != 0:
+                    return 1, "GuestTools installation is not ready for network sync: {}".format(detail)
                 ret, msg = qga.guest_exec_zs_tools(operate='net', config=jsonobject.dumps(nic_params))
             if ret != 0:
                 logger.debug("config vm {} ports by qga failed, detail info {}".format(vm_uuid, msg))
