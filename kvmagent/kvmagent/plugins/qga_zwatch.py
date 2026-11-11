@@ -385,19 +385,23 @@ class ZWatchMetricMonitor(kvmagent.KvmAgent):
     def report_vm_qga_state(self, qga_state, tools_state):
         if not qga_state or not tools_state:
             return
-        if self.qga_state == qga_state and self.tools_state == tools_state:
+        now = time.time()
+        last_report = getattr(self, '_last_qga_state_report', 0)
+        # A pending network sync may become ready without a QGA state change.
+        if (self.qga_state == qga_state and self.tools_state == tools_state
+                and 0 <= now - last_report < 60):
             return
-        else:
-            self.qga_state = qga_state
-            self.tools_state = tools_state
-        qga_state_json = json.dumps(self.qga_state)
-        tools_state_json = json.dumps(self.tools_state)
+        qga_state_json = json.dumps(qga_state)
+        tools_state_json = json.dumps(tools_state)
         logger.debug('transmitting vm qga state [%s] and tools state [%s] to management node' % (
             qga_state_json, tools_state_json))
         url = self.config.get(kvmagent.SEND_COMMAND_URL)
         if not url:
             raise kvmagent.KvmError("cannot find SEND_COMMAND_URL, unable to transmit vm operation to management node")
         http.json_dump_post(url, VmQgaState(qga_state_json, tools_state_json), {'commandpath': '/vm/qgastate/report'})
+        self.qga_state = qga_state
+        self.tools_state = tools_state
+        self._last_qga_state_report = now
 
 
 class VmQgaStatus:

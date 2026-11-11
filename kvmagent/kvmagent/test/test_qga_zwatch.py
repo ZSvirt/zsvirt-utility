@@ -195,6 +195,7 @@ class TestQgaGetVmNic(unittest.TestCase):
         self.qga.os = 'mswindows'
         self.qga.os_version = '10'  # not 2008r2
         self.qga.state = 'running'
+        self.qga.guest_exec_program.return_value = (0, '')
         self.qga.guest_exec_zs_tools.return_value = (0, '')
         self.exe = self.monitor.WIN_ZWATCH_GET_NIC_INFO_EXE_PATH
         self.ps1 = self.monitor.WIN_ZWATCH_GET_NIC_INFO_PATH
@@ -224,6 +225,23 @@ class TestQgaGetVmNic(unittest.TestCase):
         domain = mock.Mock()
         domain.name.return_value = self.uuid
         return namespace['config_vm_ports_by_qga'](object(), domain, mock.Mock())
+
+    def test_configuration_defers_while_guest_tools_setup_is_running(self):
+        self.qga.guest_exec_program.return_value = (1, 'GuestTools setup running')
+
+        code, error = self._configure_ports()
+
+        self.assertEqual(code, 1)
+        self.assertIn('GuestTools installation is not ready for network sync', error)
+        self.qga.guest_exec_program.assert_called_once()
+        self.qga.guest_exec_zs_tools.assert_not_called()
+
+    def test_configuration_runs_after_guest_tools_setup_finishes(self):
+        self.assertEqual(self._configure_ports(), (0, ''))
+
+        self.qga.guest_exec_program.assert_called_once()
+        self.qga.guest_exec_zs_tools.assert_called_once()
+        self.assertEqual(self.qga.guest_exec_zs_tools.call_args[1]['operate'], 'net')
 
     def test_configuration_skips_collection_without_cache_or_fallback(self):
         started = threading.Event()
