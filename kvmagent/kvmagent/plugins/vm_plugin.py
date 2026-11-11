@@ -3391,7 +3391,7 @@ class Vm(object):
             return False
         return memory_state['last_update'] > 0
 
-    def stop(self, strategy='grace', timeout=60, undefine=True):
+    def stop(self, strategy='grace', timeout=5, undefine=True):
         def cleanup_addons():
             for chan in self.domain_xmlobject.devices.get_child_node_as_list('channel'):
                 if chan.type_ == 'unix':
@@ -3439,8 +3439,6 @@ class Vm(object):
                     self.domain.undefineFlags(flags)
                 except:
                     logger.warn('cannot undefine the VM[uuid:%s]' % self.uuid)
-                    if strategy == 'grace':
-                        raise kvmagent.KvmError('failed to undefine gracefully stopped vm[uuid:%s]' % self.uuid)
                     pid = linux.find_process_by_cmdline(['qemu', self.uuid])
                     if pid:
                         # force to kill the VM
@@ -3458,8 +3456,6 @@ class Vm(object):
             except libvirt.libvirtError as ex:
                 logger.warn('undefine domain[%s] failed: %s' % (self.uuid, str(ex)))
                 if 'transient' in str(ex).lower():
-                    if strategy == 'grace':
-                        return self.is_powered_off()
                     try:
                         self.domain.destroy()
                     except:
@@ -3478,13 +3474,10 @@ class Vm(object):
 
             return self.is_powered_off()
 
-        do_destroy, isPersistent = strategy == 'cold', self.domain.isPersistent()
+        do_destroy, isPersistent = strategy == 'grace' or strategy == 'cold', self.domain.isPersistent()
         if strategy == 'grace':
-            if self.power_state[self.domain.info()[0]] == self.VM_STATE_PAUSED:
-                raise kvmagent.KvmError('cannot gracefully stop paused vm[uuid:%s]; resume it first' % self.uuid)
-            if not linux.wait_callback_success(loop_shutdown, None, timeout=timeout):
-                raise kvmagent.KvmError('failed to gracefully stop vm[uuid:%s], timeout after %s secs; '
-                                        'the VM has not been forcibly stopped' % (self.uuid, timeout))
+            if linux.wait_callback_success(loop_shutdown, None, timeout=60):
+                do_destroy = False
 
         iscsi_cleanup()
 
@@ -8997,7 +8990,12 @@ class VmPlugin(kvmagent.KvmAgent):
             vm = get_vm_by_uuid(vmUuid)
             vmUseOpenvSwitch = ovs.isVmUseOpenvSwitch(vmUuid)
 
-            # A grace request must not become a hard stop based on an OS heuristic.
+            if bool(cmd.forceStopIfNoOperatingSystemDetected) and strategy == "grace" and vm.state != vm.VM_STATE_SHUTDOWN:
+                has_os = vm.check_if_vm_has_operating_system_by_memory_state()
+                if not has_os:
+                    logger.info('vm has no operating system. stop it use \'cold\' mode')
+                    strategy = "cold"
+
             if strategy == "cold" or strategy == "force":
                 vm.stop(strategy=strategy)
             else:
@@ -9006,9 +9004,8 @@ class VmPlugin(kvmagent.KvmAgent):
             if vmUseOpenvSwitch:
                 ovs.getOvsCtl(with_dpdk=True).destoryNicBackend(vmUuid)
         finally:
-            # Keep the kill fallback only for explicitly requested hard stops.
-            if strategy in ('cold', 'force'):
-                self.kill_vm(vmUuid)
+            # libvirt is not reliable, c.f. ZSTAC-15412
+            self.kill_vm(vmUuid)
 
     def kill_vm(self, vm_uuid):
         output = bash.bash_o("ps -ef | grep -P -o '(qemu-kvm|qemu-system).*?-name\s+(guest=)?\K%s,' | sed 's/.$//'" % vm_uuid)
