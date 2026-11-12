@@ -3,6 +3,7 @@ __author__ = 'Wave'
 from cStringIO import StringIO
 from email import message_from_file
 from email.mime.multipart import MIMEMultipart
+import json
 import os
 import platform
 
@@ -252,14 +253,9 @@ class TfNetProviderUserdata(kvmagent.KvmAgent):
 
         http_root = os.path.join(self.TF_USERDATA_ROOT, 'html')
         vm_uuid = userdata.metadata.vmUuid
-        meta_data_json = '''\
-{
-    "uuid": "{{vmInstanceUuid}}"
-}'''
-        tmpt = Template(meta_data_json)
-        conf = tmpt.render({
-            'vmInstanceUuid': vm_uuid
-        })
+        metadata = {'uuid': vm_uuid}
+        if userdata.metadata.vmHostname:
+            metadata['hostname'] = userdata.metadata.vmHostname
 
         root = os.path.join(http_root, uuidhelper.to_full_uuid(vm_uuid))
         meta_root = os.path.join(root, 'meta-data')
@@ -285,15 +281,15 @@ class TfNetProviderUserdata(kvmagent.KvmAgent):
             linux.write_file(userdata_file_path,
                              pack_userdata(userdata.userdataList), True)
 
-            windows_meta_data_json_path = os.path.join(root, 'meta_data.json')
-            linux.write_file(windows_meta_data_json_path, conf, True)
-
             windows_userdata_file_path = os.path.join(root, 'user_data')
             linux.write_file(windows_userdata_file_path,
                              pack_userdata(userdata.userdataList), True)
 
             windows_meta_data_password = os.path.join(root, 'password')
             linux.write_file(windows_meta_data_password, '', True)
+
+        windows_meta_data_json_path = os.path.join(root, 'meta_data.json')
+        linux.write_file(windows_meta_data_json_path, json.dumps(metadata), True)
 
         if userdata.agentConfig:
             pvpanic_file_path = os.path.join(meta_root, 'pvpanic')
