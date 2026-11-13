@@ -104,6 +104,7 @@
     <import file="${basedir}/projects/zstack-store.xml" optional="false" />
     <import file="${basedir}/projects/zstack-vyos.xml" optional="false" />
     <import file="${basedir}/projects/zstack-network.xml" optional="false" />
+    <import file="${basedir}/projects/zstack-znsproxy.xml" optional="false" />
     <import file="${basedir}/projects/zstack-sharedblock.xml" optional="false" />
     <import file="${basedir}/projects/zstack-distro.xml" optional="false" />
     <import file="${basedir}/projects/zstack-zsha2.xml" optional="false" />
@@ -258,6 +259,12 @@
             <arg value="--name-status" />
             <arg value="HEAD^..HEAD" />
         </exec>
+        <exec executable="git" failonerror="false" error="/dev/null" output="${war.dir}/zns-git-commit">
+            <arg value="--git-dir=${zstackzns.source}/.git" />
+            <arg value="log" />
+            <arg value="--name-status" />
+            <arg value="HEAD^..HEAD" />
+        </exec>
         <exec executable="git" failonerror="false" error="/dev/null" output="${war.dir}/zsblk-git-commit">
             <arg value="--git-dir=${zstacksharedblock.source}/.git" />
             <arg value="log" />
@@ -278,7 +285,7 @@
         </exec>
     </target>
 
-    <target name="zip-war">
+    <target name="zip-war" depends="verify-zstack-zns-proxy-package">
         <jar destfile="${war.file}" basedir="${war.dir}"/>
 
         <echo message="successfully build zstack.war at ${war.file}" />
@@ -381,6 +388,9 @@
                 <antcall target="build-zstack-network"/>
             </sequential>
             <sequential>
+                <antcall target="build-zstack-zns-proxy"/>
+            </sequential>
+            <sequential>
                 <antcall target="build-zstack-zsha2"/>
             </sequential>
             <sequential>
@@ -470,6 +480,9 @@
             </sequential>
             <sequential>
                 <antcall target="assemble-zstack-network"/>
+            </sequential>
+            <sequential>
+                <antcall target="assemble-zstack-zns-proxy"/>
             </sequential>
             <sequential>
                 <antcall target="assemble-zstack-sharedblock"/>
