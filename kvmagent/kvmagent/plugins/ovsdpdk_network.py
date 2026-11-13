@@ -322,10 +322,17 @@ class OvsDpdkNetworkPlugin(kvmagent.KvmAgent):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = AddDpdkVhostUserClientResponse()
 
-        ovsctl = ovs.getOvsCtl(with_dpdk=True)
+        ovsctl = None
+        if not any(ovs.isZnsDpdkNic(nic) for nic in cmd.nics):
+            ovsctl = ovs.getOvsCtl(with_dpdk=True)
         for nic in cmd.nics:
             if nic.type == 'dpdkvhostuserclient':
-                ovsctl.createNicBackend(cmd.vmUuid, nic)
+                if ovs.isZnsDpdkNic(nic):
+                    ovs.createNicBackend(cmd.vmUuid, nic)
+                else:
+                    if ovsctl is None:
+                        ovsctl = ovs.getOvsCtl(with_dpdk=True)
+                    ovsctl.createNicBackend(cmd.vmUuid, nic)
 
         logger.debug(http.path_msg(OVS_DPDK_NET_GENERATE_DPDKVHOSTUSERCLIENT,
                                    'add dpdkvhostuserclient for vm:{} success'.format(cmd.vmUuid)))
@@ -336,11 +343,10 @@ class OvsDpdkNetworkPlugin(kvmagent.KvmAgent):
         cmd = jsonobject.loads(req[http.REQUEST_BODY])
         rsp = DeleteDpdkVhostUserClientResponse()
 
-        ovsctl = ovs.getOvsCtl(with_dpdk=True)
         if hasattr(cmd, "nicInternalName"):
-            ovsctl.destoryNicBackend(cmd.vmUuid, cmd.nicInternalName)
+            ovs.destroyNicBackend(cmd.vmUuid, cmd.nicInternalName)
         else:
-            ovsctl.destoryNicBackend(cmd.vmUuid)
+            ovs.destroyNicBackend(cmd.vmUuid)
 
         logger.debug(http.path_msg(OVS_DPDK_NET_DELETE_DPDKVHOSTUSERCLIENT,
                                    'delete dpdkvhostuserclient of vm:{} success'.format(cmd.vmUuid)))
@@ -458,7 +464,7 @@ class OvsDpdkNetworkPlugin(kvmagent.KvmAgent):
 
         #Bond can't config through UI, check bond status not run in current version
         #check_bond_status()
-        check_ovs_status()
+        #check_ovs_status()
 
     def stop(self):
         http.AsyncUirHandler.STOP_WORLD = True
