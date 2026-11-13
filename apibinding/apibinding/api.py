@@ -64,6 +64,9 @@ class Api(object):
             elif isinstance(v, inventory.OptionalMap):
                 setattr(apicmd, k, None)
             elif isinstance(v,str) and not v.strip():
+                if (apicmd.FULL_NAME == 'org.zstack.network.l2.virtualSwitch.header.APIUpdatePortGroupMsg'
+                        and k == 'tenantRouterUuid' and v == ''):
+                    continue
                 err = 'field[%s] of %s cannot be an empty string' % (k, apicmd.FULL_NAME)
                 raise ApiError(err)
 
