@@ -1882,7 +1882,6 @@ mimetype.assign = (
         metadata = {'uuid': to.metadata.vmUuid}
         if to.metadata.vmHostname:
             metadata['hostname'] = to.metadata.vmHostname
-        conf = json.dumps(metadata)
 
         root = os.path.join(http_root, to.vmIp)
         meta_root = os.path.join(root, 'meta-data')
@@ -1913,11 +1912,6 @@ mimetype.assign = (
             admin_password, windows_userdata = openstack_userdata.prepare(to.userdataList)
             if admin_password is not None:
                 metadata['admin_pass'] = admin_password
-            conf = json.dumps(metadata)
-            windows_meta_data_json_path = os.path.join(root, 'meta_data.json')
-            with open(windows_meta_data_json_path, 'w') as fd:
-                fd.write(conf)
-
             windows_userdata_file_path = os.path.join(root, 'user_data')
             with open(windows_userdata_file_path, 'w') as fd:
                 fd.write(windows_userdata)
@@ -1925,6 +1919,10 @@ mimetype.assign = (
             windows_meta_data_password = os.path.join(root, 'password')
             with open(windows_meta_data_password, 'w') as fd:
                 fd.write('')
+
+        windows_meta_data_json_path = os.path.join(root, 'meta_data.json')
+        with open(windows_meta_data_json_path, 'w') as fd:
+            json.dump(metadata, fd)
 
         if to.agentConfig:
             pvpanic_file_path = os.path.join(meta_root, 'pvpanic')

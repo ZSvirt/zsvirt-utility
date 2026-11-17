@@ -47,15 +47,15 @@ class TestUserdataMetadata(unittest.TestCase):
                 self.assertEqual(bool(hostname), os.path.exists(os.path.join(root, 'meta-data/local-hostname')))
                 if hostname:
                     self.assertEqual(hostname, read('meta-data/local-hostname'))
-                self.assertEqual(bool(payloads), os.path.exists(os.path.join(root, 'meta_data.json')))
-                if not payloads:
-                    continue
                 expected = {'uuid': 'test-uuid'}
                 if hostname:
                     expected['hostname'] = hostname
                 if password:
                     expected['admin_pass'] = password
                 self.assertEqual(expected, json.loads(read('meta_data.json')))
+                if not payloads:
+                    self.assertFalse(os.path.exists(os.path.join(root, 'user_data')))
+                    continue
                 if windows_body is not None:
                     self.assertEqual(windows_body.strip(), read('user_data').strip())
                 else:
