@@ -33,6 +33,7 @@ from kvmagent.plugins.vm_file_uploader import VmFileUploader, VmFileUploadError
 from zstacklib.utils import http, lvm, ceph, form, pci, report, upload_task, cpu_frequency
 from zstacklib.utils import qemu
 from zstacklib.utils import linux
+from zstacklib.utils import device as device_utils
 from zstacklib.utils.restart_fence import monotonic_time
 from zstacklib.utils import iptables
 from zstacklib.utils import iproute
@@ -376,6 +377,8 @@ class GetBlockDevicesResponse(kvmagent.AgentResponse):
     def __init__(self):
         super(GetBlockDevicesResponse, self).__init__()
         self.blockDevices = []
+        self.blockDeviceWwids = {}
+        self.blockDeviceWwns = {}
 
 
 class GetSensorsResponse(kvmagent.AgentResponse):
@@ -5336,7 +5339,10 @@ done
             if df_r != 0:
                 return None, None, None
             used, available, usedRatio = None, None, None
-            size_info = form.load(df_o)[0]
+            rows = form.load(df_o)
+            if not rows:
+                return used, available, usedRatio
+            size_info = rows[0]
             if 'Used' in size_info.keys():
                 used = long(size_info['Used']) * 1024
             if 'Available' in size_info.keys():
@@ -5354,7 +5360,7 @@ done
             status_info = jsonobject.loads(status_o)
             if status_info['smartctl'] is not None:
                 messages = status_info['smartctl']['messages']
-                if messages is not None and messages[0] is not None:
+                if messages and messages[0] is not None:
                     smartMessage = "%s: %s" % (messages[0]['severity'], messages[0]['string'])
 
             if status_info['smart_status'] is not None:
@@ -5369,7 +5375,11 @@ done
             partition_r, partition_o = bash_ro('timeout 30 parted -s %s print' % name)
             if partition_r != 0:
                 return None
-            return filter_lines_by_str_list(partition_o.splitlines(), ["Partition Table"])[0].split(':')[1].strip()
+            tables = filter_lines_by_str_list(partition_o.splitlines(), ["Partition Table"])
+            if not tables:
+                return None
+            fields = tables[0].split(':')
+            return fields[1].strip() if len(fields) > 1 else None
 
         def is_pcie_nvme(dev_name):
             transport = linux.read_file("/sys/class/block/%s/device/transport" % dev_name.replace("/dev/", ""))
@@ -5377,7 +5387,25 @@ done
                 return transport.strip() == "pcie"
             return False
 
-        def process_device(dev):
+        def collect_identifiers(dev, metadata):
+            name = dev['name']
+            if dev['wwn']:
+                metadata.blockDeviceWwns[name] = dev['wwn']
+            wwid = None
+            required = dev['type'] == 'mpath' or (
+                dev['type'] == 'disk' and (name.startswith('/dev/nvme') or dev['tran'] in ('fc', 'iscsi')))
+            try:
+                wwid = device_utils.get_block_device_wwid(name, dev['type'])
+            except Exception as error:
+                logger.warning("failed to collect identity for %s: %s", name, error)
+            wwid = wwid.strip() if wwid else None
+            if wwid and wwid != '-':
+                metadata.blockDeviceWwids[name] = wwid
+            elif required:
+                metadata.blockDeviceWwids[name] = ''
+                logger.warning("missing physical identity for %s", name)
+
+        def process_device(dev, metadata):
             name = dev['name']
             block_dev = BlockDevice(dev['name'], dev['type'], dev['size'], dev['model'], dev['serial'], dev['fstype'],
                                     dev['mountpoint'])
@@ -5388,7 +5416,7 @@ done
 
             if dev['children'] is not None:
                 for child in dev['children']:
-                    child_dev = process_device(child)
+                    child_dev = process_device(child, metadata)
                     block_dev.children.append(child_dev)
 
             block_dev.partitionTable = get_partition_table(name)
@@ -5396,25 +5424,41 @@ done
             if not skip_get_smart_info(name):
                 block_dev.smartPassed, block_dev.smartMessage = get_smart_passed_and_message(name)
 
+            collect_identifiers(dev, metadata)
             return block_dev
 
-        r, o, e = bash_roe('lsblk -p -b -o NAME,TYPE,ROTA,SIZE,MOUNTPOINT,FSTYPE,SERIAL,MODEL -J')
+        r, o, e = bash_roe('timeout 60 lsblk -p -b -o NAME,TYPE,ROTA,SIZE,MOUNTPOINT,FSTYPE,SERIAL,MODEL,WWN,TRAN -J')
         if r != 0:
             rsp.success = False
             rsp.error = e
             return jsonobject.dumps(rsp)
 
-        with ThreadPoolExecutor(max_workers=15) as executor:
-            futures = [executor.submit(process_device, device)
-                       for device in jsonobject.loads(o)['blockdevices']
-                       if 'nvme' not in device['name'] or is_pcie_nvme(device['name'])]
-            for future in as_completed(futures, timeout=60):
-                try:
-                    block_device = future.result()
+        executor = ThreadPoolExecutor(max_workers=15)
+        futures = {}
+        try:
+            for device in jsonobject.loads(o)['blockdevices']:
+                if 'nvme' in device['name'] and not is_pcie_nvme(device['name']):
+                    continue
+                metadata = GetBlockDevicesResponse()
+                futures[executor.submit(process_device, device, metadata)] = (device['name'], metadata)
+            try:
+                for future in as_completed(futures, timeout=60):
+                    name, metadata = futures[future]
+                    try:
+                        block_device = future.result()
+                    except Exception as error:
+                        logger.warning("device processing failed for %s: %s", name, error)
+                        continue
                     if block_device:
                         rsp.blockDevices.append(block_device)
-                except TimeoutError:
-                    logger.warning("device processing timeout")
+                        rsp.blockDeviceWwids.update(metadata.blockDeviceWwids)
+                        rsp.blockDeviceWwns.update(metadata.blockDeviceWwns)
+            except TimeoutError:
+                logger.warning("device processing timeout")
+        finally:
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=False)
 
         return jsonobject.dumps(rsp)
 
