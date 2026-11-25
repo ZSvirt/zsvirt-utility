@@ -1550,10 +1550,13 @@ is_install_general_libs_rh(){
     trap 'traplogger $LINENO "$BASH_COMMAND" $?'  DEBUG
 
     # Fix upgrade dependency conflicts
+    local nodejs_version
+    if [[ "$KYLIN_V10_OS" =~ "$ZSTACK_RELEASE" || "$ZSTACK_RELEASE" = "h2203sp1o" || "$ZSTACK_RELEASE" = "alinux4" ]] &&
+       nodejs_version=$(rpm -q --qf '%{VERSION}' nodejs 2>/dev/null) && [ "${nodejs_version%%.*}" -lt 24 ]; then
+        yum remove -y nodejs >>$ZSTACK_INSTALL_LOG 2>&1 || fail "remove old nodejs failed."
+    fi
     if [[ "$KYLIN_V10_OS" =~ "$ZSTACK_RELEASE" ]]; then
-      vercomp "20.16.0" `rpm -q nodejs | awk -F '-' '{print $2}'`
-      [ $? -eq 1 ] && removeable="nodejs" || removeable=""
-      yum remove -y redis5 $removeable >>$ZSTACK_INSTALL_LOG 2>&1
+        yum remove -y redis5 >>$ZSTACK_INSTALL_LOG 2>&1
     fi
 
     # Just install what is not installed
@@ -1604,7 +1607,7 @@ is_install_general_libs_rh(){
     if [ "$BASEARCH" == "x86_64" ]; then
       deps_list="${deps_list} mcelog"
     fi
-    always_update_list="openssh"
+    always_update_list="openssh nodejs"
     missing_list=`LANG=en_US.UTF-8 && rpm -q $deps_list | grep 'not installed' | awk 'BEGIN{ORS=" "}{ print $2 }'`
 
     [ x"$ZSTACK_OFFLINE_INSTALL" = x'y' ] && missing_list=$deps_list
